@@ -1,0 +1,221 @@
+const std = @import("std");
+const common = @import("common.zig");
+
+pub const Parsed = struct {
+    paths: common.Paths,
+    command: Command,
+};
+
+pub const Command = union(enum) {
+    up: struct { daemonize: bool },
+    down,
+    status: common.OutputFormat,
+    vnr_create: struct { name: []const u8, cidr: []const u8 },
+    vnr_delete: []const u8,
+    vnr_list: common.OutputFormat,
+    vnr_show: struct { name: []const u8, output: common.OutputFormat },
+    node_create: NodeCreate,
+    node_delete: []const u8,
+    node_list: common.OutputFormat,
+    node_show: struct { name: []const u8, output: common.OutputFormat },
+    node_enrollment_renew: []const u8,
+    node_enrollment_reset: []const u8,
+    route_add: struct { cidr: []const u8, node: []const u8 },
+    route_delete: []const u8,
+    route_list: common.OutputFormat,
+    route_show: struct { cidr: []const u8, output: common.OutputFormat },
+    version,
+
+    pub fn isMutation(self: Command) bool {
+        return switch (self) {
+            .vnr_create,
+            .vnr_delete,
+            .node_create,
+            .node_delete,
+            .node_enrollment_renew,
+            .node_enrollment_reset,
+            .route_add,
+            .route_delete,
+            => true,
+            else => false,
+        };
+    }
+
+    pub fn requiresDaemon(self: Command) bool {
+        return switch (self) {
+            .down, .status => true,
+            .up, .version => false,
+            else => false,
+        };
+    }
+};
+
+pub const NodeCreate = struct {
+    name: []const u8,
+    vnr: []const u8,
+    address: []const u8,
+    /// Null means use `server.json`'s default enrollment lifetime.
+    expires_seconds: ?u64 = null,
+    credential_out: ?[]const u8 = null,
+};
+
+pub fn parse(args: []const []const u8) !Parsed {
+    var paths = common.Paths.server_defaults;
+    var index: usize = 0;
+    while (try common.consumeGlobal(args, &index, &paths)) {}
+    if (index >= args.len) return error.MissingCommand;
+
+    const primary = args[index];
+    index += 1;
+    const rest = args[index..];
+    const command: Command = if (std.mem.eql(u8, primary, "up"))
+        try parseUp(rest)
+    else if (std.mem.eql(u8, primary, "down"))
+        try exactNoArgs(rest, .down)
+    else if (std.mem.eql(u8, primary, "status"))
+        .{ .status = try common.parseOutputFlag(rest) }
+    else if (std.mem.eql(u8, primary, "vnr"))
+        try parseVnr(rest)
+    else if (std.mem.eql(u8, primary, "node"))
+        try parseNode(rest)
+    else if (std.mem.eql(u8, primary, "route"))
+        try parseRoute(rest)
+    else if (std.mem.eql(u8, primary, "version"))
+        try exactNoArgs(rest, .version)
+    else
+        return error.UnknownCommand;
+
+    return .{ .paths = paths, .command = command };
+}
+
+fn parseUp(args: []const []const u8) !Command {
+    if (args.len == 0) return .{ .up = .{ .daemonize = false } };
+    if (args.len == 1 and std.mem.eql(u8, args[0], "-d")) return .{ .up = .{ .daemonize = true } };
+    return error.InvalidArguments;
+}
+
+fn parseVnr(args: []const []const u8) !Command {
+    if (args.len == 0) return error.MissingSubcommand;
+    if (std.mem.eql(u8, args[0], "create")) {
+        if (args.len != 3) return error.InvalidArguments;
+        return .{ .vnr_create = .{ .name = args[1], .cidr = args[2] } };
+    }
+    if (std.mem.eql(u8, args[0], "delete")) {
+        if (args.len != 2) return error.InvalidArguments;
+        return .{ .vnr_delete = args[1] };
+    }
+    if (std.mem.eql(u8, args[0], "list")) return .{ .vnr_list = try common.parseOutputFlag(args[1..]) };
+    if (std.mem.eql(u8, args[0], "show")) {
+        if (args.len < 2 or args.len > 3) return error.InvalidArguments;
+        return .{ .vnr_show = .{ .name = args[1], .output = try common.parseOutputFlag(args[2..]) } };
+    }
+    return error.UnknownSubcommand;
+}
+
+fn parseNode(args: []const []const u8) !Command {
+    if (args.len == 0) return error.MissingSubcommand;
+    if (std.mem.eql(u8, args[0], "create")) return .{ .node_create = try parseNodeCreate(args[1..]) };
+    if (std.mem.eql(u8, args[0], "delete")) {
+        if (args.len != 2) return error.InvalidArguments;
+        return .{ .node_delete = args[1] };
+    }
+    if (std.mem.eql(u8, args[0], "list")) return .{ .node_list = try common.parseOutputFlag(args[1..]) };
+    if (std.mem.eql(u8, args[0], "show")) {
+        if (args.len < 2 or args.len > 3) return error.InvalidArguments;
+        return .{ .node_show = .{ .name = args[1], .output = try common.parseOutputFlag(args[2..]) } };
+    }
+    if (std.mem.eql(u8, args[0], "enrollment")) {
+        if (args.len != 3) return error.InvalidArguments;
+        if (std.mem.eql(u8, args[1], "renew")) return .{ .node_enrollment_renew = args[2] };
+        if (std.mem.eql(u8, args[1], "reset")) return .{ .node_enrollment_reset = args[2] };
+        return error.UnknownSubcommand;
+    }
+    return error.UnknownSubcommand;
+}
+
+fn parseNodeCreate(args: []const []const u8) !NodeCreate {
+    if (args.len == 0) return error.InvalidArguments;
+    var result: NodeCreate = .{ .name = args[0], .vnr = "", .address = "" };
+    var have_vnr = false;
+    var have_address = false;
+    var have_expires = false;
+    var i: usize = 1;
+    while (i < args.len) {
+        const option = args[i];
+        i += 1;
+        if (i >= args.len) return error.MissingOptionValue;
+        const value = args[i];
+        i += 1;
+        if (std.mem.eql(u8, option, "--vnr")) {
+            if (have_vnr) return error.DuplicateOption;
+            result.vnr = value;
+            have_vnr = true;
+        } else if (std.mem.eql(u8, option, "--addr")) {
+            if (have_address) return error.DuplicateOption;
+            result.address = value;
+            have_address = true;
+        } else if (std.mem.eql(u8, option, "--expires")) {
+            if (have_expires) return error.DuplicateOption;
+            result.expires_seconds = try common.parseDuration(value);
+            have_expires = true;
+        } else if (std.mem.eql(u8, option, "--credential-out")) {
+            if (result.credential_out != null) return error.DuplicateOption;
+            if (value.len == 0) return error.InvalidArguments;
+            result.credential_out = value;
+        } else {
+            return error.UnknownOption;
+        }
+    }
+    if (!have_vnr or !have_address) return error.MissingRequiredOption;
+    return result;
+}
+
+fn parseRoute(args: []const []const u8) !Command {
+    if (args.len == 0) return error.MissingSubcommand;
+    if (std.mem.eql(u8, args[0], "add")) {
+        if (args.len != 3) return error.InvalidArguments;
+        return .{ .route_add = .{ .cidr = args[1], .node = args[2] } };
+    }
+    if (std.mem.eql(u8, args[0], "delete")) {
+        if (args.len != 2) return error.InvalidArguments;
+        return .{ .route_delete = args[1] };
+    }
+    if (std.mem.eql(u8, args[0], "list")) return .{ .route_list = try common.parseOutputFlag(args[1..]) };
+    if (std.mem.eql(u8, args[0], "show")) {
+        if (args.len < 2 or args.len > 3) return error.InvalidArguments;
+        return .{ .route_show = .{ .cidr = args[1], .output = try common.parseOutputFlag(args[2..]) } };
+    }
+    return error.UnknownSubcommand;
+}
+
+fn exactNoArgs(args: []const []const u8, command: Command) !Command {
+    if (args.len != 0) return error.InvalidArguments;
+    return command;
+}
+
+test "server parser covers global overrides and typed command shape" {
+    const args = [_][]const u8{
+        "--state-dir", "/tmp/ntip-state",  "node",            "create", "node01",
+        "--addr",      "10.1.0.2",         "--vnr",           "vnr0",   "--expires",
+        "2d",          "--credential-out", "/tmp/credential",
+    };
+    const parsed = try parse(&args);
+    try std.testing.expectEqualStrings("/tmp/ntip-state", parsed.paths.state_dir);
+    switch (parsed.command) {
+        .node_create => |command| {
+            try std.testing.expectEqualStrings("node01", command.name);
+            try std.testing.expectEqualStrings("vnr0", command.vnr);
+            try std.testing.expectEqual(@as(?u64, 172_800), command.expires_seconds);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "server parser rejects incomplete and destructive implicit forms" {
+    const missing = [_][]const u8{ "node", "create", "node01", "--vnr", "vnr0" };
+    try std.testing.expectError(error.MissingRequiredOption, parse(&missing));
+    const force = [_][]const u8{ "vnr", "delete", "vnr0", "--force" };
+    try std.testing.expectError(error.InvalidArguments, parse(&force));
+    const duplicate = [_][]const u8{ "node", "create", "node01", "--vnr", "v0", "--vnr", "v1", "--addr", "10.1.0.2" };
+    try std.testing.expectError(error.DuplicateOption, parse(&duplicate));
+}

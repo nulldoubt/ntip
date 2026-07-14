@@ -1,0 +1,21 @@
+.{
+    .name = .ntip,
+    .version = "0.1.0-dev",
+    .fingerprint = 0x4d7f3e7238645ce9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "scripts",
+        "packaging",
+        "docs",
+        "README.md",
+        "CHANGELOG.md",
+        "SECURITY.md",
+        "LICENSE",
+        "release",
+    },
+}

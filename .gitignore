@@ -1,0 +1,29 @@
+# Zig build output and caches
+.zig-cache/
+zig-out/
+.zig-cache-global/
+
+# Local test and runtime state
+.ntip-test/
+coverage/
+artifacts/
+dist/
+results/
+*.profraw
+*.profdata
+__pycache__/
+*.py[cod]
+core
+*.core
+
+# Generated credentials and identities
+*.key
+*.token
+ntip-enroll-*
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "version": "0.1.0-beta.1",
+  "approved": false,
+  "gates": [
+    { "name": "native-x86_64", "passed": false, "evidence": "" },
+    { "name": "native-aarch64", "passed": false, "evidence": "" },
+    { "name": "24-hour-soak", "passed": false, "evidence": "" },
+    { "name": "independent-security-review", "passed": false, "evidence": "" },
+    { "name": "noise-interoperability", "passed": false, "evidence": "" },
+    { "name": "benchmark-report", "passed": false, "evidence": "" }
+  ]
+}

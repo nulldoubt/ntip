@@ -1,0 +1,32 @@
+{
+  "xkpsk1": {
+    "messages": [
+      "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22488e3f6e979e6c0d255b27e07091d5556770d9575edf",
+      "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b50cf3d489135073dc41b52a892a92c4ed4ae4e6d6ba4",
+      "d58fdac4e38f4c30be25fc8347deffdc74ab84b435bbaa378da5510415ac1f724e5c378016ca8d37e63a7e6486f5c603877d2a27475d9cc6c024422a74ea7d397c761a4d4ceb82"
+    ],
+    "hash": "80620c7269251e42db8135f93a7d22ded094d4335afd0376f922b08f062b8445",
+    "transport": {
+      "initiator_to_responder": "3f52b62a847b155ceb79b189ed94061d100104b2d03fcb69c2d08e7142fb",
+      "responder_to_initiator": "4c3111e8e0e2870d87f9f6364542a1fd2b4db915b6db2b87c9b7041a49b4"
+    }
+  },
+  "ik": {
+    "messages": [
+      "b307ae8660efaed4d6a65f6640896892ea4a1f0075555c489d1312a2e1677c284f7b35cc256824a63302bfd173ece0200cb500cf8ac1d70b5c9af56918813e2ce035f2da81de55a0a48b85f91d36eac2bc52db39e052f9a2c71ff0e29d7ce0d634471fec9ce04439a9",
+      "5855784cb3c8c796d84ac93e8f4a53dab0bb31e80960042cfa87f03a4293b30832dfd3c7c6693f3b523ec50a8836fb1e0b63f5c9f003d8"
+    ],
+    "hash": "2e3b030c89bf7c82b59bdcd4cb93c19f9433b0db491ec305b41991283f644048",
+    "transport": {
+      "initiator_to_responder": "d439ae16587490b7f2c747a95e8eea17caa278af0a09fc9aa66608e462ab",
+      "responder_to_initiator": "f340ed6fc1ea9c14c90b6cefc6137412dd6246d9720ef7d667984911c8c3"
+    }
+  },
+  "negative": {
+    "xkpsk1_wrong_psk_rejected": true,
+    "xkpsk1_wrong_responder_static_rejected": true,
+    "xkpsk1_altered_prologue_rejected": true,
+    "ik_wrong_responder_static_rejected": true,
+    "ik_altered_prologue_rejected": true
+  }
+}

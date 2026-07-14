@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "listen_port": 49152,
+  "tun_name": "ntip0",
+  "inner_mtu": 1380,
+  "heartbeat_idle_seconds": 15,
+  "suspect_after_seconds": 30,
+  "offline_after_seconds": 45,
+  "default_enrollment_lifetime_seconds": 86400,
+  "maximum_nodes": 4096,
+  "traffic": {
+    "cold_after_seconds": 30,
+    "hot_packets_per_second": 100000,
+    "hot_bits_per_second": 1000000000,
+    "saturated_queue_percent": 80,
+    "hysteresis_seconds": 5
+  }
+}
