@@ -23,7 +23,7 @@ for command in awk mktemp sed systemd-analyze; do
 done
 
 # systemd expresses the threshold in tenths: 30 means an exposure score of
-# 3.0. Ubuntu 24.04 systemd 255 currently reports 2.8 for both bundled units.
+# 3.0. Ubuntu 24.04 systemd 255 currently reports 2.9 for both bundled units.
 # The small margin catches meaningful sandbox regression without pretending
 # that this heuristic replaces capability tests or security review.
 threshold=${NTIP_SYSTEMD_SECURITY_THRESHOLD:-30}

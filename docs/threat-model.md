@@ -179,8 +179,10 @@ compromised root account.
 
 ### Process and command execution
 
-TUN creation requires `CAP_NET_ADMIN`. Daemons drop to the dedicated `ntip`
-account before threads and retain only that capability. Packaged systemd units
+TUN creation requires `CAP_NET_ADMIN`. The root startup phase also needs
+temporary `CAP_DAC_OVERRIDE` to enter the private `ntip`-owned state directory;
+daemons replace their live capability sets, drop to the dedicated `ntip`
+account before threads, and retain only `CAP_NET_ADMIN`. Packaged systemd units
 restrict capabilities, write paths, namespaces, devices, and privilege
 escalation.
 

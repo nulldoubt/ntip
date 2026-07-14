@@ -22,6 +22,9 @@ Development version: `0.1.0-dev`.
 
 ### Security
 
+- Fixed packaged systemd startup so its runtime directory is consistently
+  `root:ntip-admin` and its root initialization phase can enter private
+  service-owned state before dropping to `ntip` with only `CAP_NET_ADMIN`.
 - Make `ntcl config` a crash-recoverable identity transition that rotates the
   Node static key instead of retaining it across enrollment reset.
 - Fixed Noise XKpsk1 enrollment and IK session patterns with

@@ -36,6 +36,12 @@ the dropped `ntip` process to remove its own NTIP-owned socket. The bundled
 self-managed service therefore uses `0770 root:ntip-admin`; persistent config,
 state, and secret directories remain private.
 
+The systemd process begins as `root:ntip-admin` with narrowly bounded startup
+capabilities so it can enter the `0700 ntip:ntip` state directory and create
+kernel/runtime resources. Before readiness and before creating threads, NTIP
+drops to `ntip:ntip` and replaces its live capability sets with only
+`CAP_NET_ADMIN`.
+
 Add an operator to the administrative group only when they may reconfigure the
 entire NTN:
 
@@ -84,6 +90,19 @@ paths. Adjust it only for interfaces and topologies that require the change.
 
 The default UDP listener is port 49152 on IPv4 and IPv6. Permit that port in the
 underlay firewall. Do not expose the local Unix sockets over a network.
+
+If foreground startup reports `InsecureOwner`, verify numeric ownership rather
+than weakening the check:
+
+```sh
+stat -c '%u:%g %U:%G %a %n' /var/lib/ntip/server /run/ntip
+getent passwd ntip
+getent group ntip-admin
+```
+
+The server state directory must be `0700 ntip:ntip`, while `/run/ntip` must be
+`0770 root:ntip-admin`. Reinstall the packaged unit if systemd recreates the
+runtime directory under a different group.
 
 ## 3. Files and permissions
 

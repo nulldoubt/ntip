@@ -147,10 +147,12 @@ does not permit fragmentation by NTIP. Oversized inner packets are rejected;
 unexpected outer `EMSGSIZE` handling generates an IPv4 fragmentation-needed
 error toward the inner sender when possible.
 
-Services start with only enough privilege to initialize networking, then run as
-the dedicated `ntip` account while retaining only `CAP_NET_ADMIN`. Systemd
-executes foreground mode and applies additional namespace, filesystem, syscall,
-and capability restrictions.
+Services start with only enough privilege to enter private service-owned state,
+create root-owned IPC, and initialize networking, then run as the dedicated
+`ntip` account while retaining only `CAP_NET_ADMIN`. The packaged systemd units
+set their initial group to `ntip-admin` so `RuntimeDirectory=ntip` preserves the
+required `root:ntip-admin` ownership. Systemd executes foreground mode and
+applies additional namespace, filesystem, syscall, and capability restrictions.
 
 ## Persistence and IPC
 

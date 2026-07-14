@@ -93,10 +93,23 @@ PATH="/tmp/ntip-spdx-tools/bin:$PATH" \
 
 The packaged systemd units are syntax-checked and passed to
 `check-systemd-security.sh`. On Ubuntu 24.04's systemd 255 both currently score
-2.8; CI enforces a maximum exposure score of 3.0 (`--threshold=30`) and uploads
+2.9; CI enforces a maximum exposure score of 3.0 (`--threshold=30`) and uploads
 the full report for both native architectures. This score is a
 version-dependent regression heuristic. It does not prove runtime privilege
 dropping and does not satisfy the independent security-review gate.
+
+Native disposable CI additionally runs:
+
+```sh
+sudo env NTIP_SYSTEMD_SMOKE_DISPOSABLE=1 \
+  scripts/integration/systemd-master-smoke.sh
+```
+
+The explicit opt-in and empty-state check prevent accidental use on an operator
+Master. The smoke starts the installed unit, proves its runtime-directory and
+socket ownership, checks that the process dropped to `ntip` with only
+`CAP_NET_ADMIN` live, exercises IPC, stops the unit, and verifies TUN/socket
+teardown. Static unit analysis alone cannot establish those runtime facts.
 
 ## Test layers
 

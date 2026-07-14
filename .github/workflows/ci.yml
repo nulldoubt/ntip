@@ -147,6 +147,11 @@ jobs:
           sudo systemd-analyze verify ntsrv.service ntcl.service
           sudo ./scripts/check-systemd-security.sh ntsrv.service ntcl.service \
             | tee artifacts/systemd-security-x86_64.txt
+      - name: Exercise the installed Master through systemd
+        run: |
+          sudo env NTIP_SYSTEMD_SMOKE_DISPOSABLE=1 \
+            ./scripts/integration/systemd-master-smoke.sh \
+            | tee artifacts/systemd-runtime-x86_64.txt
       - name: Run namespace, NAT, roaming, and kernel-policy scenarios
         run: sudo env NTIP_BIN_DIR="$PWD/zig-out/bin" NTIP_KEEP_FAILED=1 ./scripts/integration/ns-integration.sh
       - name: Upload integration logs after failure
@@ -205,6 +210,9 @@ jobs:
           sudo systemd-analyze verify ntsrv.service ntcl.service
           sudo ./scripts/check-systemd-security.sh ntsrv.service ntcl.service \
             | tee artifacts/systemd-security-aarch64.txt
+          sudo env NTIP_SYSTEMD_SMOKE_DISPOSABLE=1 \
+            ./scripts/integration/systemd-master-smoke.sh \
+            | tee artifacts/systemd-runtime-aarch64.txt
           sudo env NTIP_BIN_DIR="$PWD/zig-out/bin" NTIP_KEEP_FAILED=1 ./scripts/integration/ns-integration.sh
       - name: Upload AArch64 package and systemd evidence
         if: always()

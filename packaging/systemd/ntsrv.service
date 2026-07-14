@@ -8,7 +8,8 @@ ConditionPathIsReadWrite=/var/lib/ntip/server
 
 [Service]
 Type=simple
-ExecStartPre=+/usr/bin/install -d -o root -g ntip-admin -m 0770 /run/ntip
+User=root
+Group=ntip-admin
 ExecStart=/usr/bin/ntsrv --config /etc/ntip/server.json --state-dir /var/lib/ntip/server --runtime-dir /run/ntip up
 ExecStop=-/usr/bin/ntsrv --config /etc/ntip/server.json --state-dir /var/lib/ntip/server --runtime-dir /run/ntip down
 Restart=on-failure
@@ -18,11 +19,12 @@ TimeoutStopSec=20s
 KillSignal=SIGTERM
 UMask=0077
 
-# ntsrv starts with only the privileges required to create the root-owned IPC
-# socket, enter the ntip account, and retain CAP_NET_ADMIN. Its post-startup
-# capability set is checked by integration tests.
-CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_NET_ADMIN
-AmbientCapabilities=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_NET_ADMIN
+# Startup must enter the ntip-owned 0700 state directory before the process
+# drops uid 0. CAP_DAC_OVERRIDE is therefore temporary startup authority; the
+# daemon replaces its effective, permitted, inheritable, and ambient sets with
+# CAP_NET_ADMIN only before it creates threads or reports readiness.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
 NoNewPrivileges=yes
 
 RuntimeDirectory=ntip

@@ -59,6 +59,21 @@ for archive in "$@"; do
         "$root/usr/lib/systemd/system/ntcl.service"
     grep -Fq 'ExecStart=/usr/bin/ntsrv ' "$root/usr/lib/systemd/system/ntsrv.service"
     grep -Fq 'ExecStart=/usr/bin/ntcl ' "$root/usr/lib/systemd/system/ntcl.service"
+    for unit in ntsrv ntcl; do
+        unit_path=$root/usr/lib/systemd/system/$unit.service
+        grep -Fxq 'User=root' "$unit_path"
+        grep -Fxq 'Group=ntip-admin' "$unit_path"
+        if grep -q '^ExecStartPre=' "$unit_path"; then
+            echo "unit unexpectedly carries a packaged pre-start command: $unit" >&2
+            exit 1
+        fi
+        grep -Fxq \
+            'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_NET_ADMIN' \
+            "$unit_path"
+        grep -Fxq \
+            'AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_NET_ADMIN' \
+            "$unit_path"
+    done
     test "$(stat -c %a "$root/usr/bin/ntsrv")" = 755
     test "$(stat -c %a "$root/etc/ntip/server.json")" = 644
     test "$(stat -c %a "$root/var/lib/ntip/server")" = 700

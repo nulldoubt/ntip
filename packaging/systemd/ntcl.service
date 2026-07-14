@@ -8,7 +8,8 @@ ConditionPathIsReadWrite=/var/lib/ntip/client
 
 [Service]
 Type=simple
-ExecStartPre=+/usr/bin/install -d -o root -g ntip-admin -m 0770 /run/ntip
+User=root
+Group=ntip-admin
 ExecStart=/usr/bin/ntcl --config /etc/ntip/client.json --state-dir /var/lib/ntip/client --runtime-dir /run/ntip up
 ExecStop=-/usr/bin/ntcl --config /etc/ntip/client.json --state-dir /var/lib/ntip/client --runtime-dir /run/ntip down
 Restart=on-failure
@@ -18,8 +19,11 @@ TimeoutStopSec=20s
 KillSignal=SIGTERM
 UMask=0077
 
-CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_NET_ADMIN
-AmbientCapabilities=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_NET_ADMIN
+# The root startup phase reads ntip-owned 0700 state, creates kernel/runtime
+# resources, and then drops to ntip with CAP_NET_ADMIN as its sole live
+# capability before threads or readiness.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
 NoNewPrivileges=yes
 
 RuntimeDirectory=ntip
