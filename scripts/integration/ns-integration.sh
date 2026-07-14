@@ -365,8 +365,14 @@ ip netns exec "$master_ns" ping -n -c 3 -W 2 10.1.0.3
 ip netns exec "$node1_ns" ping -n -c 3 -W 2 10.1.0.3
 ip netns exec "$master_ns" ping -n -c 3 -W 2 192.168.178.20
 
-# TCP and UDP, including Node-to-Node through Master kernel routing.
-ip netns exec "$node1_ns" iperf3 -s -D -B 10.1.0.2 -p 5201
+# TCP and UDP, including Node-to-Node through Master kernel routing. Keep the
+# server in the foreground so its PID remains owned by this scenario; iperf3's
+# daemon mode reparents itself and can otherwise outlive namespace teardown.
+ip netns exec "$node1_ns" iperf3 -s -B 10.1.0.2 -p 5201 \
+    >"$work/logs/iperf3-node1.log" 2>&1 &
+iperf_pid=$!
+daemon_pids="$iperf_pid $daemon_pids"
+sleep 0.5
 ip netns exec "$master_ns" iperf3 -c 10.1.0.2 -p 5201 -t 2
 ip netns exec "$node2_ns" iperf3 -c 10.1.0.2 -p 5201 -t 2
 ip netns exec "$node2_ns" iperf3 -c 10.1.0.2 -p 5201 -u -b 10M -t 2
