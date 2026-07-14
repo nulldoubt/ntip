@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix; artifacts only, no release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    name: Validate and build release artifacts
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_commit: ${{ steps.version.outputs.release_commit }}
+      tag_object: ${{ steps.version.outputs.tag_object }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install release validation tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils jq
+      - name: Select and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=$INPUT_VERSION
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          gate="release/gates/$version.json"
+          test -f "$gate"
+          python3 scripts/check-release-gate.py \
+            "$gate" "$version" --require-approved
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            ref_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+            tag_type=$(jq -r '.object.type' <<<"$ref_json")
+            tag_sha=$(jq -r '.object.sha' <<<"$ref_json")
+            test "$tag_type" = tag
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+            jq -e '
+              .verification.verified == true and
+              .verification.reason == "valid" and
+              .object.type == "commit"
+            ' <<<"$tag_json" >/dev/null
+            test "$(jq -r '.tag' <<<"$tag_json")" = "$GITHUB_REF_NAME"
+            release_commit=$(jq -r '.object.sha' <<<"$tag_json")
+            test "$release_commit" = "$(git rev-parse "$GITHUB_REF_NAME^{}")"
+            git merge-base --is-ancestor "$release_commit" origin/main
+          else
+            tag_sha=
+            release_commit=$GITHUB_SHA
+          fi
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
+          echo "tag_object=$tag_sha" >> "$GITHUB_OUTPUT"
+          zig build version-check -Dexpected-version="$version"
+      - name: Run complete portable and cross-build gates
+        run: zig build check
+      - name: Verify native development CLI metadata
+        run: |
+          zig build
+          test "$(zig-out/bin/ntsrv version)" = "ntsrv ${{ steps.version.outputs.version }}"
+          test "$(zig-out/bin/ntcl version)" = "ntcl ${{ steps.version.outputs.version }}"
+      - name: Build and compare two clean static-musl releases
+        run: |
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          ./scripts/check-clean-release-reproducibility.sh \
+            "${{ steps.version.outputs.version }}"
+      - name: Verify isolated installer lifecycle and aggregate checksums
+        run: |
+          ./scripts/check-installer-isolation.sh dist/*.tar.gz
+          (cd dist && sha256sum *.tar.gz *.tar.gz.sha256 *.spdx.json > SHA256SUMS)
+      - name: Inspect archive contracts
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          python3 scripts/check-release-archive.py \
+            "$version" x86_64-linux-musl \
+            "dist/ntip-v$version-x86_64-linux-musl.tar.gz" \
+            --require-native-execution
+          python3 scripts/check-release-archive.py \
+            "$version" aarch64-linux-musl \
+            "dist/ntip-v$version-aarch64-linux-musl.tar.gz"
+          (cd dist && sha256sum --check SHA256SUMS)
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ntip-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  noise-oracles:
+    name: Release Noise transcript oracles
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install isolated oracle runtimes
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y golang-go jq python3-venv
+      - name: Compare pinned Python and Go implementations
+        run: ./scripts/check-noise-oracles.sh
+
+  spdx-validation:
+    name: Validate generated SPDX documents
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ntip-${{ needs.build.outputs.version }}
+          path: dist
+      - name: Validate with official SPDX Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/spdx-tools"
+          "$RUNNER_TEMP/spdx-tools/bin/pip" install \
+            --disable-pip-version-check spdx-tools==0.8.5
+          PATH="$RUNNER_TEMP/spdx-tools/bin:$PATH" \
+            ./scripts/validate-spdx.sh dist/*.spdx.json
+
+  publish:
+    name: Attest and publish approved artifacts
+    needs: [build, noise-oracles, spdx-validation]
+    runs-on: ubuntu-24.04
+    environment: production-beta
+    permissions:
+      actions: read
+      artifact-metadata: write
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ntip-${{ needs.build.outputs.version }}
+          path: dist
+      - name: Revalidate artifact checksums and signed tag identity
+        env:
+          EXPECTED_COMMIT: ${{ needs.build.outputs.release_commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.build.outputs.tag_object }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            ref_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+            test "$(jq -r '.object.type' <<<"$ref_json")" = tag
+            tag_sha=$(jq -r '.object.sha' <<<"$ref_json")
+            test "$tag_sha" = "$EXPECTED_TAG_OBJECT"
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+            jq -e '
+              .verification.verified == true and
+              .verification.reason == "valid" and
+              .object.type == "commit"
+            ' <<<"$tag_json" >/dev/null
+            test "$(jq -r '.tag' <<<"$tag_json")" = "$GITHUB_REF_NAME"
+            test "$(jq -r '.object.sha' <<<"$tag_json")" = "$EXPECTED_COMMIT"
+          fi
+      - name: Attest archives and SBOMs
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.spdx.json
+            dist/SHA256SUMS
+      - name: Publish tagged GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

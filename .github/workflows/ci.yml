@@ -1,0 +1,216 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  portable:
+    name: Portable (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Verify toolchain
+        run: test "$(zig version)" = "$ZIG_VERSION"
+      - name: Formatting
+        run: zig fmt --check build.zig build.zig.zon src
+      - name: Validate release-gate schemas and negative cases
+        run: |
+          python3 -m unittest tests/scripts/test_release_gate_validator.py
+          found=0
+          for gate in release/gates/*.json; do
+            test -f "$gate" || continue
+            found=1
+            version=${gate##*/}
+            version=${version%.json}
+            python3 scripts/check-release-gate.py "$gate" "$version"
+          done
+          test "$found" -eq 1
+      - name: Compile checks
+        run: zig build check
+      - name: Unit tests
+        run: zig build test
+      - name: Version consistency
+        run: zig build version-check
+      - name: Fuzz smoke
+        run: zig build fuzz
+
+  cross-build:
+    name: Static musl cross-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install release validation tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils file jq python3-venv
+      - run: zig build cross
+      - name: Two clean reproducible release builds and archives
+        run: |
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          version=$(./scripts/check-version.sh)
+          mkdir -p artifacts
+          ./scripts/check-clean-release-reproducibility.sh "$version" \
+            | tee artifacts/clean-release-reproducibility.txt
+          ./scripts/check-installer-isolation.sh dist/*.tar.gz \
+            | tee artifacts/installer-isolation.txt
+      - name: Validate SPDX with the official SPDX Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/spdx-tools"
+          "$RUNNER_TEMP/spdx-tools/bin/pip" install \
+            --disable-pip-version-check spdx-tools==0.8.5
+          PATH="$RUNNER_TEMP/spdx-tools/bin:$PATH" \
+            ./scripts/validate-spdx.sh dist/*.spdx.json \
+            | tee artifacts/spdx-validation.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ntip-cross-builds
+          path: |
+            zig-out/release/
+            dist/
+            artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  noise-oracles:
+    name: Independent Noise transcript oracles
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install isolated oracle runtimes
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y golang-go jq python3-venv
+      - name: Compare pinned Python and Go implementations
+        run: ./scripts/check-noise-oracles.sh
+
+  namespace-x86_64:
+    name: Privileged namespaces (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install namespace tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils conntrack iperf3 iproute2 jq nftables
+      - name: Build native binaries and integration tests
+        run: |
+          zig build
+          zig build integration
+      - name: Execute the packaged static x86_64 binaries
+        run: |
+          zig build release
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          version=$(./scripts/check-version.sh)
+          ./scripts/package-release.sh "$version" x86_64-linux-musl
+          mkdir -p artifacts
+          python3 scripts/check-release-archive.py \
+            "$version" x86_64-linux-musl \
+            "dist/ntip-v$version-x86_64-linux-musl.tar.gz" \
+            --require-native-execution \
+            | tee artifacts/native-package-x86_64.txt
+      - name: Install disposable-runner service prerequisites
+        run: sudo ./scripts/install.sh
+      - name: Verify systemd unit syntax and confinement
+        run: |
+          sudo systemd-analyze verify ntsrv.service ntcl.service
+          sudo ./scripts/check-systemd-security.sh ntsrv.service ntcl.service \
+            | tee artifacts/systemd-security-x86_64.txt
+      - name: Run namespace, NAT, roaming, and kernel-policy scenarios
+        run: sudo env NTIP_BIN_DIR="$PWD/zig-out/bin" NTIP_KEEP_FAILED=1 ./scripts/integration/ns-integration.sh
+      - name: Upload integration logs after failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: namespace-x86_64-logs
+          path: /tmp/ntip-integration-*/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload x86_64 package and systemd evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: namespace-x86_64-evidence
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  native-aarch64:
+    name: Native Linux AArch64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install namespace tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils conntrack iperf3 iproute2 jq nftables
+      - name: Native build and tests
+        run: |
+          test "$(uname -m)" = aarch64
+          zig build check
+          zig build test
+          zig build integration
+          zig build
+      - name: Execute the packaged static AArch64 binaries
+        run: |
+          zig build release
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          version=$(./scripts/check-version.sh)
+          ./scripts/package-release.sh "$version" aarch64-linux-musl
+          mkdir -p artifacts
+          python3 scripts/check-release-archive.py \
+            "$version" aarch64-linux-musl \
+            "dist/ntip-v$version-aarch64-linux-musl.tar.gz" \
+            --require-native-execution \
+            | tee artifacts/native-package-aarch64.txt
+      - name: Install and run native integration
+        run: |
+          sudo ./scripts/install.sh
+          sudo systemd-analyze verify ntsrv.service ntcl.service
+          sudo ./scripts/check-systemd-security.sh ntsrv.service ntcl.service \
+            | tee artifacts/systemd-security-aarch64.txt
+          sudo env NTIP_BIN_DIR="$PWD/zig-out/bin" NTIP_KEEP_FAILED=1 ./scripts/integration/ns-integration.sh
+      - name: Upload AArch64 package and systemd evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-aarch64-evidence
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7

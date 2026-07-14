@@ -1,0 +1,38 @@
+name: Extended security tests
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extended-security-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  parser-fuzz:
+    name: Coverage-guided parser and replay fuzzing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Run bounded coverage-guided campaign
+        run: |
+          mkdir -p artifacts
+          zig build fuzz --fuzz=2M 2>&1 | tee artifacts/fuzz-campaign.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: fuzz-campaign-${{ github.run_id }}
+          path: artifacts/fuzz-campaign.txt
+          if-no-files-found: error
+          retention-days: 30
