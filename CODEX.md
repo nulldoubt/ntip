@@ -24,8 +24,10 @@ security policy, or milestone status.
   Next.js 16.2.10 standalone service; current typecheck, unit, 12-route
   production build, exact-Bun runtime smoke, full lint, and 14/14 production
   Playwright journeys passed
-- Last verified commit: `612fec4` (v0.2 work is an uncommitted working tree)
-- Last verified working tree: live/offline SQLite Master cutover, DB-free
+- Last verified commit: `a718a835107438da545c56787689ca5c4e8530f6`
+  (v0.2 implementation)
+- Last verified implementation: commit `a718a835107438da545c56787689ca5c4e8530f6`;
+  live/offline SQLite Master cutover, DB-free
   `ntip-api`, embedded contract, authenticated auth/inventory/security and
   operations dispatch, both live admin sockets, encrypted-path connectivity
   checks, enrollment application service, bounded/yielding backup and locked
