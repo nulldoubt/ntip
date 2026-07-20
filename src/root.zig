@@ -11,6 +11,7 @@ pub const cli = @import("cli/root.zig");
 pub const protocol = @import("protocol/mod.zig");
 pub const platform = @import("platform/root.zig");
 pub const runtime = @import("runtime/root.zig");
+pub const management = @import("management/root.zig");
 
 test {
     _ = domain;
@@ -19,4 +20,5 @@ test {
     _ = protocol;
     _ = platform;
     _ = runtime;
+    _ = management;
 }

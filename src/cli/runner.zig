@@ -52,6 +52,15 @@ pub fn mapError(err: anyerror) common.ExitCode {
         error.ServiceUserNotFound,
         error.AdminGroupNotFound,
         error.ServiceIdentityMismatch,
+        error.LegacyMasterStateUnsupported,
+        error.InsecureStateDirectoryPermissions,
+        error.InsecureDatabasePermissions,
+        error.InvalidDatabaseFileType,
+        error.InvalidUsername,
+        error.InvalidPassword,
+        error.EmptyPassword,
+        error.PasswordTooLong,
+        error.RootRequired,
         => .usage_or_config,
 
         error.VnrExists,
@@ -79,6 +88,7 @@ pub fn mapError(err: anyerror) common.ExitCode {
         error.AlreadyRunning,
         error.DaemonRunning,
         error.MaximumNodesExceeded,
+        error.AlreadyBootstrapped,
         => .conflict_or_not_found,
 
         error.DaemonUnavailable,
@@ -382,10 +392,15 @@ pub fn canonicalIpcCommand(args: []const []const u8) ![]const u8 {
             if (std.mem.eql(u8, args[index + 2], "renew")) return "node.enrollment.renew";
             if (std.mem.eql(u8, args[index + 2], "reset")) return "node.enrollment.reset";
         }
+    } else if (std.mem.eql(u8, primary, "user")) {
+        if (index + 1 >= args.len) return error.InvalidArguments;
+        if (std.mem.eql(u8, args[index + 1], "bootstrap")) return "user.bootstrap";
     } else {
         if (std.mem.eql(u8, primary, "up")) return "up";
         if (std.mem.eql(u8, primary, "down")) return "down";
         if (std.mem.eql(u8, primary, "status")) return "status";
+        if (std.mem.eql(u8, primary, "backup")) return "backup";
+        if (std.mem.eql(u8, primary, "restore")) return "restore";
         if (std.mem.eql(u8, primary, "config")) return "config";
         if (std.mem.eql(u8, primary, "version")) return "version";
     }

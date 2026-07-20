@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-NTIP is currently `0.1.0-dev`; no version is yet supported for production use.
+NTIP is currently `0.2.0-dev`; no version is yet supported for production use.
 After the production-beta gate, the latest beta point release will receive
 security fixes. Older development snapshots may be changed without notice.
 
@@ -33,7 +33,9 @@ pre-release phase.
 ## Security expectations
 
 - Treat `identity.key`, `enrollment.token`, and server enrollment records as
-  secrets. Enrollment PSKs stored by the Master remain bearer-equivalent.
+  secrets. Enrollment PSKs stored by the Master remain bearer-equivalent while
+  unused. Protect `ntip.sqlite3`, backups, password verifiers, and web-session
+  hashes as security-sensitive state.
 - Prefer file, standard-input, or hidden-prompt credential ingestion. Positional
   credentials can leak through shell history or process inspection.
 - Keep `/var/lib/ntip` and configuration backups encrypted and access-limited.
@@ -42,13 +44,39 @@ pre-release phase.
 - Run only the packaged systemd units or equivalent confinement. `ntsrv` and
   `ntcl` require `CAP_NET_ADMIN`; they do not require unrestricted root after
   initialization.
+- Keep `ntip-api` on canonical loopback behind the exact configured same-origin
+  HTTPS proxy. It needs no capabilities or access to `/var/lib/ntip`.
+- Keep `ntip-dashboard` on canonical loopback behind that same proxy. Route
+  pages to its listener and `/api/v1` directly to `ntip-api`; never expose
+  ports 3000 or 8787. The dashboard identity must have no supplementary groups,
+  state-directory access, or access to `/run/ntip` or `/run/ntip-api`. Next has
+  no `/api/v1` fallback rewrite, so treat a browser API routing failure as a TLS
+  proxy/configuration error rather than adding another upstream path.
+- Treat the dashboard as an unprivileged presentation process, not an
+  authorization boundary. Protected layouts verify `/auth/me`, initial reads
+  forward only the named session cookie to the loopback API, and browser
+  mutations remain subject to the API's exact-Origin, CSRF, ETag,
+  idempotency, RBAC, and recent-reauthentication checks. Protected Server
+  Component reads redirect only when the authoritative API returns `401`; this
+  suppresses parallel-render error noise without treating cookie presence as
+  authentication.
+- The packaged dashboard intentionally omits `MemoryDenyWriteExecute=yes`
+  because Bun's JavaScriptCore runtime requires executable JIT mappings. Keep
+  the unit's empty capability sets, read-only application tree, inaccessible
+  state/sockets, namespace restrictions, and localhost-only networking as the
+  compensating boundary.
 - Verify release checksums and GitHub build-provenance attestations before
-  installation.
+  installation. Verify that a dashboard archive contains the expected
+  glibc `x86_64-linux` or `aarch64-linux` Bun 1.3.14 runtime and component SPDX
+  document; dashboard packages are not static-musl and NTIP has no Node.js
+  production fallback. Dashboard payload checks reject symlinks, native
+  `.node` modules, and ELF files outside the separately validated Bun runtime.
 
 ## Cryptography policy
 
-NTIP does not invent cryptographic primitives. v0.1 pins Noise Framework r34,
-X25519, ChaCha20-Poly1305, BLAKE2s, and HKDF-SHA256 as specified in
+NTIP does not invent cryptographic primitives. Wire protocol version 1,
+unchanged in v0.2, pins Noise Framework r34, X25519, ChaCha20-Poly1305,
+BLAKE2s, and HKDF-SHA256 as specified in
 `docs/protocol.md`. There is no cipher negotiation, FIPS suite, 0-RTT DATA, or
 0-RTT administrative mutation. Changes to cryptographic state machines require
 deterministic vectors, interoperability testing against two independent Noise

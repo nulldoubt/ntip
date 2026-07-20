@@ -136,6 +136,8 @@ pub const ServerAdmin = struct {
             .node_delete => |name| try self.deleteNode(command, name, stdout),
             .node_enrollment_renew => |name| try self.renewEnrollment(name, false, stdout),
             .node_enrollment_reset => |name| try self.renewEnrollment(name, true, stdout),
+            .user_bootstrap, .restore => return error.DaemonRunning,
+            .backup => return error.UnsupportedCommand,
         }
     }
 

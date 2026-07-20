@@ -1,0 +1,7 @@
+[install]
+auto = "disable"
+exact = true
+saveTextLockfile = true
+
+[test]
+root = "packages"

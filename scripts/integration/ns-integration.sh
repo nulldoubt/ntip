@@ -25,12 +25,26 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 bin_dir=${NTIP_BIN_DIR:-$repo_root/zig-out/bin}
 ntsrv=$bin_dir/ntsrv
-ntcl=$bin_dir/ntcl
+ntcl=${NTIP_CLIENT_BIN:-$bin_dir/ntcl}
+compatibility_only=${NTIP_COMPATIBILITY_ONLY:-0}
 
-if [ ! -x "$ntsrv" ] || [ ! -x "$ntcl" ]; then
-    echo "missing ntsrv/ntcl in $bin_dir; run zig build first" >&2
+if [ ! -x "$ntsrv" ]; then
+    echo "missing current ntsrv at $ntsrv; run zig build first" >&2
     exit 1
 fi
+if [ ! -x "$ntcl" ]; then
+    echo "missing Node client at $ntcl" >&2
+    exit 1
+fi
+case "$compatibility_only" in
+    0|1) ;;
+    *)
+        echo "NTIP_COMPATIBILITY_ONLY must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+printf 'NTIP namespace binaries: %s; %s\n' \
+    "$("$ntsrv" version)" "$("$ntcl" version)"
 
 run_id=${NTIP_TEST_ID:-$$}
 case "$run_id" in
@@ -337,6 +351,21 @@ assert_socket_mode() {
     fi
 }
 
+restart_master_and_assert_reconnect() {
+    # A Master restart discards sessions. Persisted Nodes must reconnect with
+    # fresh IK, including when `$ntcl` is the pinned v0.1 binary.
+    # shellcheck disable=SC2086
+    "$ntsrv" $server_args down
+    wait "$master_pid" || true
+    daemon_pids=$(printf '%s\n' "$daemon_pids" | tr ' ' '\n' | \
+        grep -v "^$master_pid$" | tr '\n' ' ')
+    start_master
+    wait_status "$ntsrv" "$server_args" "$work/server-run/ntsrv.sock"
+    wait_node_online node01
+    wait_node_online node02
+    ip netns exec "$node1_ns" ping -n -c 3 -W 2 10.1.0.3
+}
+
 start_master
 wait_status "$ntsrv" "$server_args" "$work/server-run/ntsrv.sock"
 assert_daemon_privileges "$master_pid"
@@ -358,6 +387,18 @@ assert_socket_mode "$work/node1-run/ntcl.sock"
 assert_socket_mode "$work/node2-run/ntcl.sock"
 wait_node_online node01
 wait_node_online node02
+
+if [ "$compatibility_only" -eq 1 ]; then
+    # This focused mode is run with a client built from the pinned v0.1 base
+    # commit. Reaching both addresses proves enrollment and DATA transport;
+    # the restart assertion below proves persisted-state IK reconnect.
+    ip netns exec "$master_ns" ping -n -c 3 -W 2 10.1.0.2
+    ip netns exec "$master_ns" ping -n -c 3 -W 2 10.1.0.3
+    restart_master_and_assert_reconnect
+    passed=1
+    echo "NTIP v0.1 Node enrollment and reconnect compatibility passed"
+    exit 0
+fi
 
 # ICMP through every functional path.
 ip netns exec "$master_ns" ping -n -c 3 -W 2 10.1.0.2
@@ -517,16 +558,7 @@ if ! grep -E "Frag needed|[Mm]essage too long" \
     exit 1
 fi
 
-# A Master restart discards sessions and Nodes reconnect with fresh IK.
-# shellcheck disable=SC2086
-"$ntsrv" $server_args down
-wait "$master_pid" || true
-daemon_pids=$(printf '%s\n' "$daemon_pids" | tr ' ' '\n' | grep -v "^$master_pid$" | tr '\n' ' ')
-start_master
-wait_status "$ntsrv" "$server_args" "$work/server-run/ntsrv.sock"
-wait_node_online node01
-wait_node_online node02
-ip netns exec "$node1_ns" ping -n -c 3 -W 2 10.1.0.3
+restart_master_and_assert_reconnect
 
 passed=1
 echo "NTIP namespace integration passed"

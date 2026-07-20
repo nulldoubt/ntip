@@ -2,7 +2,8 @@
 Description=NTIP Master service
 Documentation=file:/usr/share/doc/ntip/operator-guide.md
 Wants=network-online.target
-After=network-online.target
+After=network-online.target systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
 ConditionPathExists=/etc/ntip/server.json
 ConditionPathIsReadWrite=/var/lib/ntip/server
 
@@ -13,6 +14,7 @@ Group=ntip-admin
 ExecStart=/usr/bin/ntsrv --config /etc/ntip/server.json --state-dir /var/lib/ntip/server --runtime-dir /run/ntip up
 ExecStop=-/usr/bin/ntsrv --config /etc/ntip/server.json --state-dir /var/lib/ntip/server --runtime-dir /run/ntip down
 Restart=on-failure
+RestartForceExitStatus=75
 RestartSec=2s
 TimeoutStartSec=30s
 TimeoutStopSec=20s
@@ -30,7 +32,7 @@ NoNewPrivileges=yes
 RuntimeDirectory=ntip
 RuntimeDirectoryMode=0770
 RuntimeDirectoryPreserve=yes
-ReadWritePaths=/var/lib/ntip/server /run/ntip
+ReadWritePaths=/var/lib/ntip/server /run/ntip /run/ntip-api
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

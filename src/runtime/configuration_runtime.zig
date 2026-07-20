@@ -57,7 +57,7 @@ pub const MasterPublisher = struct {
     store: *const model.Store,
     config: *const state_config.ServerConfig,
     peers: []PublishedPeer,
-    dirty_generation: u64 = 0,
+    effective_generation: u64 = 0,
     association_retirer: ?AssociationRetirer = null,
 
     pub fn init(
@@ -76,7 +76,7 @@ pub const MasterPublisher = struct {
             .store = store,
             .config = config,
             .peers = peers,
-            .dirty_generation = store.generation,
+            .effective_generation = store.generation,
         };
     }
 
@@ -95,7 +95,7 @@ pub const MasterPublisher = struct {
     }
 
     pub fn generationChanged(self: *MasterPublisher, generation: u64) void {
-        if (generation > self.dirty_generation) self.dirty_generation = generation;
+        if (generation > self.effective_generation) self.effective_generation = generation;
     }
 
     pub fn setAssociationRetirer(self: *MasterPublisher, retirer: AssociationRetirer) void {
@@ -103,6 +103,12 @@ pub const MasterPublisher = struct {
     }
 
     pub fn tick(self: *MasterPublisher, now_ns: u64) !void {
+        // Inventory and effective settings acknowledgements advance the same
+        // committed generation. Reading the in-memory projection here also
+        // covers inventory publishers that coalesced their explicit notice.
+        if (self.store.generation > self.effective_generation) {
+            self.effective_generation = self.store.generation;
+        }
         for (self.peers) |*peer| {
             if (!peer.active) continue;
             const node = self.findNode(peer.node_uuid);
@@ -116,8 +122,8 @@ pub const MasterPublisher = struct {
                 peer.* = .{};
                 continue;
             }
-            if (peer.pending_generation == 0 and peer.acknowledged_generation < self.store.generation) {
-                try self.prepare(peer, self.store.generation, now_ns);
+            if (peer.pending_generation == 0 and peer.acknowledged_generation < self.effective_generation) {
+                try self.prepare(peer, self.effective_generation, now_ns);
             }
             if (peer.pending_generation == 0 or now_ns < peer.next_send_ns) continue;
             self.transmit(peer, now_ns) catch |err| switch (err) {
@@ -133,7 +139,6 @@ pub const MasterPublisher = struct {
                 else => return err,
             };
         }
-        self.dirty_generation = self.store.generation;
     }
 
     fn prepare(self: *MasterPublisher, peer: *PublishedPeer, generation: u64, now_ns: u64) !void {
@@ -196,7 +201,7 @@ pub const MasterPublisher = struct {
             .node_uuid = node_uuid,
             .receiver_session_id = receiver_session_id,
         };
-        try self.prepare(peer, self.store.generation, now_ns);
+        try self.prepare(peer, self.effective_generation, now_ns);
         // Queue the first generation before the coordinator emits the
         // enrollment completion/heartbeat signal.
         try self.transmit(peer, now_ns);
@@ -619,6 +624,88 @@ test "Master snapshot marks prefixes routed behind the receiving Node as local" 
         if ((try view.route(route_index)).kind == .local_routed_prefix) found_local = true;
     }
     try std.testing.expect(found_local);
+}
+
+test "settings-only effective generation is published and acknowledged" {
+    var store = model.Store.init(std.testing.allocator);
+    defer store.deinit();
+    _ = try store.createVnr("vnr0", try model.Cidr.parse("10.1.0.0/24"));
+    const id: model.NodeId = .{ .bytes = .{7} ** 16 };
+    try store.createNode(id, "node01", "vnr0", try model.Ipv4.parse("10.1.0.2"));
+    try store.bindNodePublicKey("node01", [_]u8{9} ** 32);
+
+    var events = try data_worker.ControlQueue.init(std.testing.allocator, 8);
+    defer events.deinit();
+    var sink_context: u8 = 0;
+    var control = control_plane.ControlPlane.init(std.testing.allocator, std.testing.io, &events, .{
+        .context = &sink_context,
+        .submit_fn = AcceptingCommandSink.submit,
+    });
+    defer control.deinit();
+    try control.registerPendingSession(.{
+        .receiver_id = 71,
+        .peer_receiver_id = 72,
+        .owner = 7,
+        .tx_key = [_]u8{0x11} ** 32,
+        .rx_key = [_]u8{0x22} ** 32,
+        .created_ns = 1,
+        .endpoint = .{ .ip4 = .loopback(49171) },
+    }, [_]u8{0x33} ** 32, 1);
+    try control.confirmAsInitiator(71, 1);
+
+    var config: state_config.ServerConfig = .{ .schema_version = 1 };
+    var publisher = try MasterPublisher.init(
+        std.testing.allocator,
+        &control,
+        &store,
+        &config,
+        1,
+    );
+    defer publisher.deinit();
+    try publisher.readyCallback().ready(id.bytes, 71, 0, .reconnect_or_rekey, 1);
+
+    var peer = &publisher.peers[0];
+    const initial_generation = peer.pending_generation;
+    const initial_request = peer.pending_request_id;
+    const initial_hash = peer.pending_hash;
+    publisher.observer().receive(
+        71,
+        .configuration_ack,
+        initial_request,
+        initial_generation,
+        &initial_hash,
+        2,
+    );
+    try std.testing.expectEqual(initial_generation, peer.acknowledged_generation);
+    try std.testing.expectEqual(@as(u64, 0), peer.pending_generation);
+
+    // This models the post-commit effective callback: no inventory object
+    // changes, but the shared durable configuration generation advances and
+    // the immutable runtime config is replaced before publication.
+    config.inner_mtu = 1420;
+    store.generation = try std.math.add(u64, store.generation, 1);
+    publisher.generationChanged(store.generation);
+    try publisher.tick(3);
+
+    peer = &publisher.peers[0];
+    try std.testing.expectEqual(store.generation, peer.pending_generation);
+    try std.testing.expect(peer.pending_generation > initial_generation);
+    const view = try configuration.View.decode(peer.pending_bytes);
+    try std.testing.expectEqual(@as(u16, 1420), view.inner_mtu);
+
+    const applied_generation = peer.pending_generation;
+    const applied_request = peer.pending_request_id;
+    const applied_hash = peer.pending_hash;
+    publisher.observer().receive(
+        71,
+        .configuration_ack,
+        applied_request,
+        applied_generation,
+        &applied_hash,
+        4,
+    );
+    try std.testing.expectEqual(applied_generation, peer.acknowledged_generation);
+    try std.testing.expectEqual(@as(u64, 0), peer.pending_generation);
 }
 
 const AcceptingCommandSink = struct {

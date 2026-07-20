@@ -26,6 +26,8 @@ pub const Peer = struct {
     state: PeerState = .awaiting_confirmation,
     last_rx_ns: u64,
     last_tx_ns: u64,
+    authenticated_rx_ns: ?u64 = null,
+    authenticated_tx_ns: ?u64 = null,
     next_request_id: u32 = 1,
     traffic_state: traffic.State = .cold,
     /// Cleared as soon as a same-owner replacement becomes current. The peer
@@ -138,6 +140,18 @@ pub const ClientSnapshotObserver = struct {
     }
 };
 
+/// Acknowledges that the DATA worker has installed one live operational
+/// settings revision. The serialized operator worker uses this as the final
+/// runtime barrier before advancing the durable effective revision.
+pub const RuntimeSettingsObserver = struct {
+    context: *anyopaque,
+    applied_fn: *const fn (*anyopaque, u64) void,
+
+    pub fn applied(self: RuntimeSettingsObserver, sequence: u64) void {
+        self.applied_fn(self.context, sequence);
+    }
+};
+
 pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -149,6 +163,7 @@ pub const ControlPlane = struct {
     configuration_observer: ?ConfigurationObserver = null,
     snapshot_observer: ?SnapshotObserver = null,
     client_snapshot_observer: ?ClientSnapshotObserver = null,
+    runtime_settings_observer: ?RuntimeSettingsObserver = null,
     peers: std.ArrayList(Peer) = .empty,
     heartbeat_interval_ns: u64 = heartbeat_idle_ns,
     suspect_interval_ns: u64 = suspect_after_ns,
@@ -197,6 +212,16 @@ pub const ControlPlane = struct {
 
     pub fn setClientSnapshotObserver(self: *ControlPlane, observer: ?ClientSnapshotObserver) void {
         self.client_snapshot_observer = observer;
+    }
+
+    pub fn setRuntimeSettingsObserver(self: *ControlPlane, observer: ?RuntimeSettingsObserver) void {
+        self.runtime_settings_observer = observer;
+    }
+
+    /// Delivers a dedicated DATA barrier acknowledgement without routing it
+    /// behind lossy/coalescible runtime observations in the general queue.
+    pub fn runtimeSettingsApplied(self: *ControlPlane, sequence: u64) void {
+        if (self.runtime_settings_observer) |observer| observer.applied(sequence);
     }
 
     pub fn registerPendingSession(
@@ -346,7 +371,20 @@ pub const ControlPlane = struct {
     }
 
     pub fn poll(self: *ControlPlane, now_ns: u64) void {
-        while (self.events.pop()) |event| self.onEvent(event, now_ns);
+        while (self.pollOneEvent(now_ns)) {}
+        self.pollTimers(now_ns);
+    }
+
+    /// Processes at most one bounded DATA-to-control event. The Master
+    /// operator loop uses this seam to stop immediately after an event commits
+    /// a new runtime projection; Nodes continue to use `poll`.
+    pub fn pollOneEvent(self: *ControlPlane, now_ns: u64) bool {
+        const event = self.events.pop() orelse return false;
+        self.onEvent(event, now_ns);
+        return true;
+    }
+
+    pub fn pollTimers(self: *ControlPlane, now_ns: u64) void {
         self.tick(now_ns);
     }
 
@@ -363,6 +401,19 @@ pub const ControlPlane = struct {
     pub fn peerTrafficState(self: *ControlPlane, receiver_session_id: u64) ?traffic.State {
         const peer = self.findPeer(receiver_session_id) orelse return null;
         return peer.traffic_state;
+    }
+
+    pub const PeerActivity = struct {
+        authenticated_rx_ns: ?u64,
+        authenticated_tx_ns: ?u64,
+    };
+
+    pub fn peerActivity(self: *ControlPlane, receiver_session_id: u64) ?PeerActivity {
+        const peer = self.findPeer(receiver_session_id) orelse return null;
+        return .{
+            .authenticated_rx_ns = peer.authenticated_rx_ns,
+            .authenticated_tx_ns = peer.authenticated_tx_ns,
+        };
     }
 
     pub fn peerTransmitEnabled(self: *ControlPlane, receiver_session_id: u64) ?bool {
@@ -393,17 +444,20 @@ pub const ControlPlane = struct {
                 const peer = self.findPeer(event.receiver_session_id) orelse return;
                 if (!peer.transmit_enabled) return;
                 peer.last_rx_ns = now_ns;
+                peer.authenticated_rx_ns = now_ns;
                 if (peer.state == .suspect) peer.state = .online;
                 self.observeEndpoint(peer, event.endpoint orelse return, now_ns);
             },
             .outbound_authenticated => {
                 const peer = self.findPeer(event.receiver_session_id) orelse return;
                 peer.last_tx_ns = now_ns;
+                peer.authenticated_tx_ns = now_ns;
             },
             .control_frame => {
                 const peer = self.findPeer(event.receiver_session_id) orelse return;
                 if (!peer.transmit_enabled) return;
                 peer.last_rx_ns = now_ns;
+                peer.authenticated_rx_ns = now_ns;
                 self.handleControl(peer, event.endpoint orelse return, event.frame(), now_ns);
             },
             .rekey_due => {
@@ -414,6 +468,7 @@ pub const ControlPlane = struct {
             },
             .snapshot_installed => self.onSnapshotInstalled(event),
             .client_snapshot_installed => self.onClientSnapshotInstalled(event),
+            .runtime_settings_applied => self.runtimeSettingsApplied(event.snapshot_generation),
             .traffic_state_changed => {
                 const peer = self.findPeer(event.receiver_session_id) orelse return;
                 peer.traffic_state = event.traffic_state;
@@ -770,6 +825,8 @@ test "session confirmation gates Master transmission" {
     const hash = [_]u8{3} ** 32;
     try plane.registerPendingSession(session, hash, 0);
     try std.testing.expectEqual(PeerState.awaiting_confirmation, plane.peerState(7).?);
+    try std.testing.expect(plane.peerActivity(7).?.authenticated_rx_ns == null);
+    try std.testing.expect(plane.peerActivity(7).?.authenticated_tx_ns == null);
 
     const payload = (handshake.SessionConfirm{ .handshake_hash = hash }).encode();
     var frame_bytes: [control.max_frame_len]u8 = undefined;
@@ -777,6 +834,13 @@ test "session confirmation gates Master transmission" {
     try std.testing.expect(events.push(worker_mod.ControlEvent.control(7, .{ .ip4 = .loopback(49152) }, frame)));
     plane.poll(1);
     try std.testing.expectEqual(PeerState.online, plane.peerState(7).?);
+    try std.testing.expectEqual(@as(?u64, 1), plane.peerActivity(7).?.authenticated_rx_ns);
+    try std.testing.expect(events.push(.{
+        .kind = .outbound_authenticated,
+        .receiver_session_id = 7,
+    }));
+    plane.poll(2);
+    try std.testing.expectEqual(@as(?u64, 2), plane.peerActivity(7).?.authenticated_tx_ns);
     try std.testing.expectEqual(worker_mod.DataCommandKind.confirm_session, sink.commands.items[sink.commands.items.len - 1].kind);
 }
 

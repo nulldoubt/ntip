@@ -61,26 +61,39 @@ for target in "$@"; do
             ;;
     esac
 
-    base="ntip-v$version-$target"
-    archive="$repo_root/dist/$base.tar.gz"
-    sbom="$repo_root/dist/$base.spdx.json"
-    checksum="$archive.sha256"
-    rm -f "$archive" "$sbom" "$checksum"
+    core_base="ntip-v$version-$target"
+    api_base="ntip-api-v$version-$target"
+    for base in "$core_base" "$api_base"; do
+        archive="$repo_root/dist/$base.tar.gz"
+        sbom="$repo_root/dist/$base.spdx.json"
+        checksum="$archive.sha256"
+        rm -f "$archive" "$sbom" "$checksum"
+    done
 
     (CDPATH='' cd -- "$repo_root" && ./scripts/package-release.sh "$version" "$target")
-    python3 "$repo_root/scripts/check-release-archive.py" "$version" "$target" "$archive"
-    cp "$archive" "$work/$base.first.tar.gz"
-    cp "$sbom" "$work/$base.first.spdx.json"
-    cp "$checksum" "$work/$base.first.tar.gz.sha256"
+    for base in "$core_base" "$api_base"; do
+        archive="$repo_root/dist/$base.tar.gz"
+        sbom="$repo_root/dist/$base.spdx.json"
+        checksum="$archive.sha256"
+        python3 "$repo_root/scripts/check-release-archive.py" "$version" "$target" "$archive"
+        cp "$archive" "$work/$base.first.tar.gz"
+        cp "$sbom" "$work/$base.first.spdx.json"
+        cp "$checksum" "$work/$base.first.tar.gz.sha256"
+    done
 
     (CDPATH='' cd -- "$repo_root" && ./scripts/package-release.sh "$version" "$target")
-    cmp "$work/$base.first.tar.gz" "$archive"
-    cmp "$work/$base.first.spdx.json" "$sbom"
-    cmp "$work/$base.first.tar.gz.sha256" "$checksum"
-    python3 "$repo_root/scripts/check-release-archive.py" "$version" "$target" "$archive"
+    for base in "$core_base" "$api_base"; do
+        archive="$repo_root/dist/$base.tar.gz"
+        sbom="$repo_root/dist/$base.spdx.json"
+        checksum="$archive.sha256"
+        cmp "$work/$base.first.tar.gz" "$archive"
+        cmp "$work/$base.first.spdx.json" "$sbom"
+        cmp "$work/$base.first.tar.gz.sha256" "$checksum"
+        python3 "$repo_root/scripts/check-release-archive.py" "$version" "$target" "$archive"
 
-    echo "reproducible_package=$base"
-    sha256sum "$archive" "$sbom"
+        echo "reproducible_package=$base"
+        sha256sum "$archive" "$sbom"
+    done
 done
 
 echo "release_archive_reproducibility=passed"

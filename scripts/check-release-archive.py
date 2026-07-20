@@ -23,6 +23,28 @@ TARGET_MACHINES = {
     "aarch64-linux-musl": ("aarch64", 183),
 }
 
+COMPONENTS = {
+    "core": {
+        "package_name": "ntip",
+        "package_id": "SPDXRef-Package-NTIP",
+        "binaries": ("ntsrv", "ntcl"),
+        "internal_sbom_prefix": "ntip",
+    },
+    "api": {
+        "package_name": "ntip-api",
+        "package_id": "SPDXRef-Package-NTIP-API",
+        "binaries": ("ntip-api",),
+        "internal_sbom_prefix": "ntip-api",
+    },
+}
+
+SQLITE_COMPONENT = {
+    "package_id": "SPDXRef-Package-SQLite",
+    "version": "3.53.3",
+    "download": "https://www.sqlite.org/2026/sqlite-amalgamation-3530300.zip",
+    "archive_sha3": "d45c688a8cb23f68611a894a756a12d7eb6ab6e9e2468ca70adbeab3808b5ab9",
+}
+
 
 class ContractError(RuntimeError):
     pass
@@ -37,39 +59,74 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def expected_payload(repo_root: Path, version: str) -> tuple[set[str], set[str]]:
-    files = {
-        "bin/ntsrv",
-        "bin/ntcl",
-        "scripts/install.sh",
-        "scripts/uninstall.sh",
+def expected_payload(
+    repo_root: Path,
+    version: str,
+    component: str,
+) -> tuple[set[str], set[str]]:
+    common = {
         "LICENSE",
         "README.md",
         "CHANGELOG.md",
         "SECURITY.md",
-        f"ntip-{version}.spdx.json",
     }
-    for directory, pattern in (
-        ("docs", "*.md"),
-        ("packaging/config", "*.json"),
-        ("packaging/systemd", "*.service"),
-        ("packaging/tmpfiles", "*.conf"),
-    ):
-        source = repo_root / directory
-        discovered = sorted(source.glob(pattern))
-        require(bool(discovered), f"no source files found for {directory}/{pattern}")
-        files.update(f"{directory}/{path.name}" for path in discovered)
-
-    directories = {
-        ".",
-        "bin",
-        "docs",
-        "packaging",
-        "packaging/config",
-        "packaging/systemd",
-        "packaging/tmpfiles",
-        "scripts",
-    }
+    if component == "core":
+        files = common | {
+            "bin/ntsrv",
+            "bin/ntcl",
+            "scripts/install.sh",
+            "scripts/uninstall.sh",
+            "packaging/config/server.json",
+            "packaging/config/client.json",
+            "packaging/systemd/ntsrv.service",
+            "packaging/systemd/ntcl.service",
+            "packaging/tmpfiles/ntip.conf",
+            f"ntip-{version}.spdx.json",
+        }
+        for directory, pattern in (
+            ("docs", "*.md"),
+            ("packaging/examples/systemd", "*"),
+        ):
+            source = repo_root / directory
+            discovered = sorted(path for path in source.glob(pattern) if path.is_file())
+            require(bool(discovered), f"no source files found for {directory}/{pattern}")
+            files.update(f"{directory}/{path.name}" for path in discovered)
+        directories = {
+            ".",
+            "bin",
+            "docs",
+            "packaging",
+            "packaging/config",
+            "packaging/examples",
+            "packaging/examples/systemd",
+            "packaging/systemd",
+            "packaging/tmpfiles",
+            "scripts",
+        }
+    elif component == "api":
+        files = common | {
+            "bin/ntip-api",
+            "scripts/install-api.sh",
+            "scripts/uninstall-api.sh",
+            "packaging/config/api.json",
+            "packaging/systemd/ntip-api.service",
+            f"ntip-api-{version}.spdx.json",
+        }
+        source = repo_root / "docs"
+        discovered = sorted(source.glob("*.md"))
+        require(bool(discovered), "no API documentation sources found")
+        files.update(f"docs/{path.name}" for path in discovered)
+        directories = {
+            ".",
+            "bin",
+            "docs",
+            "packaging",
+            "packaging/config",
+            "packaging/systemd",
+            "scripts",
+        }
+    else:
+        raise ContractError(f"unsupported release component: {component}")
     return files, directories
 
 
@@ -95,18 +152,66 @@ def validate_sbom(
     document: dict[str, object],
     payload: dict[str, bytes],
     version: str,
+    component: str,
 ) -> None:
+    metadata = COMPONENTS[component]
     require(document.get("spdxVersion") == "SPDX-2.3", "SBOM is not SPDX-2.3")
     require(document.get("dataLicense") == "CC0-1.0", "SBOM data license is not CC0-1.0")
 
     packages = document.get("packages")
-    require(isinstance(packages, list) and len(packages) == 1, "SBOM must describe one package")
-    package = packages[0]
-    require(isinstance(package, dict), "SBOM package is not an object")
-    require(package.get("SPDXID") == "SPDXRef-Package-NTIP", "unexpected package SPDXID")
+    expected_package_count = 2 if component == "core" else 1
+    require(
+        isinstance(packages, list) and len(packages) == expected_package_count,
+        f"SBOM must describe {expected_package_count} package(s)",
+    )
+    package_by_id = {
+        item.get("SPDXID"): item
+        for item in packages
+        if isinstance(item, dict) and isinstance(item.get("SPDXID"), str)
+    }
+    require(len(package_by_id) == len(packages), "SBOM package IDs must be unique strings")
+    package = package_by_id.get(metadata["package_id"])
+    require(isinstance(package, dict), "SBOM primary package is missing")
+    require(package.get("SPDXID") == metadata["package_id"], "unexpected package SPDXID")
+    require(package.get("name") == metadata["package_name"], "unexpected package name")
     require(package.get("versionInfo") == version, "SBOM package version mismatch")
 
-    internal_sbom = f"ntip-{version}.spdx.json"
+    if component == "core":
+        sqlite_package = package_by_id.get(SQLITE_COMPONENT["package_id"])
+        require(isinstance(sqlite_package, dict), "core SBOM omits statically linked SQLite")
+        require(sqlite_package.get("name") == "sqlite", "unexpected SQLite package name")
+        require(
+            sqlite_package.get("versionInfo") == SQLITE_COMPONENT["version"],
+            "SQLite SBOM version differs from the vendored pin",
+        )
+        require(
+            sqlite_package.get("downloadLocation") == SQLITE_COMPONENT["download"],
+            "SQLite SBOM download location differs from the vendored pin",
+        )
+        require(sqlite_package.get("filesAnalyzed") is False, "SQLite dependency filesAnalyzed must be false")
+        require(
+            sqlite_package.get("licenseDeclared") == "blessing"
+            and sqlite_package.get("licenseConcluded") == "blessing",
+            "SQLite SBOM license must use the SPDX blessing identifier",
+        )
+        sqlite_checksums = sqlite_package.get("checksums")
+        require(isinstance(sqlite_checksums, list), "SQLite SBOM checksums are missing")
+        require(
+            {
+                item.get("algorithm"): item.get("checksumValue")
+                for item in sqlite_checksums
+                if isinstance(item, dict)
+            }.get("SHA3-256")
+            == SQLITE_COMPONENT["archive_sha3"],
+            "SQLite upstream archive checksum differs from the vendored pin",
+        )
+    else:
+        require(
+            SQLITE_COMPONENT["package_id"] not in package_by_id,
+            "DB-free API SBOM unexpectedly declares SQLite",
+        )
+
+    internal_sbom = f"{metadata['internal_sbom_prefix']}-{version}.spdx.json"
     expected_files = set(payload) - {internal_sbom}
     files = document.get("files")
     require(isinstance(files, list), "SBOM files is not an array")
@@ -139,14 +244,37 @@ def validate_sbom(
 
     relationships = document.get("relationships")
     require(isinstance(relationships, list), "SBOM relationships is not an array")
+    described = [
+        item.get("relatedSpdxElement")
+        for item in relationships
+        if isinstance(item, dict)
+        and item.get("spdxElementId") == "SPDXRef-DOCUMENT"
+        and item.get("relationshipType") == "DESCRIBES"
+    ]
+    require(described == [metadata["package_id"]], "SBOM DESCRIBES relationship differs")
     contained = {
         item.get("relatedSpdxElement")
         for item in relationships
         if isinstance(item, dict)
-        and item.get("spdxElementId") == "SPDXRef-Package-NTIP"
+        and item.get("spdxElementId") == metadata["package_id"]
         and item.get("relationshipType") == "CONTAINS"
     }
     require(contained == spdx_ids, "SBOM CONTAINS relationships do not match file entries")
+
+    dependency_targets = {
+        item.get("relatedSpdxElement")
+        for item in relationships
+        if isinstance(item, dict)
+        and item.get("spdxElementId") == metadata["package_id"]
+        and item.get("relationshipType") == "DEPENDS_ON"
+    }
+    if component == "core":
+        require(
+            dependency_targets == {SQLITE_COMPONENT["package_id"]},
+            "core SBOM dependency relationship must name exactly SQLite",
+        )
+    else:
+        require(not dependency_targets, "DB-free API SBOM must not declare runtime dependencies")
 
     verification = package.get("packageVerificationCode")
     require(isinstance(verification, dict), "missing package verification code")
@@ -170,17 +298,21 @@ def native_host_for(target: str) -> bool:
     return platform.system() == "Linux" and machine == expected_arch
 
 
-def execute_packaged_binaries(payload: dict[str, bytes], version: str) -> None:
+def execute_packaged_binaries(payload: dict[str, bytes], version: str, component: str) -> None:
     readelf = shutil.which("readelf")
     require(readelf is not None, "readelf is required for native static-binary validation")
     with tempfile.TemporaryDirectory(prefix="ntip-release-exec.") as temporary:
         root = Path(temporary)
-        for binary in ("ntsrv", "ntcl"):
+        binaries = COMPONENTS[component]["binaries"]
+        require(isinstance(binaries, tuple), "invalid component binary register")
+        for binary in binaries:
+            require(isinstance(binary, str), "invalid component binary name")
             path = root / binary
             path.write_bytes(payload[f"bin/{binary}"])
             path.chmod(0o755)
+            command = [str(path), "--version"] if binary == "ntip-api" else [str(path), "version"]
             completed = subprocess.run(
-                [str(path), "version"],
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -208,12 +340,20 @@ def execute_packaged_binaries(payload: dict[str, bytes], version: str) -> None:
 def inspect(args: argparse.Namespace) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     archive = args.archive.resolve()
-    root_name = f"ntip-v{args.version}-{args.target}"
-    require(archive.name == f"{root_name}.tar.gz", "archive filename does not match version and target")
+    core_root = f"ntip-v{args.version}-{args.target}"
+    api_root = f"ntip-api-v{args.version}-{args.target}"
+    if archive.name == f"{core_root}.tar.gz":
+        component = "core"
+        root_name = core_root
+    elif archive.name == f"{api_root}.tar.gz":
+        component = "api"
+        root_name = api_root
+    else:
+        raise ContractError("archive filename does not match version, target, or component")
     require(archive.is_file(), f"archive does not exist: {archive}")
     validate_checksum(archive)
 
-    expected_files, expected_directories = expected_payload(repo_root, args.version)
+    expected_files, expected_directories = expected_payload(repo_root, args.version, component)
     payload: dict[str, bytes] = {}
     directories: set[str] = set()
     seen_members: set[str] = set()
@@ -236,11 +376,11 @@ def inspect(args: argparse.Namespace) -> None:
                 directories.add(relative)
                 continue
             require(member.isfile(), f"{relative}: links and special files are forbidden")
-            expected_mode = 0o755 if relative in {
-                "bin/ntsrv",
-                "bin/ntcl",
+            expected_mode = 0o755 if relative.startswith("bin/") or relative in {
                 "scripts/install.sh",
                 "scripts/uninstall.sh",
+                "scripts/install-api.sh",
+                "scripts/uninstall-api.sh",
             } else 0o644
             require(stat.S_IMODE(member.mode) == expected_mode, f"{relative}: unexpected file mode")
             extracted = bundle.extractfile(member)
@@ -251,27 +391,33 @@ def inspect(args: argparse.Namespace) -> None:
     require(directories == expected_directories, "archive directory set does not match the release contract")
 
     _, expected_machine = TARGET_MACHINES[args.target]
-    validate_elf(payload["bin/ntsrv"], expected_machine, "ntsrv")
-    validate_elf(payload["bin/ntcl"], expected_machine, "ntcl")
+    binaries = COMPONENTS[component]["binaries"]
+    require(isinstance(binaries, tuple), "invalid component binary register")
+    for binary in binaries:
+        require(isinstance(binary, str), "invalid component binary name")
+        validate_elf(payload[f"bin/{binary}"], expected_machine, binary)
 
-    internal_name = f"ntip-{args.version}.spdx.json"
+    sbom_prefix = COMPONENTS[component]["internal_sbom_prefix"]
+    require(isinstance(sbom_prefix, str), "invalid component SBOM register")
+    internal_name = f"{sbom_prefix}-{args.version}.spdx.json"
     external_sbom = archive.parent / f"{root_name}.spdx.json"
     require(external_sbom.is_file(), f"missing external SBOM: {external_sbom}")
     require(payload[internal_name] == external_sbom.read_bytes(), "internal and external SBOMs differ")
     document = json.loads(payload[internal_name])
     require(isinstance(document, dict), "SBOM document is not an object")
-    validate_sbom(document, payload, args.version)
+    validate_sbom(document, payload, args.version, component)
 
     can_execute = native_host_for(args.target)
     if args.require_native_execution:
         require(can_execute, "archive target does not match this native Linux host")
     if can_execute:
-        execute_packaged_binaries(payload, args.version)
+        execute_packaged_binaries(payload, args.version, component)
         execution = "passed"
     else:
         execution = "skipped-non-native-host"
 
     print(f"archive={archive.name}")
+    print(f"component={component}")
     print(f"sha256={sha256(archive.read_bytes())}")
     print(f"files={len(payload)}")
     print("archive_contract=passed")

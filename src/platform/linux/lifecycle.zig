@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 
 pub const service_user = "ntip";
 pub const admin_group = "ntip-admin";
+pub const api_service_user = "ntip-api";
+pub const api_service_group = "ntip-api";
 pub const required_capability = "CAP_NET_ADMIN";
 
 // Linux UAPI `struct __user_cap_header_struct` uses a 32-bit pid. Zig 0.16.0's

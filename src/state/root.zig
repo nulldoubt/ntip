@@ -8,6 +8,15 @@ pub const client = @import("client.zig");
 pub const identity = @import("identity.zig");
 pub const server_transaction = @import("server_transaction.zig");
 pub const client_transaction = @import("client_transaction.zig");
+pub const migrations = @import("migrations.zig");
+pub const sqlite = @import("sqlite.zig");
+pub const sqlite_repository = @import("sqlite_repository.zig");
+pub const management_repository = @import("management_repository.zig");
+pub const access_repository = @import("access_repository.zig");
+pub const operations_repository = @import("operations_repository.zig");
+pub const sqlite_maintenance = @import("sqlite_maintenance.zig");
+pub const settings_repository = @import("settings_repository.zig");
+pub const idempotency_repository = @import("idempotency_repository.zig");
 
 test {
     _ = json;
@@ -20,4 +29,13 @@ test {
     _ = identity;
     _ = server_transaction;
     _ = client_transaction;
+    _ = migrations;
+    _ = sqlite;
+    _ = sqlite_repository;
+    _ = management_repository;
+    _ = access_repository;
+    _ = operations_repository;
+    _ = sqlite_maintenance;
+    _ = settings_repository;
+    _ = idempotency_repository;
 }

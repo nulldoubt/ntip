@@ -1,7 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const socket_deadline = @import("socket_deadline.zig");
 
 pub const socket_mode: std.Io.File.Permissions = @enumFromInt(0o660);
+/// Human-admin connections are OS-authorized but still untrusted for
+/// availability. One incomplete request is hard-closed after this slice; the
+/// serialized owner rechecks protocol work before accepting another.
+pub const io_timeout_milliseconds: i64 = socket_deadline.phase_timeout_milliseconds;
 
 pub const PeerCredentials = extern struct {
     pid: i32,
@@ -62,7 +67,10 @@ fn secureSocketPath(path: []const u8, admin_gid: std.Io.File.Gid) !void {
 fn installIoDeadline(handle: std.Io.net.Socket.Handle) !void {
     if (comptime builtin.os.tag != .linux) return;
     const linux = std.os.linux;
-    const timeout: linux.timeval = .{ .sec = 2, .usec = 0 };
+    const timeout: linux.timeval = .{
+        .sec = 0,
+        .usec = io_timeout_milliseconds * std.time.us_per_ms,
+    };
     try std.posix.setsockopt(handle, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&timeout));
     try std.posix.setsockopt(handle, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&timeout));
 }
@@ -98,4 +106,9 @@ pub fn peerCredentials(handle: std.Io.net.Socket.Handle) !PeerCredentials {
 
 test "peer credential structure matches Linux ucred" {
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(PeerCredentials));
+}
+
+test "human admin I/O slice preserves protocol progress bound" {
+    try std.testing.expect(io_timeout_milliseconds > 0);
+    try std.testing.expect(io_timeout_milliseconds <= 250);
 }

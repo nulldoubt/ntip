@@ -1,0 +1,4 @@
+# Preserve the checksummed upstream SQLite amalgamation byte-for-byte.
+ext/sqlite/sqlite3.c -whitespace
+ext/sqlite/sqlite3.h -whitespace
+ext/sqlite/sqlite3ext.h -whitespace

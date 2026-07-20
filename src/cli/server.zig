@@ -24,6 +24,9 @@ pub const Command = union(enum) {
     route_delete: []const u8,
     route_list: common.OutputFormat,
     route_show: struct { cidr: []const u8, output: common.OutputFormat },
+    user_bootstrap: struct { username: []const u8, password_stdin: bool },
+    backup: struct { output_dir: []const u8 },
+    restore: struct { input: []const u8 },
     version,
 
     pub fn isMutation(self: Command) bool {
@@ -36,6 +39,9 @@ pub const Command = union(enum) {
             .node_enrollment_reset,
             .route_add,
             .route_delete,
+            .user_bootstrap,
+            .backup,
+            .restore,
             => true,
             else => false,
         };
@@ -80,6 +86,12 @@ pub fn parse(args: []const []const u8) !Parsed {
         try parseNode(rest)
     else if (std.mem.eql(u8, primary, "route"))
         try parseRoute(rest)
+    else if (std.mem.eql(u8, primary, "user"))
+        try parseUser(rest)
+    else if (std.mem.eql(u8, primary, "backup"))
+        try parseBackup(rest)
+    else if (std.mem.eql(u8, primary, "restore"))
+        try parseRestore(rest)
     else if (std.mem.eql(u8, primary, "version"))
         try exactNoArgs(rest, .version)
     else
@@ -188,6 +200,30 @@ fn parseRoute(args: []const []const u8) !Command {
     return error.UnknownSubcommand;
 }
 
+fn parseUser(args: []const []const u8) !Command {
+    if (args.len == 0) return error.MissingSubcommand;
+    if (!std.mem.eql(u8, args[0], "bootstrap")) return error.UnknownSubcommand;
+    if (args.len != 3 or !std.mem.eql(u8, args[2], "--password-stdin")) {
+        return error.InvalidArguments;
+    }
+    if (args[1].len == 0) return error.InvalidArguments;
+    return .{ .user_bootstrap = .{ .username = args[1], .password_stdin = true } };
+}
+
+fn parseBackup(args: []const []const u8) !Command {
+    if (args.len != 2 or !std.mem.eql(u8, args[0], "--output-dir") or args[1].len == 0) {
+        return error.InvalidArguments;
+    }
+    return .{ .backup = .{ .output_dir = args[1] } };
+}
+
+fn parseRestore(args: []const []const u8) !Command {
+    if (args.len != 2 or !std.mem.eql(u8, args[0], "--input") or args[1].len == 0) {
+        return error.InvalidArguments;
+    }
+    return .{ .restore = .{ .input = args[1] } };
+}
+
 fn exactNoArgs(args: []const []const u8, command: Command) !Command {
     if (args.len != 0) return error.InvalidArguments;
     return command;
@@ -218,4 +254,15 @@ test "server parser rejects incomplete and destructive implicit forms" {
     try std.testing.expectError(error.InvalidArguments, parse(&force));
     const duplicate = [_][]const u8{ "node", "create", "node01", "--vnr", "v0", "--vnr", "v1", "--addr", "10.1.0.2" };
     try std.testing.expectError(error.DuplicateOption, parse(&duplicate));
+}
+
+test "server parser keeps bootstrap and maintenance commands explicit" {
+    const bootstrap = try parse(&.{ "user", "bootstrap", "Root.Admin", "--password-stdin" });
+    try std.testing.expectEqualStrings("Root.Admin", bootstrap.command.user_bootstrap.username);
+    const backup = try parse(&.{ "backup", "--output-dir", "/var/backups/ntip" });
+    try std.testing.expectEqualStrings("/var/backups/ntip", backup.command.backup.output_dir);
+    const restore = try parse(&.{ "restore", "--input", "/var/backups/ntip/ntip.sqlite3" });
+    try std.testing.expectEqualStrings("/var/backups/ntip/ntip.sqlite3", restore.command.restore.input);
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "user", "bootstrap", "root" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "restore", "/tmp/backup" }));
 }

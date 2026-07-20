@@ -1,0 +1,33 @@
+{
+  "name": "@ntip/contracts",
+  "version": "0.2.0-dev",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./src/generated/schema.ts",
+    "./openapi": "./openapi/ntip-v1.yaml",
+    "./openapi.json": "./src/generated/openapi.json"
+  },
+  "files": [
+    "openapi",
+    "src"
+  ],
+  "scripts": {
+    "generate": "bun run scripts/generate.ts",
+    "validate": "bun run scripts/validate.ts",
+    "check": "bun run scripts/check-drift.ts",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "openapi-fetch": "0.17.0"
+  },
+  "devDependencies": {
+    "@readme/openapi-parser": "6.3.0",
+    "@types/bun": "1.3.14",
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
+  }
+}

@@ -16,6 +16,7 @@ pub fn serverTarget(command: server.Command, daemon_running: bool) !Target {
         .up => if (daemon_running) error.AlreadyRunning else .daemon_start,
         .down => if (daemon_running) .daemon_ipc else error.DaemonUnavailable,
         .status => if (daemon_running) .daemon_ipc else .offline_state,
+        .user_bootstrap, .restore => if (daemon_running) error.DaemonRunning else .offline_state,
         .version => .local_version,
         else => if (daemon_running) .daemon_ipc else .offline_state,
     };
@@ -67,7 +68,7 @@ pub fn applyServerMutation(store: *model.Store, io: std.Io, command: server.Comm
         },
         .route_add => |add| blk: {
             const prefix = model.Cidr.parse(add.cidr) catch return error.InvalidCidr;
-            try store.addRoute(prefix, add.node);
+            _ = try store.addRouteRandom(io, prefix, add.node);
             break :blk .route_added;
         },
         .route_delete => |text| blk: {

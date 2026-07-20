@@ -16,6 +16,15 @@ __pycache__/
 core
 *.core
 
+# Bun / TypeScript workspace
+node_modules/
+*.tsbuildinfo
+.next/
+.eslintcache
+playwright-report/
+test-results/
+output/playwright/
+
 # Generated credentials and identities
 *.key
 *.token

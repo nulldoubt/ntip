@@ -59,4 +59,13 @@ evidence only. Automation never edits these records or changes `passed`,
 `evidence`, or `approved`. In particular, a systemd exposure score and green CI
 do not substitute for a 24-hour soak, benchmark report, native rollout record,
 or independent review. The initial `0.1.0-beta.1` record intentionally remains
-unapproved until those artifacts exist and are reviewed.
+unapproved and is retained as a superseded pre-release record.
+
+Every future v0.2 release tag must add its own exact filename/version record;
+automation never reuses the v0.1 record. In addition to this human evidence,
+`scripts/check-dashboard-release-gate.py` fails every v0.2 release candidate
+unless the dashboard exists and its lint, typecheck, unit, exact-Bun production
+build, checked standalone-launcher smoke, and Playwright scripts all pass.
+Architecture-matched archive validation also starts the packaged JSON launcher
+and probes its preview-cookie guard. Development version `0.2.0-dev` is
+intentionally not treated as a release candidate.

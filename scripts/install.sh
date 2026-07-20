@@ -23,6 +23,28 @@ root_path() {
     printf '%s%s\n' "$destdir" "$1"
 }
 
+require_unique_passwd_id() {
+    identity_name=$1
+    identity_uid=$2
+    identity_matches=$(getent passwd | awk -F: -v wanted="$identity_uid" \
+        '$3 == wanted { count += 1 } END { print count + 0 }')
+    if [ "$identity_matches" != 1 ]; then
+        echo "$identity_name UID $identity_uid has duplicate numeric passwd aliases" >&2
+        exit 1
+    fi
+}
+
+require_unique_group_id() {
+    identity_name=$1
+    identity_gid=$2
+    identity_matches=$(getent group | awk -F: -v wanted="$identity_gid" \
+        '$3 == wanted { count += 1 } END { print count + 0 }')
+    if [ "$identity_matches" != 1 ]; then
+        echo "$identity_name GID $identity_gid has duplicate numeric group aliases" >&2
+        exit 1
+    fi
+}
+
 install_dir() {
     owner=$1
     group=$2
@@ -64,11 +86,11 @@ else
     fi
 
     if [ "$(uname -s)" != "Linux" ]; then
-        echo "NTIP v0.1 runtime installation supports Linux only" >&2
+        echo "NTIP v0.2 runtime installation supports Linux only" >&2
         exit 1
     fi
 
-    for command in getent groupadd useradd usermod install systemctl systemd-tmpfiles ip awk uname; do
+    for command in getent groupadd id useradd usermod install systemctl systemd-tmpfiles ip awk uname; do
         if ! command -v "$command" >/dev/null 2>&1; then
             echo "required command not found: $command" >&2
             exit 1
@@ -78,7 +100,7 @@ else
     case "$(uname -m)" in
         x86_64|aarch64) ;;
         *)
-            echo "NTIP v0.1 supports only Linux x86_64 and AArch64" >&2
+            echo "NTIP v0.2 supports only Linux x86_64 and AArch64" >&2
             exit 1
             ;;
     esac
@@ -93,7 +115,7 @@ else
             ;;
     esac
     if [ "$kernel_major" -lt 6 ] || { [ "$kernel_major" -eq 6 ] && [ "$kernel_minor" -lt 1 ]; }; then
-        echo "NTIP v0.1 requires Linux kernel 6.1 or newer (found $kernel_release)" >&2
+        echo "NTIP v0.2 requires Linux kernel 6.1 or newer (found $kernel_release)" >&2
         exit 1
     fi
     if [ ! -c /dev/net/tun ]; then
@@ -121,7 +143,9 @@ ntsrv_binary=$(find_binary ntsrv)
 ntcl_binary=$(find_binary ntcl)
 
 if [ "$staging" -eq 0 ]; then
-    if systemctl is-active --quiet ntsrv.service || systemctl is-active --quiet ntcl.service; then
+    if systemctl is-active --quiet ntsrv.service || systemctl is-active --quiet ntcl.service || \
+        systemctl is-active --quiet ntip-api.service
+    then
         echo "stop NTIP services and take a coherent state snapshot before upgrade" >&2
         exit 1
     fi
@@ -145,6 +169,36 @@ if [ "$staging" -eq 0 ]; then
     if ! getent group ntip >/dev/null 2>&1; then
         groupadd --system ntip
     fi
+
+    if ! getent group ntip-api >/dev/null 2>&1; then
+        groupadd --system ntip-api
+    fi
+
+    ntip_admin_gid=$(getent group ntip-admin | awk -F: '{print $3}')
+    ntip_group_gid=$(getent group ntip | awk -F: '{print $3}')
+    ntip_api_group_gid=$(getent group ntip-api | awk -F: '{print $3}')
+    case "$ntip_admin_gid:$ntip_group_gid:$ntip_api_group_gid" in
+        *[!0-9:]*|:*|*::*|*:)
+            echo "could not resolve numeric NTIP group identities" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$ntip_admin_gid" = 0 ] || [ "$ntip_group_gid" = 0 ] || \
+        [ "$ntip_api_group_gid" = 0 ]
+    then
+        echo "NTIP service groups must not resolve to the privileged GID" >&2
+        exit 1
+    fi
+    if [ "$ntip_admin_gid" = "$ntip_group_gid" ] || \
+        [ "$ntip_admin_gid" = "$ntip_api_group_gid" ] || \
+        [ "$ntip_group_gid" = "$ntip_api_group_gid" ]
+    then
+        echo "ntip, ntip-api, and ntip-admin must have distinct numeric GIDs" >&2
+        exit 1
+    fi
+    require_unique_group_id ntip "$ntip_group_gid"
+    require_unique_group_id ntip-api "$ntip_api_group_gid"
+    require_unique_group_id ntip-admin "$ntip_admin_gid"
 
     if ! getent passwd ntip >/dev/null 2>&1; then
         nologin_shell=/usr/sbin/nologin
@@ -183,16 +237,75 @@ if [ "$staging" -eq 0 ]; then
                 exit 1
                 ;;
         esac
-        usermod -a -G ntip-admin ntip
     fi
+
+    if ! getent passwd ntip-api >/dev/null 2>&1; then
+        nologin_shell=/usr/sbin/nologin
+        if [ ! -x "$nologin_shell" ]; then
+            nologin_shell=/sbin/nologin
+        fi
+        if [ ! -x "$nologin_shell" ]; then
+            echo "could not locate a nologin shell" >&2
+            exit 1
+        fi
+        useradd --system \
+            --gid ntip-api \
+            --home-dir /nonexistent \
+            --no-create-home \
+            --shell "$nologin_shell" \
+            --comment "NTIP management API service account" \
+            ntip-api
+    else
+        api_record=$(getent passwd ntip-api)
+        api_uid=$(printf '%s\n' "$api_record" | awk -F: '{print $3}')
+        api_primary_gid=$(printf '%s\n' "$api_record" | awk -F: '{print $4}')
+        api_home=$(printf '%s\n' "$api_record" | awk -F: '{print $6}')
+        api_shell=$(printf '%s\n' "$api_record" | awk -F: '{print $7}')
+        expected_api_gid=$(getent group ntip-api | awk -F: '{print $3}')
+        if [ "$api_uid" -eq 0 ] || [ "$api_primary_gid" != "$expected_api_gid" ] || \
+            [ "$api_home" != /nonexistent ]
+        then
+            echo "existing ntip-api account is not the dedicated API identity" >&2
+            exit 1
+        fi
+        case "$api_shell" in
+            /usr/sbin/nologin|/sbin/nologin) ;;
+            *)
+                echo "existing ntip-api account has an interactive shell: $api_shell" >&2
+                exit 1
+                ;;
+        esac
+    fi
+    if [ "$(id -G ntip-api)" != "$ntip_api_group_gid" ]; then
+        echo "ntip-api account must not have supplementary groups" >&2
+        exit 1
+    fi
+
+    ntip_uid=$(getent passwd ntip | awk -F: '{print $3}')
+    api_uid=$(getent passwd ntip-api | awk -F: '{print $3}')
+    case "$ntip_uid:$api_uid" in
+        *[!0-9:]*|:*|*::*|*:)
+            echo "could not resolve numeric NTIP service identities" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$ntip_uid" = 0 ] || [ "$api_uid" = 0 ] || [ "$ntip_uid" = "$api_uid" ]; then
+        echo "ntip and ntip-api must have distinct unprivileged numeric UIDs" >&2
+        exit 1
+    fi
+    require_unique_passwd_id ntip "$ntip_uid"
+    require_unique_passwd_id ntip-api "$api_uid"
+    usermod -a -G ntip-admin ntip
 fi
 
 install_dir root root 0755 /etc/ntip
 install_dir root root 0755 /var/lib/ntip
 install_dir root root 0755 /usr/share/doc/ntip
+install_dir root root 0755 /usr/share/doc/ntip/examples/systemd
 install_dir ntip ntip 0700 /var/lib/ntip/server
 install_dir ntip ntip 0700 /var/lib/ntip/client
 install_dir root ntip-admin 0770 /run/ntip
+install_dir ntip ntip-api 0750 /run/ntip-api
 if [ "$staging" -eq 1 ]; then
     install_dir root root 0755 /usr/bin
     install_dir root root 0755 /usr/lib/systemd/system
@@ -207,6 +320,9 @@ install_file root root 0644 "$package_root/CHANGELOG.md" /usr/share/doc/ntip/CHA
 install_file root root 0644 "$package_root/SECURITY.md" /usr/share/doc/ntip/SECURITY.md
 for document in "$package_root"/docs/*.md; do
     install_file root root 0644 "$document" "/usr/share/doc/ntip/$(basename "$document")"
+done
+for example in "$package_root"/packaging/examples/systemd/*; do
+    install_file root root 0644 "$example" "/usr/share/doc/ntip/examples/systemd/$(basename "$example")"
 done
 
 server_config=$(root_path /etc/ntip/server.json)

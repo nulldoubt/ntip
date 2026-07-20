@@ -82,6 +82,11 @@ pub const NodeId = struct {
     }
 };
 
+/// Routes use the same opaque 128-bit representation as Nodes while retaining
+/// a distinct domain name at call sites. The identifier is management-plane
+/// metadata only and is never placed on the Node wire protocol.
+pub const RouteId = NodeId;
+
 pub const EnrollmentState = enum {
     unenrolled,
     enrolled,
@@ -106,6 +111,7 @@ pub const Node = struct {
 };
 
 pub const Route = struct {
+    id: RouteId,
     prefix: Cidr,
     node: Name,
 };
@@ -143,6 +149,7 @@ pub const Store = struct {
         AddressInUse,
         NodeHasRoutes,
         RouteExists,
+        RouteIdInUse,
         RouteNotFound,
         RouteOverlap,
         RouteOverlapsVnr,
@@ -171,10 +178,20 @@ pub const Store = struct {
         return null;
     }
 
+    pub fn findNodeById(self: *const Store, id: NodeId) ?*const Node {
+        for (self.nodes.items) |*node| if (node.id.eql(id)) return node;
+        return null;
+    }
+
     pub fn findRoute(self: *const Store, prefix: Cidr) ?*const Route {
         for (self.routes.items) |*route| {
             if (route.prefix.prefix == prefix.prefix and route.prefix.network.value == prefix.network.value) return route;
         }
+        return null;
+    }
+
+    pub fn findRouteById(self: *const Store, id: RouteId) ?*const Route {
+        for (self.routes.items) |*route| if (route.id.eql(id)) return route;
         return null;
     }
 
@@ -198,6 +215,32 @@ pub const Store = struct {
         for (self.nodes.items) |node| if (node.vnr.eqlSlice(name)) return error.VnrInUse;
         const next_generation = try self.nextGeneration();
         _ = self.vnrs.orderedRemove(index);
+        self.generation = next_generation;
+    }
+
+    /// Changes a VNR range without changing its stable management name. Every
+    /// dependent invariant is checked before the Store is mutated so callers
+    /// can persist and publish the resulting generation atomically.
+    pub fn updateVnrRange(self: *Store, name: []const u8, range: Cidr) MutationError!void {
+        const index = self.vnrIndex(name) orelse return error.VnrNotFound;
+        range.validateVnr() catch |err| return switch (err) {
+            error.InvalidVnrPrefix => error.InvalidVnrPrefix,
+            error.InvalidVnrRange => error.InvalidVnrRange,
+        };
+        for (self.vnrs.items, 0..) |existing, other_index| {
+            if (other_index != index and existing.range.overlaps(range)) return error.VnrOverlap;
+        }
+        for (self.routes.items) |route| if (route.prefix.overlaps(range)) return error.RouteOverlapsVnr;
+        const master_address = range.firstUsable() orelse return error.InvalidVnrRange;
+        for (self.nodes.items) |node| {
+            if (!node.vnr.eqlSlice(name)) continue;
+            if (!range.contains(node.address)) return error.NodeAddressOutsideVnr;
+            if (!range.isUsableHost(node.address) or node.address.value == master_address.value) {
+                return error.NodeAddressReserved;
+            }
+        }
+        const next_generation = try self.nextGeneration();
+        self.vnrs.items[index].range = range;
         self.generation = next_generation;
     }
 
@@ -234,6 +277,42 @@ pub const Store = struct {
         self.generation = next_generation;
     }
 
+    /// Renames, readdresses, or moves a Node while preserving its immutable ID
+    /// and enrollment binding. Routes follow a successful rename because their
+    /// durable owner is the Node identity, not the display name.
+    pub fn updateNode(
+        self: *Store,
+        id: NodeId,
+        name_text: []const u8,
+        vnr_name: []const u8,
+        address: Ipv4,
+    ) MutationError!void {
+        const index = self.nodeIdIndex(id) orelse return error.NodeNotFound;
+        const name = Name.parse(name_text) catch return error.InvalidName;
+        const vnr = self.findVnr(vnr_name) orelse return error.VnrNotFound;
+        for (self.nodes.items, 0..) |existing, other_index| {
+            if (other_index == index) continue;
+            if (existing.name.eql(name)) return error.NodeExists;
+            if (existing.address.value == address.value) return error.AddressInUse;
+        }
+        if (!vnr.range.contains(address)) return error.NodeAddressOutsideVnr;
+        if (!vnr.range.isUsableHost(address) or address.value == vnr.masterAddress().value) {
+            return error.NodeAddressReserved;
+        }
+
+        const old_name = self.nodes.items[index].name;
+        const next_generation = try self.nextGeneration();
+        self.nodes.items[index].name = name;
+        self.nodes.items[index].vnr = vnr.name;
+        self.nodes.items[index].address = address;
+        if (!old_name.eql(name)) {
+            for (self.routes.items) |*route| {
+                if (route.node.eql(old_name)) route.node = name;
+            }
+        }
+        self.generation = next_generation;
+    }
+
     pub fn bindNodePublicKey(self: *Store, name: []const u8, public_key: [32]u8) MutationError!void {
         const index = self.nodeIndex(name) orelse return error.NodeNotFound;
         var any_nonzero = false;
@@ -262,11 +341,28 @@ pub const Store = struct {
     }
 
     pub fn addRoute(self: *Store, prefix: Cidr, node_name: []const u8) MutationError!void {
+        const node = self.findNode(node_name) orelse return error.NodeNotFound;
+        return self.addRouteWithId(deriveLegacyRouteId(prefix, node.id), prefix, node_name);
+    }
+
+    pub fn addRouteRandom(self: *Store, io: std.Io, prefix: Cidr, node_name: []const u8) MutationError!RouteId {
+        while (true) {
+            const id = RouteId.generate(io);
+            self.addRouteWithId(id, prefix, node_name) catch |err| switch (err) {
+                error.RouteIdInUse => continue,
+                else => return err,
+            };
+            return id;
+        }
+    }
+
+    pub fn addRouteWithId(self: *Store, id: RouteId, prefix: Cidr, node_name: []const u8) MutationError!void {
         prefix.validateRouted() catch |err| return switch (err) {
             error.InvalidRoutePrefix => error.InvalidRoutePrefix,
             error.InvalidRouteRange => error.InvalidRouteRange,
         };
         const node = self.findNode(node_name) orelse return error.NodeNotFound;
+        if (self.findRouteById(id) != null) return error.RouteIdInUse;
         for (self.vnrs.items) |vnr| if (vnr.range.overlaps(prefix)) return error.RouteOverlapsVnr;
         for (self.routes.items) |route| {
             if (route.prefix.prefix == prefix.prefix and route.prefix.network.value == prefix.network.value) return error.RouteExists;
@@ -274,7 +370,7 @@ pub const Store = struct {
         }
 
         const next_generation = try self.nextGeneration();
-        try self.routes.append(self.allocator, .{ .prefix = prefix, .node = node.name });
+        try self.routes.append(self.allocator, .{ .id = id, .prefix = prefix, .node = node.name });
         self.generation = next_generation;
     }
 
@@ -282,6 +378,23 @@ pub const Store = struct {
         const index = self.routeIndex(prefix) orelse return error.RouteNotFound;
         const next_generation = try self.nextGeneration();
         _ = self.routes.orderedRemove(index);
+        self.generation = next_generation;
+    }
+
+    pub fn updateRoute(self: *Store, current_prefix: Cidr, prefix: Cidr, node_name: []const u8) MutationError!void {
+        const index = self.routeIndex(current_prefix) orelse return error.RouteNotFound;
+        prefix.validateRouted() catch |err| return switch (err) {
+            error.InvalidRoutePrefix => error.InvalidRoutePrefix,
+            error.InvalidRouteRange => error.InvalidRouteRange,
+        };
+        const node = self.findNode(node_name) orelse return error.NodeNotFound;
+        for (self.vnrs.items) |vnr| if (vnr.range.overlaps(prefix)) return error.RouteOverlapsVnr;
+        for (self.routes.items, 0..) |route, other_index| {
+            if (other_index != index and route.prefix.overlaps(prefix)) return error.RouteOverlap;
+        }
+        const next_generation = try self.nextGeneration();
+        self.routes.items[index].prefix = prefix;
+        self.routes.items[index].node = node.name;
         self.generation = next_generation;
     }
 
@@ -325,7 +438,10 @@ pub const Store = struct {
         for (self.routes.items, 0..) |route, i| {
             if (self.findNode(route.node.slice()) == null) return error.NodeNotFound;
             for (self.vnrs.items) |vnr| if (vnr.range.overlaps(route.prefix)) return error.RouteOverlapsVnr;
-            for (self.routes.items[i + 1 ..]) |other| if (route.prefix.overlaps(other.prefix)) return error.RouteOverlap;
+            for (self.routes.items[i + 1 ..]) |other| {
+                if (route.id.eql(other.id)) return error.RouteIdInUse;
+                if (route.prefix.overlaps(other.prefix)) return error.RouteOverlap;
+            }
         }
     }
 
@@ -343,6 +459,11 @@ pub const Store = struct {
         return null;
     }
 
+    fn nodeIdIndex(self: *const Store, id: NodeId) ?usize {
+        for (self.nodes.items, 0..) |node, i| if (node.id.eql(id)) return i;
+        return null;
+    }
+
     fn routeIndex(self: *const Store, prefix: Cidr) ?usize {
         for (self.routes.items, 0..) |route, i| {
             if (route.prefix.prefix == prefix.prefix and route.prefix.network.value == prefix.network.value) return i;
@@ -350,6 +471,23 @@ pub const Store = struct {
         return null;
     }
 };
+
+pub fn deriveLegacyRouteId(prefix: Cidr, node_id: NodeId) RouteId {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("ntip-route-legacy-v0.2\x00");
+    var address: [4]u8 = undefined;
+    std.mem.writeInt(u32, &address, prefix.network.value, .big);
+    hash.update(&address);
+    hash.update(&.{prefix.prefix});
+    hash.update(&node_id.bytes);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    var id: RouteId = undefined;
+    @memcpy(&id.bytes, digest[0..16]);
+    id.bytes[6] = (id.bytes[6] & 0x0f) | 0x50;
+    id.bytes[8] = (id.bytes[8] & 0x3f) | 0x80;
+    return id;
+}
 
 test "domain invariants reject overlap and deletion dependencies" {
     var store = Store.init(std.testing.allocator);
@@ -372,6 +510,75 @@ test "public VNR returns an explicit warning" {
     defer store.deinit();
     const result = try store.createVnr("public", try Cidr.parse("8.8.8.0/24"));
     try std.testing.expect(result.public_range_warning);
+}
+
+test "validated in-place updates commit one generation and preserve identities" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.createVnr("vnr0", try Cidr.parse("10.1.0.0/24"));
+    _ = try store.createVnr("vnr1", try Cidr.parse("10.2.0.0/24"));
+    const id = NodeId{ .bytes = .{1} ** 16 };
+    try store.createNode(id, "node01", "vnr0", try Ipv4.parse("10.1.0.2"));
+    try store.addRoute(try Cidr.parse("192.168.10.0/24"), "node01");
+    const route_id = store.routes.items[0].id;
+
+    const before_vnr = store.generation;
+    try store.updateVnrRange("vnr0", try Cidr.parse("10.1.0.0/23"));
+    try std.testing.expectEqual(before_vnr + 1, store.generation);
+
+    const before_node = store.generation;
+    try store.updateNode(id, "edge01", "vnr1", try Ipv4.parse("10.2.0.2"));
+    try std.testing.expectEqual(before_node + 1, store.generation);
+    try std.testing.expect(store.findNode("node01") == null);
+    try std.testing.expect(store.findNodeById(id) != null);
+    try std.testing.expect(store.routes.items[0].node.eqlSlice("edge01"));
+
+    const before_route = store.generation;
+    try store.updateRoute(
+        try Cidr.parse("192.168.10.0/24"),
+        try Cidr.parse("192.168.20.0/24"),
+        "edge01",
+    );
+    try std.testing.expectEqual(before_route + 1, store.generation);
+    try std.testing.expect(store.routes.items[0].id.eql(route_id));
+    try store.validate();
+}
+
+test "in-place updates fail without partially mutating the Store" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.createVnr("vnr0", try Cidr.parse("10.1.0.0/24"));
+    _ = try store.createVnr("vnr1", try Cidr.parse("10.2.0.0/24"));
+    const first = NodeId{ .bytes = .{1} ** 16 };
+    const second = NodeId{ .bytes = .{2} ** 16 };
+    try store.createNode(first, "node01", "vnr0", try Ipv4.parse("10.1.0.2"));
+    try store.createNode(second, "node02", "vnr1", try Ipv4.parse("10.2.0.2"));
+    try store.addRoute(try Cidr.parse("192.168.10.0/24"), "node01");
+    try store.addRoute(try Cidr.parse("192.168.20.0/24"), "node02");
+    const generation = store.generation;
+
+    try std.testing.expectError(
+        error.NodeAddressOutsideVnr,
+        store.updateVnrRange("vnr0", try Cidr.parse("10.1.1.0/24")),
+    );
+    try std.testing.expectError(
+        error.NodeExists,
+        store.updateNode(first, "node02", "vnr0", try Ipv4.parse("10.1.0.3")),
+    );
+    try std.testing.expectError(
+        error.RouteOverlap,
+        store.updateRoute(
+            try Cidr.parse("192.168.10.0/24"),
+            try Cidr.parse("192.168.20.0/25"),
+            "node01",
+        ),
+    );
+
+    try std.testing.expectEqual(generation, store.generation);
+    try std.testing.expect(store.findNode("node01") != null);
+    try std.testing.expect(store.findVnr("vnr0").?.range.contains(try Ipv4.parse("10.1.0.2")));
 }
 
 test "Node IDs use UUIDv4 version and variant bits" {

@@ -1,0 +1,59 @@
+[Unit]
+Description=NTIP operations dashboard
+Documentation=file:/usr/share/doc/ntip-dashboard/README.md
+Wants=ntip-api.service
+After=network.target ntip-api.service
+ConditionPathExists=/etc/ntip/dashboard.json
+ConditionPathExists=/usr/lib/ntip-dashboard/app/launcher.ts
+
+[Service]
+Type=simple
+User=ntip-dashboard
+Group=ntip-dashboard
+WorkingDirectory=/usr/lib/ntip-dashboard/app
+ExecStart=/usr/lib/ntip-dashboard/runtime/bun run --no-env-file /usr/lib/ntip-dashboard/app/launcher.ts --config /etc/ntip/dashboard.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=NODE_ENV=production
+Environment=BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+
+# The dashboard owns no state and cannot reach the Master database or either
+# Unix socket. JavaScriptCore requires executable JIT mappings, so this unit
+# deliberately does not enable MemoryDenyWriteExecute.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+InaccessiblePaths=/var/lib/ntip /run/ntip /run/ntip-api
+ReadOnlyPaths=/etc/ntip/dashboard.json /usr/lib/ntip-dashboard
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

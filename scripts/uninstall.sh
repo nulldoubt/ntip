@@ -50,8 +50,14 @@ if [ "$staging" -eq 0 ]; then
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
+        # The separately packaged dashboard and API are consumers of the
+        # lower service layers. Stop them before the core socket disappears.
+        systemctl disable --now ntip-dashboard.service >/dev/null 2>&1 || true
         systemctl disable --now ntsrv.service >/dev/null 2>&1 || true
         systemctl disable --now ntcl.service >/dev/null 2>&1 || true
+        # ntip-api depends on the core service socket. Disable it before the
+        # provider disappears, but leave the separately owned artifact intact.
+        systemctl disable --now ntip-api.service >/dev/null 2>&1 || true
     fi
 else
     if [ ! -d "$destdir" ]; then
@@ -81,7 +87,7 @@ if [ "$staging" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
 fi
 
 echo "NTIP executables, units, and runtime files removed."
-echo "Preserved: /etc/ntip, /var/lib/ntip, user ntip, groups ntip and ntip-admin."
+echo "Preserved: /etc/ntip, /var/lib/ntip, /run/ntip-api, service accounts, and service groups."
 echo "Persistent identity and state are never deleted automatically."
 if [ "$staging" -eq 1 ]; then
     echo "Isolated uninstall completed under DESTDIR=$destdir; the host was not changed."

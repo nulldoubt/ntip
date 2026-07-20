@@ -1,0 +1,3150 @@
+openapi: 3.1.1
+info:
+  title: NTIP Management API
+  version: 1.0.0
+  summary: Same-origin management contract for NTIP v0.2.
+  description: |
+    The versioned operator API exposed by the loopback-only `ntip-api` service.
+    It is intended for the bundled dashboard and does not constitute a general
+    automation compatibility promise in v0.2.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: /api/v1
+    description: Same-origin API mounted by the operator TLS proxy
+security:
+  - sessionCookie: []
+tags:
+  - name: Health
+  - name: Authentication
+  - name: Read models
+  - name: VNRs
+  - name: Nodes
+  - name: Routes
+  - name: Enrollment
+  - name: Diagnostics
+  - name: Events
+  - name: Audit
+  - name: Users
+  - name: Sessions
+  - name: Settings
+  - name: Service control
+paths:
+  /health/live:
+    get:
+      operationId: getLiveness
+      summary: Report whether the HTTP process is alive
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: The HTTP process is live.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /health/ready:
+    get:
+      operationId: getReadiness
+      summary: Report whether ntsrv is reachable and ready
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: The management service is ready.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessStatus'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /openapi.json:
+    get:
+      operationId: getOpenApiDocument
+      summary: Return this canonical OpenAPI document as JSON
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Canonical API document.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /auth/login:
+    post:
+      operationId: login
+      summary: Create a password-authenticated web session
+      tags: [Authentication]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated. The opaque token is returned only as a cookie.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Set-Cookie:
+              $ref: '#/components/headers/SessionCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthContext'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/me:
+    get:
+      operationId: getAuthContext
+      summary: Resolve the current session and its CSRF token
+      tags: [Authentication]
+      responses:
+        '200':
+          description: Current authenticated context.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthContext'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/reauth:
+    post:
+      operationId: reauthenticate
+      summary: Refresh the session's dangerous-operation authorization window
+      tags: [Authentication]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReauthenticateRequest'
+      responses:
+        '200':
+          description: Password verified and reauthentication window refreshed.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReauthenticationStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /auth/change-password:
+    post:
+      operationId: changeOwnPassword
+      summary: Change the current user's password and revoke other sessions
+      tags: [Authentication]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Revoke the current session
+      tags: [Authentication]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Session revoked or already absent.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Set-Cookie:
+              description: Expired `__Host-ntip_session` cookie.
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /overview:
+    get:
+      operationId: getOverview
+      summary: Read the management overview
+      tags: [Read models]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: Inventory, runtime, and settings summary.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Overview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /topology:
+    get:
+      operationId: getTopology
+      summary: Read the deterministic topology projection
+      tags: [Read models]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: Current topology projection.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Topology'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /runtime/nodes:
+    get:
+      operationId: listNodeRuntime
+      summary: List current in-memory Node observations
+      tags: [Read models]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: liveness
+          in: query
+          schema:
+            $ref: '#/components/schemas/LivenessState'
+      responses:
+        '200':
+          description: Page of runtime observations.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeRuntimePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /vnrs:
+    get:
+      operationId: listVnrs
+      summary: List virtual network ranges
+      tags: [VNRs]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: Page of VNRs.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VnrPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createVnr
+      summary: Create a virtual network range
+      tags: [VNRs]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VnrCreate'
+      responses:
+        '201':
+          description: VNR created.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vnr'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /vnrs/{name}:
+    parameters:
+      - $ref: '#/components/parameters/VnrName'
+    get:
+      operationId: getVnr
+      summary: Read one virtual network range
+      tags: [VNRs]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: VNR details.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vnr'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateVnr
+      summary: Change a VNR CIDR while preserving its immutable name
+      tags: [VNRs]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VnrUpdate'
+      responses:
+        '200':
+          description: Updated VNR.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vnr'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      operationId: deleteVnr
+      summary: Delete an unused virtual network range
+      tags: [VNRs]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /nodes:
+    get:
+      operationId: listNodes
+      summary: List configured Nodes
+      tags: [Nodes]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: vnrName
+          in: query
+          schema:
+            $ref: '#/components/schemas/Name'
+        - name: enrollmentState
+          in: query
+          schema:
+            $ref: '#/components/schemas/EnrollmentState'
+      responses:
+        '200':
+          description: Page of Nodes.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createNode
+      summary: Create an unenrolled Node
+      tags: [Nodes]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeCreate'
+      responses:
+        '201':
+          description: Node created without disclosing an enrollment credential.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /nodes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      operationId: getNode
+      summary: Read one Node
+      tags: [Nodes]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: Node details.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateNode
+      summary: Rename, readdress, or move a Node to another VNR
+      tags: [Nodes]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeUpdate'
+      responses:
+        '200':
+          description: Updated Node.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      operationId: deleteNode
+      summary: Delete a Node that owns no routes
+      tags: [Nodes]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /routes:
+    get:
+      operationId: listRoutes
+      summary: List routed prefixes
+      tags: [Routes]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: nodeId
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: Page of routes.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createRoute
+      summary: Add a routed prefix owned by a Node
+      tags: [Routes]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteCreate'
+      responses:
+        '201':
+          description: Route created.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Route'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /routes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RouteId'
+    get:
+      operationId: getRoute
+      summary: Read one routed prefix
+      tags: [Routes]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: Route details.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Route'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateRoute
+      summary: Change a route prefix or owner
+      tags: [Routes]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteUpdate'
+      responses:
+        '200':
+          description: Updated route.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Route'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      operationId: deleteRoute
+      summary: Delete a routed prefix
+      tags: [Routes]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /nodes/{id}/enrollment-credentials:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      operationId: issueEnrollmentCredential
+      summary: Issue and download a one-time enrollment credential
+      description: The credential is returned once and recoverable plaintext is never persisted.
+      tags: [Enrollment]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentCredentialRequest'
+      responses:
+        '200':
+          description: Single-use enrollment credential download.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Content-Disposition:
+              $ref: '#/components/headers/Attachment'
+          content:
+            application/vnd.ntip.enrollment-credential:
+              schema:
+                $ref: '#/components/schemas/EnrollmentCredential'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /nodes/{id}/actions/reset-enrollment:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      operationId: resetNodeEnrollment
+      summary: Revoke enrollment state and any unused credential
+      tags: [Enrollment]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '200':
+          description: Node returned to the unenrolled state.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /connectivity-checks:
+    get:
+      operationId: listConnectivityChecks
+      summary: List persisted Master-originated checks
+      tags: [Diagnostics]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: nodeId
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ConnectivityCheckStatus'
+      responses:
+        '200':
+          description: Page of connectivity checks.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectivityCheckPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createConnectivityCheck
+      summary: Send an ICMP echo request to an existing Node address
+      tags: [Diagnostics]
+      x-ntip-roles: [operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectivityCheckCreate'
+      responses:
+        '202':
+          description: Check accepted for the bounded data path.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectivityCheck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /connectivity-checks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ConnectivityCheckId'
+    get:
+      operationId: getConnectivityCheck
+      summary: Read one connectivity check
+      tags: [Diagnostics]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: Connectivity check details.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectivityCheck'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /events:
+    get:
+      operationId: listEvents
+      summary: List retained runtime and security state transitions
+      tags: [Events]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: severity
+          in: query
+          schema:
+            $ref: '#/components/schemas/EventSeverity'
+        - name: nodeId
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: since
+          in: query
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+      responses:
+        '200':
+          description: Page of events.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /audit:
+    get:
+      operationId: listAuditEntries
+      summary: List immutable, role-redacted audit entries
+      tags: [Audit]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: actorUserId
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: resourceType
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: since
+          in: query
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+      responses:
+        '200':
+          description: Page of redacted audit entries.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /audit/export:
+    post:
+      operationId: exportAuditEntries
+      summary: Stream an immutable audit prefix and record an export receipt
+      tags: [Audit]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditExportRequest'
+      responses:
+        '200':
+          description: Newline-delimited audit entries followed by a signed-off receipt record.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Content-Disposition:
+              $ref: '#/components/headers/Attachment'
+            X-NTIP-Audit-Export-ID:
+              description: Identifier of the durable matching export receipt.
+              required: true
+              schema:
+                $ref: '#/components/schemas/Id'
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: UTF-8 newline-delimited JSON stream.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /audit/prune:
+    post:
+      operationId: pruneAuditEntries
+      summary: Prune only an audit prefix covered by a durable export receipt
+      tags: [Audit]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditPruneRequest'
+      responses:
+        '200':
+          description: Audit prefix pruned and the prune operation audited.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPruneResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /users:
+    get:
+      operationId: listUsers
+      summary: List management users
+      tags: [Users]
+      x-ntip-roles: [superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: Page of users.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createUser
+      summary: Provision a user with a one-time temporary password
+      tags: [Users]
+      x-ntip-roles: [superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '201':
+          description: User provisioned; the temporary password is returned once.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProvisioningResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      operationId: getUser
+      summary: Read one management user
+      tags: [Users]
+      x-ntip-roles: [superuser]
+      responses:
+        '200':
+          description: User details.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateUser
+      summary: Change a user's role or enabled state
+      tags: [Users]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+      responses:
+        '200':
+          description: Updated user. Role or enabled-state changes revoke sessions.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+    delete:
+      operationId: tombstoneUser
+      summary: Tombstone a user and permanently reserve its username
+      tags: [Users]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /users/{id}/password-reset:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: resetUserPassword
+      summary: Replace a password and return its temporary value once
+      tags: [Users]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '200':
+          description: Password reset and all existing sessions revoked.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProvisioningResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /sessions:
+    get:
+      operationId: listSessions
+      summary: List own sessions, or every session for a superuser
+      tags: [Sessions]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+        - name: scope
+          in: query
+          description: '`all` is accepted only for superusers.'
+          schema:
+            type: string
+            enum: [own, all]
+            default: own
+      responses:
+        '200':
+          description: Page of sessions.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /sessions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    delete:
+      operationId: revokeSession
+      summary: Revoke an own session, or any session for a superuser
+      tags: [Sessions]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /settings:
+    get:
+      operationId: getSettings
+      summary: Read desired and effective operational settings
+      tags: [Settings]
+      x-ntip-roles: [viewer, operator, superuser]
+      responses:
+        '200':
+          description: Current desired and effective settings state.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      operationId: updateSettings
+      summary: Create an immutable full settings revision from a partial update
+      tags: [Settings]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsUpdate'
+      responses:
+        '202':
+          description: Revision committed and queued for live application or restart.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsRevision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /settings/revisions:
+    get:
+      operationId: listSettingsRevisions
+      summary: List immutable settings revisions
+      tags: [Settings]
+      x-ntip-roles: [viewer, operator, superuser]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200':
+          description: Page of settings revisions.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsRevisionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /settings/revisions/{id}/rollback:
+    parameters:
+      - $ref: '#/components/parameters/SettingsRevisionId'
+    post:
+      operationId: rollbackSettings
+      summary: Create a new revision from an earlier settings snapshot
+      tags: [Settings]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '202':
+          description: Rollback revision committed and queued for application.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsRevision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+  /operations/restart:
+    post:
+      operationId: restartService
+      summary: Commit an audit record and request managed restart
+      description: Supply the current `serviceControlEtag` from `/overview` as If-Match.
+      tags: [Service control]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestartRequest'
+      responses:
+        '202':
+          description: Restart audit committed; ntsrv will exit with its managed-restart status.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedOperation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /operations/shutdown:
+    post:
+      operationId: shutdownService
+      summary: Commit an audit record and request clean shutdown
+      description: Supply the current `serviceControlEtag` from `/overview` as If-Match.
+      tags: [Service control]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShutdownRequest'
+      responses:
+        '202':
+          description: Shutdown audit committed; ntsrv will exit cleanly.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedOperation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-ntip_session
+      description: Opaque 256-bit session token. Only its hash is persisted.
+  headers:
+    XRequestId:
+      description: Lowercase request identifier used in logs and error responses.
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    NoStore:
+      description: Management responses are never cached.
+      required: true
+      schema:
+        type: string
+        const: no-store
+    ETag:
+      description: Strong generation tag required by later mutations.
+      required: true
+      schema:
+        $ref: '#/components/schemas/EntityTag'
+    Location:
+      description: Relative URL of the created resource.
+      required: true
+      schema:
+        type: string
+    Attachment:
+      description: Safe attachment filename generated by the service.
+      required: true
+      schema:
+        type: string
+        pattern: '^attachment; filename="[A-Za-z0-9._-]+"$'
+    SessionCookie:
+      description: '`__Host-ntip_session` with Secure, HttpOnly, SameSite=Strict, and Path=/.'
+      required: true
+      schema:
+        type: string
+        pattern: '^__Host-ntip_session=.*; Path=/; Secure; HttpOnly; SameSite=Strict$'
+    RetryAfter:
+      description: Seconds until another attempt is recommended.
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque forward-only pagination cursor.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+    PageLimit:
+      name: limit
+      in: query
+      description: Page size; defaults to 50 and is capped at 200.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Origin:
+      name: Origin
+      in: header
+      required: true
+      description: Must exactly match the configured public HTTPS origin.
+      schema:
+        type: string
+        format: uri
+        maxLength: 2048
+    CsrfToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      description: Session-bound token obtained from `/auth/me`.
+      schema:
+        type: string
+        minLength: 43
+        maxLength: 128
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Caller-generated key scoped to the authenticated principal and operation.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]+$'
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Strong ETag returned by the latest read of the target generation.
+      schema:
+        type: string
+        pattern: '^"[a-z0-9._:-]{1,96}"$'
+    VnrName:
+      name: name
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Name'
+    NodeId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    RouteId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    ConnectivityCheckId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    UserId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    SettingsRevisionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+  responses:
+    NoContent:
+      description: Operation completed without a response body.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+    BadRequest:
+      description: Malformed framing, JSON, parameters, or validation input.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: No valid session or invalid credentials.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: The authenticated principal or request origin is not authorized.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: The requested resource does not exist or is not visible.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: The operation conflicts with a domain invariant or idempotency record.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PreconditionFailed:
+      description: The supplied ETag is stale.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        ETag:
+          $ref: '#/components/headers/ETag'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PreconditionRequired:
+      description: A required If-Match precondition was omitted.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TooManyRequests:
+      description: Principal or global authentication work is throttled.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: An unexpected failure was assigned a request ID.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: ntsrv, its operator worker, or a bounded required queue is unavailable.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    Id:
+      type: string
+      description: Lowercase 128-bit identifier without separators.
+      pattern: '^[0-9a-f]{32}$'
+      examples: [018f8d95b0f74d669f16a606fa9c87e2]
+    EntityTag:
+      type: string
+      description: Opaque strong entity tag, including its required double quotes.
+      pattern: '^"[a-z0-9._:-]{1,96}"$'
+    Name:
+      type: string
+      minLength: 1
+      maxLength: 63
+      pattern: '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$'
+      examples: [edge-berlin-01]
+    Username:
+      type: string
+      description: Canonical lowercase ASCII username.
+      minLength: 1
+      maxLength: 63
+      pattern: '^[a-z0-9_][a-z0-9_.-]{0,62}$'
+      examples: [operator]
+    Password:
+      type: string
+      format: password
+      minLength: 14
+      maxLength: 256
+      writeOnly: true
+    TemporaryPassword:
+      allOf:
+        - $ref: '#/components/schemas/Password'
+      readOnly: true
+      description: Returned exactly once and never persisted in recoverable form.
+    Timestamp:
+      type: string
+      format: date-time
+      minLength: 20
+      maxLength: 20
+      pattern: '^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$'
+      description: Whole-second RFC 3339 timestamp in canonical UTC form (`YYYY-MM-DDTHH:mm:ssZ`); calendar validity is enforced by the service.
+      examples: ['2026-07-20T12:34:56Z']
+    NullableTimestamp:
+      oneOf:
+        - $ref: '#/components/schemas/Timestamp'
+        - type: 'null'
+    Ipv4Address:
+      type: string
+      format: ipv4
+      examples: [10.42.0.2]
+    Ipv4Cidr:
+      type: string
+      pattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$'
+      examples: [10.42.0.0/24]
+    Generation:
+      type: integer
+      format: int64
+      minimum: 0
+    Role:
+      type: string
+      enum: [viewer, operator, superuser]
+    UserStatus:
+      type: string
+      enum: [active, disabled, tombstoned]
+    EnrollmentState:
+      type: string
+      enum: [unenrolled, credential_issued, enrolled]
+    LivenessState:
+      type: string
+      enum: [unknown, online, suspect, offline]
+    RuntimeSessionState:
+      type: string
+      enum: [disconnected, enrolling, connecting, established]
+    TrafficState:
+      type: string
+      enum: [unknown, cold, warm, hot, saturated]
+    EventSeverity:
+      type: string
+      enum: [info, warning, critical]
+    SettingsRevisionStatus:
+      type: string
+      enum: [pending_apply, active, failed, pending_restart]
+    ConnectivityCheckStatus:
+      type: string
+      enum: [queued, running, succeeded, timed_out, failed, interrupted]
+    ErrorCode:
+      type: string
+      description: Stable machine-readable error code; messages are not stable contracts.
+      enum:
+        - invalid_request
+        - validation_failed
+        - authentication_required
+        - invalid_credentials
+        - password_change_required
+        - csrf_failed
+        - origin_forbidden
+        - forbidden
+        - reauthentication_required
+        - not_found
+        - conflict
+        - invariant_violation
+        - idempotency_required
+        - idempotency_conflict
+        - precondition_required
+        - precondition_failed
+        - rate_limited
+        - service_unavailable
+        - operation_unavailable
+        - internal_error
+    FieldViolation:
+      type: object
+      additionalProperties: false
+      required: [field, code, message]
+      properties:
+        field:
+          type: string
+          maxLength: 256
+        code:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,63}$'
+        message:
+          type: string
+          maxLength: 512
+    ErrorObject:
+      type: object
+      additionalProperties: false
+      required: [code, message, requestId]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          maxLength: 512
+        requestId:
+          $ref: '#/components/schemas/Id'
+        violations:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/FieldViolation'
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorObject'
+    PageCursor:
+      type: object
+      additionalProperties: false
+      required: [nextCursor]
+      properties:
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    HealthStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: live
+    ReadinessStatus:
+      type: object
+      additionalProperties: false
+      required: [status, ntsrv, databaseSchemaVersion]
+      properties:
+        status:
+          type: string
+          const: ready
+        ntsrv:
+          type: string
+          const: ready
+        databaseSchemaVersion:
+          type: integer
+          minimum: 1
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username:
+          $ref: '#/components/schemas/Username'
+        password:
+          $ref: '#/components/schemas/Password'
+    ReauthenticateRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          $ref: '#/components/schemas/Password'
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          $ref: '#/components/schemas/Password'
+        newPassword:
+          $ref: '#/components/schemas/Password'
+    AuthContext:
+      type: object
+      additionalProperties: false
+      required: [user, session, csrfToken]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        session:
+          $ref: '#/components/schemas/Session'
+        csrfToken:
+          type: string
+          minLength: 43
+          maxLength: 128
+          readOnly: true
+    ReauthenticationStatus:
+      type: object
+      additionalProperties: false
+      required: [validUntil]
+      properties:
+        validUntil:
+          $ref: '#/components/schemas/Timestamp'
+    InventoryCounts:
+      type: object
+      additionalProperties: false
+      required: [vnrs, nodes, routes]
+      properties:
+        vnrs:
+          type: integer
+          minimum: 0
+        nodes:
+          type: integer
+          minimum: 0
+        routes:
+          type: integer
+          minimum: 0
+    RuntimeCounts:
+      type: object
+      additionalProperties: false
+      required: [online, suspect, offline, unknown]
+      properties:
+        online:
+          type: integer
+          minimum: 0
+        suspect:
+          type: integer
+          minimum: 0
+        offline:
+          type: integer
+          minimum: 0
+        unknown:
+          type: integer
+          minimum: 0
+    Overview:
+      type: object
+      additionalProperties: false
+      required:
+        - generation
+        - inventory
+        - runtime
+        - desiredSettingsRevisionId
+        - effectiveSettingsRevisionId
+        - serviceControlEtag
+        - observedAt
+      properties:
+        generation:
+          $ref: '#/components/schemas/Generation'
+        inventory:
+          $ref: '#/components/schemas/InventoryCounts'
+        runtime:
+          $ref: '#/components/schemas/RuntimeCounts'
+        desiredSettingsRevisionId:
+          $ref: '#/components/schemas/Id'
+        effectiveSettingsRevisionId:
+          $ref: '#/components/schemas/Id'
+        pendingRestart:
+          type: boolean
+          default: false
+        serviceControlEtag:
+          allOf:
+            - $ref: '#/components/schemas/EntityTag'
+          description: Fresh If-Match value for restart and shutdown requests.
+        observedAt:
+          $ref: '#/components/schemas/Timestamp'
+    Topology:
+      type: object
+      additionalProperties: false
+      required: [generation, vnrs, nodes, routes, runtime, observedAt]
+      properties:
+        generation:
+          $ref: '#/components/schemas/Generation'
+        vnrs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Vnr'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Route'
+        runtime:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeRuntime'
+        observedAt:
+          $ref: '#/components/schemas/Timestamp'
+    Vnr:
+      type: object
+      additionalProperties: false
+      required: [name, cidr, masterAddress, generation, createdAt, updatedAt]
+      properties:
+        name:
+          $ref: '#/components/schemas/Name'
+        cidr:
+          $ref: '#/components/schemas/Ipv4Cidr'
+        masterAddress:
+          $ref: '#/components/schemas/Ipv4Address'
+        publicRangeWarning:
+          type: boolean
+          default: false
+        generation:
+          $ref: '#/components/schemas/Generation'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    VnrCreate:
+      type: object
+      additionalProperties: false
+      required: [name, cidr]
+      properties:
+        name:
+          $ref: '#/components/schemas/Name'
+        cidr:
+          $ref: '#/components/schemas/Ipv4Cidr'
+    VnrUpdate:
+      type: object
+      additionalProperties: false
+      required: [cidr]
+      properties:
+        cidr:
+          $ref: '#/components/schemas/Ipv4Cidr'
+    VnrPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Vnr'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    Node:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - vnrName
+        - address
+        - enrollmentState
+        - generation
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          $ref: '#/components/schemas/Name'
+        vnrName:
+          $ref: '#/components/schemas/Name'
+        address:
+          $ref: '#/components/schemas/Ipv4Address'
+        enrollmentState:
+          $ref: '#/components/schemas/EnrollmentState'
+        generation:
+          $ref: '#/components/schemas/Generation'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    NodeDetail:
+      type: object
+      additionalProperties: false
+      required: [node, runtime, routes]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        runtime:
+          oneOf:
+            - $ref: '#/components/schemas/NodeRuntime'
+            - type: 'null'
+        routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Route'
+    NodeCreate:
+      type: object
+      additionalProperties: false
+      required: [name, vnrName, address]
+      properties:
+        name:
+          $ref: '#/components/schemas/Name'
+        vnrName:
+          $ref: '#/components/schemas/Name'
+        address:
+          $ref: '#/components/schemas/Ipv4Address'
+    NodeUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          $ref: '#/components/schemas/Name'
+        vnrName:
+          $ref: '#/components/schemas/Name'
+        address:
+          $ref: '#/components/schemas/Ipv4Address'
+    NodePage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    Route:
+      type: object
+      additionalProperties: false
+      required: [id, prefix, nodeId, nodeName, generation, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        prefix:
+          $ref: '#/components/schemas/Ipv4Cidr'
+        nodeId:
+          $ref: '#/components/schemas/Id'
+        nodeName:
+          $ref: '#/components/schemas/Name'
+        generation:
+          $ref: '#/components/schemas/Generation'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    RouteCreate:
+      type: object
+      additionalProperties: false
+      required: [prefix, nodeId]
+      properties:
+        prefix:
+          $ref: '#/components/schemas/Ipv4Cidr'
+        nodeId:
+          $ref: '#/components/schemas/Id'
+    RouteUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        prefix:
+          $ref: '#/components/schemas/Ipv4Cidr'
+        nodeId:
+          $ref: '#/components/schemas/Id'
+    RoutePage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Route'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    NodeRuntime:
+      type: object
+      additionalProperties: false
+      required:
+        - nodeId
+        - liveness
+        - sessionState
+        - observedEndpoint
+        - trafficState
+        - authenticatedRxAt
+        - authenticatedTxAt
+        - observedAt
+      description: Runtime projection intentionally excludes keys, protocol session IDs, and software versions.
+      properties:
+        nodeId:
+          $ref: '#/components/schemas/Id'
+        liveness:
+          $ref: '#/components/schemas/LivenessState'
+        sessionState:
+          $ref: '#/components/schemas/RuntimeSessionState'
+        observedEndpoint:
+          type: [string, 'null']
+          maxLength: 255
+          examples: ['198.51.100.4:51900']
+        trafficState:
+          $ref: '#/components/schemas/TrafficState'
+        authenticatedRxAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        authenticatedTxAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        observedAt:
+          $ref: '#/components/schemas/Timestamp'
+    NodeRuntimePage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor, observedAt]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeRuntime'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+        observedAt:
+          $ref: '#/components/schemas/Timestamp'
+    DangerousConfirmation:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties:
+        confirmation:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Exact resource name or operation word typed by the user.
+    EnrollmentCredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [expiresInSeconds, confirmation]
+      properties:
+        expiresInSeconds:
+          type: integer
+          format: int64
+          minimum: 60
+          maximum: 2592000
+          description: Credential validity, from one minute through 30 days.
+        confirmation:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Exact Node name typed by the user.
+    EnrollmentCredential:
+      type: string
+      readOnly: true
+      minLength: 122
+      maxLength: 122
+      pattern: '^ntip-enroll-v1\.[A-Za-z0-9_-]{107}$'
+      description: Single-use credential text including its version prefix.
+    ConnectivityCheckCreate:
+      type: object
+      additionalProperties: false
+      required: [nodeId]
+      properties:
+        nodeId:
+          $ref: '#/components/schemas/Id'
+        timeoutMilliseconds:
+          type: integer
+          minimum: 500
+          maximum: 10000
+          default: 3000
+    ConnectivityCheck:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - nodeId
+        - nodeAddress
+        - status
+        - timeoutMilliseconds
+        - roundTripMilliseconds
+        - failureCode
+        - createdAt
+        - startedAt
+        - completedAt
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        nodeId:
+          description: Null only when the historical target Node has since been deleted.
+          oneOf:
+            - $ref: '#/components/schemas/Id'
+            - type: 'null'
+        nodeAddress:
+          $ref: '#/components/schemas/Ipv4Address'
+        status:
+          $ref: '#/components/schemas/ConnectivityCheckStatus'
+        timeoutMilliseconds:
+          type: integer
+          minimum: 500
+          maximum: 10000
+        roundTripMilliseconds:
+          type: [number, 'null']
+          minimum: 0
+        failureCode:
+          type: [string, 'null']
+          maxLength: 64
+          pattern: '^[a-z][a-z0-9_]*$'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        startedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        completedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+    ConnectivityCheckPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectivityCheck'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    Event:
+      type: object
+      additionalProperties: false
+      required: [id, kind, severity, resourceType, resourceId, occurredAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        kind:
+          type: string
+          pattern: '^[a-z][a-z0-9_.]{0,127}$'
+        severity:
+          $ref: '#/components/schemas/EventSeverity'
+        resourceType:
+          type: string
+          maxLength: 64
+        resourceId:
+          type: [string, 'null']
+          maxLength: 128
+        summary:
+          type: string
+          maxLength: 512
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    AuditActorType:
+      type: string
+      enum: [web_user, local_cli, system]
+    AuditOutcome:
+      type: string
+      enum: [succeeded, rejected, failed]
+    AuditEntry:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - actorType
+        - actorUserId
+        - actorUsername
+        - action
+        - resourceType
+        - resourceId
+        - outcome
+        - requestId
+        - userAgent
+        - proxyPeer
+        - occurredAt
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        actorType:
+          $ref: '#/components/schemas/AuditActorType'
+        actorUserId:
+          oneOf:
+            - $ref: '#/components/schemas/Id'
+            - type: 'null'
+        actorUsername:
+          type: [string, 'null']
+          maxLength: 63
+        action:
+          type: string
+          pattern: '^[a-z][a-z0-9_.]{0,127}$'
+        resourceType:
+          type: string
+          maxLength: 64
+        resourceId:
+          type: [string, 'null']
+          maxLength: 128
+        outcome:
+          $ref: '#/components/schemas/AuditOutcome'
+        requestId:
+          oneOf:
+            - $ref: '#/components/schemas/Id'
+            - type: 'null'
+        userAgent:
+          type: [string, 'null']
+          maxLength: 512
+        proxyPeer:
+          type: [string, 'null']
+          maxLength: 255
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+    AuditPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    AuditExportRequest:
+      type: object
+      additionalProperties: false
+      required: [throughAuditId, confirmation]
+      properties:
+        throughAuditId:
+          $ref: '#/components/schemas/Id'
+        confirmation:
+          type: string
+          const: export audit
+    AuditPruneRequest:
+      type: object
+      additionalProperties: false
+      required: [exportId, throughAuditId, confirmation]
+      properties:
+        exportId:
+          $ref: '#/components/schemas/Id'
+        throughAuditId:
+          $ref: '#/components/schemas/Id'
+        confirmation:
+          type: string
+          const: prune audit
+    AuditPruneResult:
+      type: object
+      additionalProperties: false
+      required: [exportId, throughAuditId, prunedEntries, prunedAt]
+      properties:
+        exportId:
+          $ref: '#/components/schemas/Id'
+        throughAuditId:
+          $ref: '#/components/schemas/Id'
+        prunedEntries:
+          type: integer
+          minimum: 0
+        prunedAt:
+          $ref: '#/components/schemas/Timestamp'
+    User:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - username
+        - role
+        - status
+        - mustChangePassword
+        - generation
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        username:
+          $ref: '#/components/schemas/Username'
+        role:
+          $ref: '#/components/schemas/Role'
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        mustChangePassword:
+          type: boolean
+        generation:
+          $ref: '#/components/schemas/Generation'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    UserCreate:
+      type: object
+      additionalProperties: false
+      required: [username, role]
+      properties:
+        username:
+          $ref: '#/components/schemas/Username'
+        role:
+          $ref: '#/components/schemas/Role'
+    UserUpdate:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      minProperties: 2
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+        enabled:
+          type: boolean
+        confirmation:
+          type: string
+          minLength: 1
+          maxLength: 63
+          description: Exact username typed by the superuser.
+    UserProvisioningResult:
+      type: object
+      additionalProperties: false
+      required: [user, temporaryPassword]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        temporaryPassword:
+          $ref: '#/components/schemas/TemporaryPassword'
+    UserPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    Session:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - userId
+        - username
+        - current
+        - userAgent
+        - proxyPeer
+        - generation
+        - etag
+        - createdAt
+        - lastSeenAt
+        - idleExpiresAt
+        - absoluteExpiresAt
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        userId:
+          $ref: '#/components/schemas/Id'
+        username:
+          $ref: '#/components/schemas/Username'
+        current:
+          type: boolean
+        userAgent:
+          type: [string, 'null']
+          maxLength: 512
+        proxyPeer:
+          type: [string, 'null']
+          maxLength: 255
+        generation:
+          $ref: '#/components/schemas/Generation'
+        etag:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: Strong precondition value to send as If-Match when revoking this session.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        lastSeenAt:
+          $ref: '#/components/schemas/Timestamp'
+        idleExpiresAt:
+          $ref: '#/components/schemas/Timestamp'
+        absoluteExpiresAt:
+          $ref: '#/components/schemas/Timestamp'
+    SessionPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    OperationalSettings:
+      type: object
+      additionalProperties: false
+      required:
+        - innerMtu
+        - heartbeatIntervalSeconds
+        - suspectAfterSeconds
+        - offlineAfterSeconds
+        - defaultEnrollmentLifetimeSeconds
+        - trafficColdAfterSeconds
+        - trafficHotPacketsPerSecond
+        - trafficHotBitsPerSecond
+        - trafficSaturatedQueuePercent
+        - trafficHysteresisSeconds
+        - runtimeEventRetentionDays
+        - connectivityRetentionDays
+        - maximumNodes
+      properties:
+        innerMtu:
+          type: integer
+          minimum: 576
+          maximum: 65501
+        heartbeatIntervalSeconds:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        suspectAfterSeconds:
+          type: integer
+          minimum: 2
+          maximum: 65535
+        offlineAfterSeconds:
+          type: integer
+          minimum: 3
+          maximum: 65535
+        defaultEnrollmentLifetimeSeconds:
+          type: integer
+          format: int64
+          minimum: 60
+          maximum: 2592000
+        trafficColdAfterSeconds:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        trafficHotPacketsPerSecond:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+        trafficHotBitsPerSecond:
+          type: integer
+          format: int64
+          minimum: 1
+        trafficSaturatedQueuePercent:
+          type: integer
+          minimum: 1
+          maximum: 100
+        trafficHysteresisSeconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        runtimeEventRetentionDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
+          default: 90
+        connectivityRetentionDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
+          default: 30
+        maximumNodes:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          description: Restart-required capacity setting.
+    SettingsUpdate:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      minProperties: 2
+      properties:
+        confirmation:
+          type: string
+          const: settings
+        innerMtu:
+          type: integer
+          minimum: 576
+          maximum: 65501
+        heartbeatIntervalSeconds:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        suspectAfterSeconds:
+          type: integer
+          minimum: 2
+          maximum: 65535
+        offlineAfterSeconds:
+          type: integer
+          minimum: 3
+          maximum: 65535
+        defaultEnrollmentLifetimeSeconds:
+          type: integer
+          format: int64
+          minimum: 60
+          maximum: 2592000
+        trafficColdAfterSeconds:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        trafficHotPacketsPerSecond:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+        trafficHotBitsPerSecond:
+          type: integer
+          format: int64
+          minimum: 1
+        trafficSaturatedQueuePercent:
+          type: integer
+          minimum: 1
+          maximum: 100
+        trafficHysteresisSeconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        runtimeEventRetentionDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
+        connectivityRetentionDays:
+          type: integer
+          minimum: 1
+          maximum: 3650
+        maximumNodes:
+          type: integer
+          minimum: 1
+          maximum: 65536
+    SettingsRevision:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - sequence
+        - status
+        - settings
+        - createdByUserId
+        - createdAt
+        - appliedAt
+        - failureCode
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/SettingsRevisionStatus'
+        settings:
+          $ref: '#/components/schemas/OperationalSettings'
+        createdByUserId:
+          oneOf:
+            - $ref: '#/components/schemas/Id'
+            - type: 'null'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        appliedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        failureCode:
+          type: [string, 'null']
+          maxLength: 64
+          pattern: '^[a-z][a-z0-9_]*$'
+    SettingsState:
+      type: object
+      additionalProperties: false
+      required: [desired, effective, pendingRestart]
+      properties:
+        desired:
+          $ref: '#/components/schemas/SettingsRevision'
+        effective:
+          $ref: '#/components/schemas/SettingsRevision'
+        pendingRestart:
+          type: boolean
+    SettingsRevisionPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SettingsRevision'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 512
+    RestartRequest:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties:
+        confirmation:
+          type: string
+          const: restart
+    ShutdownRequest:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties:
+        confirmation:
+          type: string
+          const: shutdown
+    AcceptedOperation:
+      type: object
+      additionalProperties: false
+      required: [id, kind, acceptedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        kind:
+          type: string
+          enum: [restart, shutdown]
+        acceptedAt:
+          $ref: '#/components/schemas/Timestamp'

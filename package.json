@@ -1,0 +1,25 @@
+{
+  "name": "ntip",
+  "version": "0.2.0-dev",
+  "private": true,
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "contracts:generate": "bun run --cwd packages/contracts generate",
+    "contracts:validate": "bun run --cwd packages/contracts validate",
+    "contracts:check": "bun run --cwd packages/contracts check",
+    "dashboard:dev": "bun run --cwd apps/dashboard dev",
+    "dashboard:lint": "bun run --cwd apps/dashboard lint",
+    "dashboard:build": "bun run --cwd apps/dashboard build",
+    "dashboard:start": "bun run --cwd apps/dashboard start",
+    "dashboard:typecheck": "bun run --cwd apps/dashboard typecheck",
+    "dashboard:test": "bun run --cwd apps/dashboard test",
+    "dashboard:e2e": "bun run --cwd apps/dashboard e2e",
+    "dashboard:runtime-smoke": "bun run --cwd apps/dashboard runtime-smoke",
+    "typecheck": "bun run --cwd packages/contracts typecheck && bun run --cwd packages/config typecheck && bun run --cwd packages/ui typecheck && bun run dashboard:typecheck",
+    "test": "bun run --cwd packages/contracts test && bun run --cwd packages/config test && bun run --cwd packages/ui test && bun run dashboard:test"
+  }
+}

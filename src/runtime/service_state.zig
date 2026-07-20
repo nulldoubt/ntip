@@ -125,6 +125,7 @@ pub const MasterRegistryAdapter = struct {
         self: *MasterRegistryAdapter,
         handle: [16]u8,
         node_uuid: [16]u8,
+        verified_psk: [32]u8,
         public_key: [32]u8,
     ) !void {
         if (allZero(&handle)) return error.EnrollmentNotFound;
@@ -141,6 +142,9 @@ pub const MasterRegistryAdapter = struct {
 
         var consumed = try candidate_enrollments.consume(handle, now);
         defer std.crypto.secureZero(u8, &consumed.derived_psk);
+        if (!constantTimeEqual(&consumed.derived_psk, &verified_psk)) {
+            return error.InvalidEnrollmentCredential;
+        }
         const node = candidate_store.findNode(consumed.node.slice()) orelse return error.NodeNotFound;
         if (!constantTimeEqual(&node.id.bytes, &consumed.node_id.bytes)) {
             return error.InvalidEnrollmentState;
@@ -209,10 +213,11 @@ pub const MasterRegistryAdapter = struct {
         raw: *anyopaque,
         handle: [16]u8,
         node_uuid: [16]u8,
+        verified_psk: [32]u8,
         public_key: [32]u8,
     ) anyerror!void {
         const self: *MasterRegistryAdapter = @ptrCast(@alignCast(raw));
-        return self.consumeAndBind(handle, node_uuid, public_key);
+        return self.consumeAndBind(handle, node_uuid, verified_psk, public_key);
     }
 
     fn lookupNodeOpaque(raw: *anyopaque, node_uuid: [16]u8) anyerror!handshake.NodeRecord {
@@ -556,7 +561,7 @@ test "Master registry expires at lookup and rechecks at atomic consume" {
     try std.testing.expectError(error.EnrollmentExpired, adapter.interface().lookupEnrollment(handle));
     try std.testing.expectError(
         error.EnrollmentExpired,
-        adapter.interface().consumeAndBind(handle, node_id.bytes, .{0x55} ** 32),
+        adapter.interface().consumeAndBind(handle, node_id.bytes, .{0x35} ** 32, .{0x55} ** 32),
     );
     try std.testing.expectEqual(enrollments.Status.unused, registry.records.items[0].status);
     try std.testing.expectEqual(model.EnrollmentState.unenrolled, store.nodes.items[0].enrollment_state);
@@ -576,11 +581,34 @@ test "Master registry resolves stale-lookups as one durable winner" {
     adapter.clock = .{ .fixed = 10 };
     _ = try adapter.lookupEnrollment(handle);
     _ = try adapter.lookupEnrollment(handle);
-    try adapter.consumeAndBind(handle, node_id.bytes, .{0x55} ** 32);
-    try std.testing.expectError(error.EnrollmentConsumed, adapter.consumeAndBind(handle, node_id.bytes, .{0x56} ** 32));
+    try adapter.consumeAndBind(handle, node_id.bytes, .{0x35} ** 32, .{0x55} ** 32);
+    try std.testing.expectError(error.EnrollmentConsumed, adapter.consumeAndBind(handle, node_id.bytes, .{0x35} ** 32, .{0x56} ** 32));
     try std.testing.expectEqual(model.EnrollmentState.enrolled, store.nodes.items[0].enrollment_state);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 32), &store.nodes.items[0].public_key.?);
     _ = try adapter.lookupNode(node_id.bytes);
+}
+
+test "Master registry rejects a credential replaced after handshake lookup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fixture = try createMasterFixture(std.testing.allocator, std.testing.io, tmp.dir, 1000);
+    var store = fixture[0];
+    defer store.deinit();
+    var registry = fixture[1];
+    defer registry.deinit();
+    const handle = fixture[2];
+    const node_id = fixture[3];
+    var adapter = MasterRegistryAdapter.init(std.testing.allocator, std.testing.io, .{ .dir = tmp.dir }, &store, &registry);
+    adapter.clock = .{ .fixed = 10 };
+    const looked_up = try adapter.lookupEnrollment(handle);
+
+    registry.records.items[0].derived_psk = .{0x44} ** 32;
+    try std.testing.expectError(
+        error.InvalidEnrollmentCredential,
+        adapter.consumeAndBind(handle, node_id.bytes, looked_up.psk, .{0x55} ** 32),
+    );
+    try std.testing.expectEqual(enrollments.Status.unused, registry.records.items[0].status);
+    try std.testing.expectEqual(model.EnrollmentState.unenrolled, store.nodes.items[0].enrollment_state);
 }
 
 test "Master registry fails closed when an enrollment record names the wrong Node UUID" {
@@ -600,7 +628,7 @@ test "Master registry fails closed when an enrollment record names the wrong Nod
     try std.testing.expectError(error.InvalidEnrollmentState, adapter.lookupEnrollment(handle));
     try std.testing.expectError(
         error.InvalidEnrollmentState,
-        adapter.consumeAndBind(handle, node_id.bytes, .{0x55} ** 32),
+        adapter.consumeAndBind(handle, node_id.bytes, .{0x35} ** 32, .{0x55} ** 32),
     );
     try std.testing.expectEqual(enrollments.Status.unused, registry.records.items[0].status);
     try std.testing.expectEqual(model.EnrollmentState.unenrolled, store.nodes.items[0].enrollment_state);
@@ -622,7 +650,7 @@ test "Master commit interruption recovers bound identity for IK lost-ack recover
         adapter.commit_fault = fault;
         try std.testing.expectError(
             error.InjectedFailure,
-            adapter.consumeAndBind(handle, node_id.bytes, .{0x61} ** 32),
+            adapter.consumeAndBind(handle, node_id.bytes, .{0x35} ** 32, .{0x61} ** 32),
         );
         try std.testing.expectEqual(enrollments.Status.consumed, registry.records.items[0].status);
         try std.testing.expectEqual(model.EnrollmentState.enrolled, store.nodes.items[0].enrollment_state);

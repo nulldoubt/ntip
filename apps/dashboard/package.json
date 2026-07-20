@@ -1,0 +1,40 @@
+{
+  "name": "@ntip/dashboard",
+  "version": "0.2.0-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --bun next dev --hostname 127.0.0.1 --port 3000",
+    "lint": "eslint . --max-warnings=0",
+    "build": "bun --bun next build && bun run scripts/normalize-build.ts",
+    "start": "bun run scripts/start-standalone.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./test/unit",
+    "e2e": "playwright test",
+    "runtime-smoke": "bun run scripts/production-smoke.ts"
+  },
+  "dependencies": {
+    "@ntip/config": "workspace:*",
+    "@ntip/contracts": "workspace:*",
+    "@ntip/ui": "workspace:*",
+    "geist": "1.7.2",
+    "lucide-react": "1.25.0",
+    "next": "16.2.10",
+    "next-themes": "0.4.6",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/bun": "1.3.14",
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.2.10",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3"
+  }
+}

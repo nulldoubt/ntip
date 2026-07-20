@@ -76,6 +76,9 @@ for pass in 1 2; do
             python3 scripts/check-release-archive.py \
                 "$version" "$target" \
                 "dist/ntip-v$version-$target.tar.gz"
+            python3 scripts/check-release-archive.py \
+                "$version" "$target" \
+                "dist/ntip-api-v$version-$target.tar.gz"
         done
     )
     echo "clean_release_build=completed pass=$pass"
@@ -89,31 +92,38 @@ for target in x86_64-linux-musl aarch64-linux-musl; do
     second_dist=$work/pass-2/source/dist
     base=ntip-v$version-$target
 
-    for binary in ntsrv ntcl; do
+    for binary in ntsrv ntcl ntip-api; do
         if ! cmp "$first_prefix/$binary" "$second_prefix/$binary"; then
             echo "clean release binary mismatch: target=$target binary=$binary" >&2
             exit 1
         fi
     done
-    for suffix in tar.gz spdx.json tar.gz.sha256; do
-        if ! cmp "$first_dist/$base.$suffix" "$second_dist/$base.$suffix"; then
-            echo "clean release artifact mismatch: $base.$suffix" >&2
-            exit 1
-        fi
-        install -m 0644 "$first_dist/$base.$suffix" "$repo_root/dist/$base.$suffix"
+    api_base=ntip-api-v$version-$target
+    for artifact_base in "$base" "$api_base"; do
+        for suffix in tar.gz spdx.json tar.gz.sha256; do
+            if ! cmp "$first_dist/$artifact_base.$suffix" "$second_dist/$artifact_base.$suffix"; then
+                echo "clean release artifact mismatch: $artifact_base.$suffix" >&2
+                exit 1
+            fi
+            install -m 0644 "$first_dist/$artifact_base.$suffix" "$repo_root/dist/$artifact_base.$suffix"
+        done
     done
 
     output_dir=$repo_root/zig-out/release/$target
     install -d -m 0755 "$output_dir"
     install -m 0755 "$first_prefix/ntsrv" "$output_dir/ntsrv"
     install -m 0755 "$first_prefix/ntcl" "$output_dir/ntcl"
+    install -m 0755 "$first_prefix/ntip-api" "$output_dir/ntip-api"
 
     echo "clean_release_reproducibility=passed target=$target commit=$commit"
     sha256sum \
         "$first_prefix/ntsrv" \
         "$first_prefix/ntcl" \
+        "$first_prefix/ntip-api" \
         "$first_dist/$base.tar.gz" \
-        "$first_dist/$base.spdx.json"
+        "$first_dist/$base.spdx.json" \
+        "$first_dist/$api_base.tar.gz" \
+        "$first_dist/$api_base.spdx.json"
 done
 
 echo "clean_release_reproducibility=passed builds=2 isolated_source_roots=2 isolated_local_caches=2 isolated_global_caches=2"

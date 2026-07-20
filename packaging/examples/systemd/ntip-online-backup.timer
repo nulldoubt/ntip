@@ -1,0 +1,11 @@
+[Unit]
+Description=Example schedule for operator-managed NTIP SQLite backups
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=ntip-online-backup.service
+
+[Install]
+WantedBy=timers.target

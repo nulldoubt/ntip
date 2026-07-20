@@ -1,0 +1,56 @@
+[Unit]
+Description=NTIP management HTTP API
+Documentation=file:/usr/share/doc/ntip-api/README.md
+After=network.target systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
+ConditionPathExists=/etc/ntip/api.json
+ConditionPathIsDirectory=/run/ntip-api
+
+[Service]
+Type=simple
+User=ntip-api
+Group=ntip-api
+ExecStart=/usr/bin/ntip-api --config /etc/ntip/api.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=20s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+UMask=0077
+
+# ntip-api has no capabilities and cannot see Master/Node state or the
+# OS-authorized human administration socket. Its only writable peers are the
+# loopback TCP listener and the group-authorized ntsrv API socket.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+InaccessiblePaths=/var/lib/ntip /run/ntip
+ReadOnlyPaths=/etc/ntip/api.json /run/ntip-api
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

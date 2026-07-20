@@ -1,7 +1,7 @@
 # NTIP wire protocol version 1
 
-Status: normative for the NTIP `0.1.x` line. The implementation remains
-`0.1.0-dev` until all production-beta gates pass.
+Status: normative wire protocol version 1 for the NTIP `0.1.x` and `0.2.x`
+lines. The current implementation is `0.2.0-dev`; v0.2 adds no wire change.
 
 ## 1. Conventions
 

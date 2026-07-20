@@ -2,12 +2,13 @@
 
 ## Toolchain and repository contract
 
-NTIP requires Zig 0.16.0 and has no third-party Zig or dynamically linked
-runtime libraries. Linux operation uses `iproute2`, and packaged services use
-systemd. The package
-version begins at `0.1.0-dev`; `build.zig.zon`, the shared version module, CLI
-`version` output, release archive names, and changelog are checked for
-consistency.
+NTIP requires Zig 0.16.0 and has no third-party Zig modules or dynamically
+linked runtime libraries. `ntsrv` statically compiles the pinned SQLite 3.53.3
+amalgamation; `ntcl` and `ntip-api` deliberately do not. Linux operation uses
+`iproute2`, and packaged services use systemd. The package version remains
+`0.2.0-dev`; `build.zig.zon`, the Bun workspace manifests, the shared version
+module, CLI `version` output, release archive names, and changelog are checked
+for consistency.
 
 On macOS or Linux:
 
@@ -22,6 +23,64 @@ zig build version-check
 zig build cross
 ```
 
+Management contracts and the dashboard require the exact Bun 1.3.14 runtime
+declared in `package.json`. Frozen installation and portable workspace gates
+are:
+
+```sh
+test "$(bun --version)" = 1.3.14
+bun install --frozen-lockfile
+bun run contracts:validate
+bun run contracts:check
+bun run typecheck
+bun run test
+python3 scripts/check-packaging-contract.py
+python3 scripts/check-vendored-sqlite.py
+python3 scripts/check-secret-exposure.py
+```
+
+OpenAPI is canonical. `contracts:check` regenerates in memory and fails when the
+embedded JSON, Zig document, TypeScript schema, or `openapi-fetch` client has
+drifted.
+
+The dashboard is a Next.js 16.2.10 App Router service. Development, builds,
+standalone startup, and release checks use the pinned Bun runtime with no
+Node.js fallback:
+
+```sh
+bun run dashboard:dev
+bun run dashboard:lint
+bun run dashboard:typecheck
+bun run dashboard:test
+bun run dashboard:build
+bun run dashboard:start
+bun run dashboard:runtime-smoke
+bun run dashboard:e2e
+```
+
+Initial reads are Server Components using the loopback-only API origin and
+`no-store`; browser reads and mutations use same-origin `/api/v1`. The
+runtime `api_origin` is server-only and Next defines no `/api/v1` rewrite;
+browser API routing belongs exclusively to the TLS proxy. The production build
+uses `output: "standalone"`. `dashboard:runtime-smoke` must
+start that output through the same checked launcher as `dashboard:start`, and
+Playwright must exercise the production page/API split through one HTTPS
+origin. Native archive validation separately starts the packaged strict-JSON
+launcher and probes `/login`. `check-dashboard-release-gate.py` requires every
+bounded verification command for a v0.2 release and rejects any
+build/start/smoke script that introduces a Node, npm, npx, pnpm, or yarn
+runtime fallback.
+
+Next emits build-host paths, a host-derived worker count, and random
+compatibility values even though NTIP uses neither Draft Mode nor Server
+Actions. The dashboard fixes the build worker count, normalizes build-only path
+metadata to the installed application root, rejects generated Server Actions,
+and canonicalizes the remaining unsupported compatibility fields. An
+all-request Next proxy rejects and clears preview cookies before routing;
+Playwright and native archive smoke cover a forged compatibility cookie.
+Adding Draft Mode or Server Actions requires a new security and reproducibility
+design.
+
 `check` runs formatting, version consistency, all portable test executables, and
 both cross-builds. `cross` (also exposed as `cross-build`) compiles static-musl `ReleaseSafe`
 artifacts for `x86_64-linux-musl` and `aarch64-linux-musl`. Cross-compilation is
@@ -34,11 +93,31 @@ The expected release output is:
 zig-out/release/
 ├── x86_64-linux-musl/
 │   ├── ntsrv
-│   └── ntcl
+│   ├── ntcl
+│   └── ntip-api
 └── aarch64-linux-musl/
     ├── ntsrv
-    └── ntcl
+    ├── ntcl
+    └── ntip-api
 ```
+
+Packaging emits three architecture-matched artifacts per architecture: the core
+`ntip-v...` archive (`ntsrv` and `ntcl`), optional `ntip-api-v...` archive, and
+optional `ntip-dashboard-v...` archive. The API installer verifies its version
+against the installed core and receives no SQLite or state-directory access.
+The dashboard installer requires matching installed core and API versions and
+bundles Bun 1.3.14 with architecture-neutral Next standalone output.
+
+The target names deliberately differ by component:
+
+| Component | x86_64 target | AArch64 target | Runtime model |
+|---|---|---|---|
+| Core/API | `x86_64-linux-musl` | `aarch64-linux-musl` | static-musl Zig binaries |
+| Dashboard | `x86_64-linux` | `aarch64-linux` | glibc Bun runtime plus standalone JavaScript |
+
+Bun's musl assets require a musl loader that is absent on the supported
+Ubuntu/systemd hosts, so they are not valid dashboard service artifacts. This
+does not change the static-musl core/API contract.
 
 ## Mechanical release-artifact checks
 
@@ -52,11 +131,27 @@ scripts/check-clean-release-reproducibility.sh "$(scripts/check-version.sh)"
 scripts/check-installer-isolation.sh dist/*.tar.gz
 ```
 
-The clean-build script exports the committed tree into two different source
-roots, gives each build a separate local cache, global cache, and install
-prefix, runs `zig build release` twice, and compares `ntsrv`, `ntcl`, archives,
-external SBOMs, and checksum sidecars byte-for-byte. Only one verified result
+The core/API clean-build script exports the committed tree into two different
+source roots, gives each build a separate local cache, global cache, and install
+prefix, runs `zig build release` twice, and compares `ntsrv`, `ntcl`,
+`ntip-api`, both core/API component archives, external SBOMs, and checksum
+sidecars byte-for-byte. Only one verified result
 is copied into the repository's `zig-out/release` and `dist` directories.
+
+The dashboard has a separate two-build archive check:
+
+```sh
+export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+scripts/check-dashboard-release-reproducibility.sh \
+  "$(scripts/check-version.sh)"
+```
+
+It copies the current source into two different absolute roots, installs each
+workspace independently, performs two cache-free Next production builds, then
+packages the glibc `x86_64-linux` and `aarch64-linux` dashboard targets from
+each. It compares every archive, checksum sidecar, and external SPDX document
+byte-for-byte. It never packages one preexisting build twice as reproducibility
+proof.
 
 For a faster packaging-only development check after `zig build release`, run
 `check-release-reproducibility.sh`. That helper packages the same binaries
@@ -66,17 +161,37 @@ used as the clean compiler-output reproducibility gate.
 `check-release-archive.py` rejects unexpected archive entries, unsafe paths,
 links or special files, wrong modes/owners/timestamps, target-architecture
 mismatches, checksum-sidecar mismatches, incomplete SPDX coverage, incorrect
-file digests, and an incorrect SPDX package verification code. On a matching
-Linux architecture it extracts and executes the packaged static `ntsrv` and
-`ntcl` binaries, verifies their exact `version` output, and uses `readelf` to
+file digests, and an incorrect SPDX package verification code. The core SBOM
+must identify the exact statically linked SQLite version, upstream SHA3-256,
+license, and `DEPENDS_ON` relationship; the DB-free API SBOM must omit SQLite.
+On a matching Linux architecture it extracts and executes packaged static
+`ntsrv`, `ntcl`, and `ntip-api`, verifies exact version output, and uses
+`readelf` to
 reject an ELF interpreter or `NEEDED` dynamic-library entry. Native CI passes
 `--require-native-execution`, so a skipped execution is a failure there.
 
+`check-dashboard-release-archive.py` additionally verifies the bundled glibc
+Bun ELF architecture and exact 1.3.14 SBOM entry, standalone application/static
+assets, absence of links, native `.node` modules, and other ELF application
+payloads, and native Bun execution when the host architecture matches.
+
+Dashboard packaging requires `images.unoptimized=true`, copies a private
+generated standalone trace, removes only trace-confirmed optional Sharp/`@img`
+native image dependencies, removes dangling links, dereferences remaining
+workspace links, and materializes traced sibling dependencies. This avoids
+silently shipping host-native image binaries or source-tree-only Bun workspace
+links. `check-dashboard-payload.py` then requires regular, non-group-writable
+application files with zero symlinks, `.node` modules, or ELF application
+objects before archive construction.
+
 The isolated installer check runs the installer and uninstaller shipped inside
-each archive under a temporary `DESTDIR`. It covers initial installation,
+each of the three archives under a temporary `DESTDIR`. It covers initial
+installation,
 idempotent upgrade, packaged-file replacement, preservation of operator config
-and machine state, transient-runtime removal, uninstall preservation, and a
-second idempotent uninstall without creating accounts or touching the host.
+and machine state, core/API ownership isolation, preservation of the typed
+runtime seam, dashboard application/runtime isolation, transient-runtime
+removal, uninstall preservation, and a second idempotent uninstall without
+creating accounts or touching the host.
 Normal installation with no `DESTDIR` retains all Linux/root/account/TUN and
 systemd prerequisites.
 
@@ -91,10 +206,11 @@ PATH="/tmp/ntip-spdx-tools/bin:$PATH" \
   scripts/validate-spdx.sh dist/*.spdx.json
 ```
 
-The packaged systemd units are syntax-checked and passed to
-`check-systemd-security.sh`. On Ubuntu 24.04's systemd 255 both currently score
-2.9; CI enforces a maximum exposure score of 3.0 (`--threshold=30`) and uploads
-the full report for both native architectures. This score is a
+The packaged `ntsrv`, `ntcl`, `ntip-api`, and `ntip-dashboard` systemd units
+are syntax-checked and passed to `check-systemd-security.sh`. CI enforces a
+maximum exposure score
+of 3.0 (`--threshold=30`) and uploads the full report for both native
+architectures. This score is a
 version-dependent regression heuristic. It does not prove runtime privilege
 dropping and does not satisfy the independent security-review gate.
 
@@ -108,8 +224,27 @@ sudo env NTIP_SYSTEMD_SMOKE_DISPOSABLE=1 \
 The explicit opt-in and empty-state check prevent accidental use on an operator
 Master. The smoke starts the installed unit, proves its runtime-directory and
 socket ownership, checks that the process dropped to `ntip` with only
-`CAP_NET_ADMIN` live, exercises IPC, stops the unit, and verifies TUN/socket
-teardown. Static unit analysis alone cannot establish those runtime facts.
+`CAP_NET_ADMIN` live, then starts the separately installed `ntip-api` as its
+zero-capability numeric identity. `/health/ready` must cross the
+`SO_PEERCRED`-authenticated typed socket; liveness and the embedded OpenAPI
+document are also fetched over loopback. The smoke stops both units and verifies
+TUN plus human/typed-socket teardown. Static unit analysis alone cannot
+establish those runtime facts.
+
+The dashboard unit has no capabilities, writable state path, supplementary
+groups, or access to either Unix-socket directory. It permits only loopback
+IPv4/IPv6 and reads only its strict bootstrap plus the installed application.
+It intentionally omits `MemoryDenyWriteExecute=yes` because Bun's
+JavaScriptCore needs executable JIT mappings. Native Linux service evidence
+must confirm that the remaining sandbox stays intact and that the page service
+cannot reach Master state or sockets.
+
+`check-secret-exposure.py` scans repository text and release-archive members
+for common private-key and provider-token signatures. It also examines complete
+production `std.log` calls and rejects references to password, enrollment PSK,
+opaque session/CSRF token, token-hash, private-key, or cookie material. This is
+a deterministic regression gate, not a substitute for scanning release-host
+state, service logs, backups, or Git history.
 
 ## Test layers
 
@@ -128,20 +263,48 @@ tests, and `tests/protocol/all.zig`. Together they currently cover:
 - 2048-packet replay behavior;
 - route snapshots, open-addressed session lookup, traffic-state hysteresis, and
   bounded queues.
+- transactional SQLite migrations/checksums, inventory invariants, immutable
+  audit/export/prune rules, settings reconciliation, online backup and stopped
+  restore;
+- Argon2/session/throttle lifecycle, strict service IPC, bounded HTTP framing,
+  CSRF/Origin/RBAC/ETag/idempotency rules, runtime read models, diagnostics,
+  and audit streaming.
 
 Tests must use deterministic randomness only through explicit injected test
 sources. Production randomness always uses the operating system CSPRNG.
 
 ### Crash consistency
 
-Atomic-file tests inject failure before rename and prove the prior file remains
-visible. The coupled Master-state/enrollment transaction test injects a crash at
-each of its declared two-file commit boundaries and then runs recovery, which
-must roll forward to one complete generation. Repository tests also prove that
-corrupt and newer-schema state fails closed. Enrollment tests cover credential
-renewal revocation, single-use consumption, and pending assignment recovery
-after a lost completion acknowledgement. Native filesystem ownership, mode,
-and symlink behavior remains part of the privileged Linux gate.
+Node atomic-file tests inject failure before rename and prove the prior file
+remains visible. Recoverable Node reconfiguration tests cover multi-file
+boundaries and lost enrollment acknowledgement. Master repository tests
+exercise transactional migration failure, WAL reopen, persist-before-publish,
+credential replacement/consumption races, settings acknowledgement, queue
+pressure, online backup, integrity-checked restore, and restored-session
+revocation. Legacy Master JSON/intent refusal is tested byte-for-byte. Native
+filesystem ownership, mode, hard-link, sidecar, and symlink behavior remains
+part of the privileged Linux gate.
+
+### Dashboard unit and browser tests
+
+The Bun unit suite covers the shared two-request polling scheduler, visibility
+and offline pauses, interval jitter and 20/40/60-second failure backoff,
+last-known-good freshness, deterministic topology construction, role
+capabilities, theme preference parsing, and mutation safety. Shared config
+tests reject unknown bootstrap fields, non-loopback API origins and binds, and
+invalid ports. Shared UI tests cover class composition.
+
+Playwright uses the production build behind a same-origin HTTPS harness. The
+harness launches `.next/standalone/apps/dashboard/server.js` directly with Bun
+1.3.14 rather than a development server or `next start`. Its fixture separates
+page traffic from `/api/v1`, implements the OpenAPI-shaped browser boundary,
+and validates session cookies, Origin, CSRF,
+`Idempotency-Key`, and `If-Match` behavior instead of bypassing Server Component
+requests with browser-only route interception. Required journeys include login
+and forced password change, all roles, inventory navigation and CRUD, the
+topology table equivalent, enrollment download, diagnostics/activity, settings
+rollback, session revocation, restart/shutdown recovery, stale polling, logout,
+keyboard/accessibility checks, and the desktop-size guard.
 
 ### Fuzz and negative tests
 
@@ -230,6 +393,31 @@ The ICMP packet builder also has a deterministic checksum, quoted-packet, and
 next-hop-MTU unit test; the namespace scenario exercises its real TUN/UDP error
 path.
 
+The harness normally uses `zig-out/bin/ntcl`, preserving the complete
+current-client/current-Master scenario. To prove wire compatibility with an
+older Node binary, set an explicit client path and select the focused scenario:
+
+```sh
+sudo env \
+  NTIP_BIN_DIR="$PWD/zig-out/bin" \
+  NTIP_CLIENT_BIN=/absolute/path/to/v0.1/ntcl \
+  NTIP_COMPATIBILITY_ONLY=1 \
+  NTIP_TEST_ID=v01local \
+  scripts/integration/ns-integration.sh
+```
+
+Focused compatibility mode still creates two fresh Nodes, configures them with
+the selected client, enrolls both against the current `ntsrv`, carries DATA,
+restarts the Master, and requires both persisted Nodes to reconnect before a
+final Node-to-Node probe. It skips unrelated NAT, load-balancer, netem, and MTU
+coverage, which remains in the default scenario.
+
+CI builds that client from the immutable base commit
+`612fec453bb112b36e547c0f7ce6317f8e23e85b` in a separate checkout and verifies
+its `ntcl 0.1.0-dev` identity before running the focused scenario. This is
+executable Linux evidence of v0.1 enrollment and reconnect compatibility; it
+does not replace current-current namespace coverage.
+
 Never run namespace integration on a host where its configured namespace prefix
 is already in use. The CI runner is disposable; on operator hardware, inspect
 the script and current namespace list first.
@@ -316,8 +504,12 @@ When updating a transcript fixture:
 run:
 
 - format, unit, and version checks on macOS and Ubuntu;
+- pinned-Bun dashboard lint, typecheck, unit, production standalone
+  build/start smoke, same-origin HTTPS Playwright, and both dashboard archives;
 - Linux x86_64/AArch64 static-musl cross-builds;
 - privileged namespaces on Ubuntu 24.04;
+- pinned v0.1 Node enrollment and reconnect against the current Master on the
+  privileged x86_64 runner;
 - native AArch64 smoke/integration on an Ubuntu 24.04 ARM runner;
 - parser fuzz smoke tests on every pull request and extended fuzz runs on a
   schedule or explicit dispatch;
@@ -346,9 +538,13 @@ must include the continuous-session and resource measurements listed above.
 4. Resolve all critical/high review findings and archive the independent review
    summary.
 5. Update `CHANGELOG.md` from Unreleased and set the final version.
-6. Build with `zig build release` and package each target with
-   `scripts/package-release.sh`.
-7. Run the two-isolated-build archive/SBOM/installer checks above. For a final
+6. Build with `zig build release` and package each core/API target with
+   `scripts/package-release.sh` using `x86_64-linux-musl` and
+   `aarch64-linux-musl`; build the dashboard with the exact pinned Bun and use
+   `scripts/package-dashboard-release.sh` with `x86_64-linux` and
+   `aarch64-linux`.
+7. Run the dashboard release gate, both reproducibility checks, and all
+   archive/SBOM/installer checks above. For a final
    candidate, also reproduce the result on a separately provisioned builder;
    two roots and caches on one CI runner do not establish diverse-builder
    reproducibility.

@@ -6,6 +6,7 @@ const lifecycle = @import("../platform/linux/lifecycle.zig");
 const queues = @import("bounded_queue.zig");
 const buffers = @import("buffer_pool.zig");
 const icmp = @import("icmp.zig");
+const connectivity = @import("connectivity.zig");
 const plane_mod = @import("data_plane.zig");
 const topology = @import("topology.zig");
 const wire = @import("../protocol/header.zig");
@@ -19,6 +20,7 @@ pub const ControlEventKind = enum {
     rekey_due,
     snapshot_installed,
     client_snapshot_installed,
+    runtime_settings_applied,
     traffic_state_changed,
     session_command_failed,
 };
@@ -65,6 +67,20 @@ pub const ControlEvent = struct {
 
 pub const ControlQueue = queues.SpscQueue(ControlEvent);
 
+/// Master forwarding and live-settings barriers share a dedicated bounded
+/// hand-off in their original DATA-command order. Ordinary observations or
+/// handshake datagrams can therefore never head-of-line block the barrier that
+/// releases the serialized operator worker's next mutation reservation.
+pub const RuntimeBarrierAcknowledgement = union(enum) {
+    master_snapshot: struct {
+        generation: u64,
+        retired: ?*topology.MasterSnapshots,
+    },
+    runtime_settings: u64,
+};
+
+pub const RuntimeBarrierAcknowledgementQueue = queues.SpscQueue(RuntimeBarrierAcknowledgement);
+
 pub const DataCommandKind = enum {
     send_datagram,
     send_control,
@@ -74,6 +90,7 @@ pub const DataCommandKind = enum {
     remove_session,
     install_master_snapshot,
     install_client_snapshot,
+    apply_runtime_settings,
 };
 
 pub const DataCommand = struct {
@@ -132,6 +149,19 @@ pub const DataCommand = struct {
             .kind = .install_client_snapshot,
             .snapshot_generation = generation,
             .client_snapshot = snapshot,
+            .traffic_config = traffic_config,
+            .inner_mtu = inner_mtu,
+        };
+    }
+
+    pub fn applyRuntimeSettings(
+        sequence: u64,
+        traffic_config: traffic.Config,
+        inner_mtu: u16,
+    ) DataCommand {
+        return .{
+            .kind = .apply_runtime_settings,
+            .snapshot_generation = sequence,
             .traffic_config = traffic_config,
             .inner_mtu = inner_mtu,
         };
@@ -197,6 +227,9 @@ pub const WorkerCounters = struct {
     tun_io_errors: u64 = 0,
     udp_io_errors: u64 = 0,
     icmp_synthesized: u64 = 0,
+    connectivity_started: u64 = 0,
+    connectivity_completed: u64 = 0,
+    connectivity_failed: u64 = 0,
 };
 
 /// Linux epoll worker that exclusively owns TUN, UDP, sessions, replay state,
@@ -209,6 +242,8 @@ pub const DataWorker = struct {
     control_queue: *ControlQueue,
     command_queue: *CommandQueue,
     retirement_queue: *RetirementQueue,
+    connectivity_channel: ?*connectivity.Channel = null,
+    runtime_barrier_acknowledgements: ?*RuntimeBarrierAcknowledgementQueue = null,
     retirement_fences: RetirementFences,
     epoll_fd: i32,
     wake_fd: i32,
@@ -307,6 +342,44 @@ pub const DataWorker = struct {
         return true;
     }
 
+    /// Attaches the Master-only connectivity channel before the DATA thread
+    /// starts. Nodes leave this unset and retain their existing packet path.
+    pub fn attachConnectivityChannel(self: *DataWorker, channel: *connectivity.Channel) !void {
+        if (self.connectivity_channel != null) return error.ConnectivityChannelAlreadyAttached;
+        self.connectivity_channel = channel;
+    }
+
+    /// Attaches the Master-only acknowledgement queue before the DATA thread
+    /// starts. Node runtimes and tests that do not attach it retain the legacy
+    /// shared-control-queue path for client/settings acknowledgements.
+    pub fn attachRuntimeBarrierAcknowledgements(
+        self: *DataWorker,
+        acknowledgements: *RuntimeBarrierAcknowledgementQueue,
+    ) !void {
+        if (self.runtime_barrier_acknowledgements != null) {
+            return error.RuntimeBarrierAcknowledgementsAlreadyAttached;
+        }
+        self.runtime_barrier_acknowledgements = acknowledgements;
+    }
+
+    /// Control-side non-blocking admission seam. A successful return reserves
+    /// a terminal completion; a false return means the request was not
+    /// admitted and no DATA-path work will occur.
+    pub fn submitConnectivity(self: *DataWorker, request: connectivity.Request) bool {
+        const channel = self.connectivity_channel orelse return false;
+        if (!channel.submit(request)) return false;
+        if (comptime builtin.os.tag == .linux) {
+            const wake: u64 = 1;
+            _ = std.os.linux.write(self.wake_fd, @ptrCast(&wake), @sizeOf(u64));
+        }
+        return true;
+    }
+
+    pub fn nextConnectivityCompletion(self: *DataWorker) ?connectivity.Completion {
+        const channel = self.connectivity_channel orelse return null;
+        return channel.nextCompletion();
+    }
+
     /// Transfers initial snapshot ownership to the data worker before its
     /// thread starts. The DataPlane must already reference this snapshot.
     pub fn adoptMasterSnapshot(self: *DataWorker, snapshot: *topology.MasterSnapshots) !void {
@@ -328,12 +401,19 @@ pub const DataWorker = struct {
 
     pub fn run(self: *DataWorker) !void {
         if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        defer {
+            if (self.connectivity_channel) |channel| {
+                _ = channel.interruptAll(monotonicNow(self.io));
+            }
+        }
         const linux = std.os.linux;
         var events: [16]linux.epoll_event = undefined;
         while (!lifecycle.shouldStop()) {
             self.flushSnapshotAck();
             self.processRetirements();
             self.processCommands();
+            self.processConnectivity();
+            self.expireConnectivity(monotonicNow(self.io));
             self.reportTraffic();
             const count_result = linux.epoll_wait(self.epoll_fd, &events, events.len, 1000);
             switch (linux.errno(count_result)) {
@@ -428,8 +508,16 @@ pub const DataWorker = struct {
             })) self.plane.rearmReceiveRekey(result.receiver_session_id);
         }
         switch (result.payload) {
-            .data => |packet| self.tun.write(self.io, packet) catch {
-                self.counters.tun_io_errors +|= 1;
+            .data => |packet| {
+                if (self.connectivity_channel) |channel| {
+                    if (channel.matchReply(packet, monotonicNow(self.io))) {
+                        self.counters.connectivity_completed +|= 1;
+                        return;
+                    }
+                }
+                self.tun.write(self.io, packet) catch {
+                    self.counters.tun_io_errors +|= 1;
+                };
             },
             .control => |frame| _ = self.pushEvent(ControlEvent.control(result.receiver_session_id, incoming.from, frame)),
         }
@@ -458,6 +546,55 @@ pub const DataWorker = struct {
         _ = std.os.linux.read(self.wake_fd, @ptrCast(&value), @sizeOf(u64));
         self.processRetirements();
         self.processCommands();
+        self.processConnectivity();
+    }
+
+    fn processConnectivity(self: *DataWorker) void {
+        const channel = self.connectivity_channel orelse return;
+        while (channel.nextRequest()) |request| {
+            const now_ns = monotonicNow(self.io);
+            const pending = channel.begin(request, now_ns) catch {
+                channel.fail(request, now_ns, .packet_rejected);
+                self.counters.connectivity_failed +|= 1;
+                continue;
+            };
+            const packet = pending.buildRequest(&self.icmp_buffer, request.ipv4_id) catch {
+                channel.failPending(request.check_id, now_ns, .packet_rejected);
+                self.counters.connectivity_failed +|= 1;
+                continue;
+            };
+            const outbound = self.plane.encryptData(packet, now_ns, &self.datagram_buffer) catch |err| {
+                channel.failPending(request.check_id, now_ns, connectivityFailure(err));
+                self.counters.connectivity_failed +|= 1;
+                continue;
+            };
+            const endpoint = outbound.endpoint orelse {
+                channel.failPending(request.check_id, now_ns, .node_offline);
+                self.counters.connectivity_failed +|= 1;
+                continue;
+            };
+            self.udp.send(&endpoint, outbound.datagram) catch {
+                self.plane.observeBackpressure(outbound.receiver_session_id, monotonicNow(self.io));
+                channel.failPending(request.check_id, monotonicNow(self.io), .transport_unavailable);
+                self.counters.udp_io_errors +|= 1;
+                self.counters.connectivity_failed +|= 1;
+                continue;
+            };
+            self.counters.connectivity_started +|= 1;
+            _ = self.pushEvent(.{
+                .kind = .outbound_authenticated,
+                .receiver_session_id = outbound.receiver_session_id,
+            });
+            if (outbound.rekey_due) _ = self.pushEvent(.{
+                .kind = .rekey_due,
+                .receiver_session_id = outbound.receiver_session_id,
+            });
+        }
+    }
+
+    fn expireConnectivity(self: *DataWorker, now_ns: u64) void {
+        const channel = self.connectivity_channel orelse return;
+        self.counters.connectivity_completed +|= channel.expire(now_ns);
     }
 
     fn processRetirements(self: *DataWorker) void {
@@ -569,12 +706,44 @@ pub const DataWorker = struct {
                 self.flushSnapshotAck();
                 if (self.pending_snapshot_ack != null) return false;
             },
+            .apply_runtime_settings => {
+                // This is the DATA worker's acknowledgement point. The
+                // control-side settings applier does not mark the durable
+                // revision effective until this event is observed.
+                self.plane.configureTraffic(command.traffic_config);
+                self.plane.inner_mtu = command.inner_mtu;
+                self.pending_snapshot_ack = .{
+                    .kind = .runtime_settings_applied,
+                    .receiver_session_id = 0,
+                    .snapshot_generation = command.snapshot_generation,
+                };
+                self.flushSnapshotAck();
+                if (self.pending_snapshot_ack != null) return false;
+            },
         }
         return true;
     }
 
     fn flushSnapshotAck(self: *DataWorker) void {
         const event = self.pending_snapshot_ack orelse return;
+        if (self.runtime_barrier_acknowledgements) |acknowledgements| {
+            switch (event.kind) {
+                .snapshot_installed => {
+                    if (acknowledgements.push(.{ .master_snapshot = .{
+                        .generation = event.snapshot_generation,
+                        .retired = event.retired_snapshot,
+                    } })) self.pending_snapshot_ack = null;
+                    return;
+                },
+                .runtime_settings_applied => {
+                    if (acknowledgements.push(.{
+                        .runtime_settings = event.snapshot_generation,
+                    })) self.pending_snapshot_ack = null;
+                    return;
+                },
+                else => {},
+            }
+        }
         if (self.control_queue.push(event)) self.pending_snapshot_ack = null;
     }
 
@@ -611,6 +780,19 @@ pub const DataWorker = struct {
         }
     }
 };
+
+fn connectivityFailure(err: anyerror) connectivity.Failure {
+    return switch (err) {
+        error.NoRoute => .route_unavailable,
+        error.DestinationOffline,
+        error.SessionReceiveOnly,
+        error.SessionUnconfirmed,
+        error.EndpointUnavailable,
+        error.SessionExpired,
+        => .node_offline,
+        else => .packet_rejected,
+    };
+}
 
 fn addToEpoll(epoll_fd: i32, watched_fd: i32) !void {
     const linux = std.os.linux;
@@ -651,4 +833,79 @@ test "retirement fences suppress overtaken installs and fail closed on overflow"
     fences.clear();
     try std.testing.expect(!fences.blocks(11));
     try std.testing.expect(!fences.blocks(99));
+}
+
+test "runtime settings acknowledgement is retained under control queue pressure" {
+    const forwarding_mod = @import("forwarding.zig");
+    const authorization_mod = @import("authorization.zig");
+    var routes = try forwarding_mod.Snapshot.init(std.testing.allocator, &.{});
+    defer routes.deinit();
+    var sources = try authorization_mod.Snapshot.init(std.testing.allocator, &.{});
+    defer sources.deinit();
+    var plane = try plane_mod.DataPlane.init(std.testing.allocator, 2, &routes, &sources, null);
+    defer plane.deinit();
+    var events = try ControlQueue.init(std.testing.allocator, 2);
+    defer events.deinit();
+    try std.testing.expect(events.push(.{ .kind = .traffic_state_changed, .receiver_session_id = 1 }));
+    try std.testing.expect(events.push(.{ .kind = .traffic_state_changed, .receiver_session_id = 2 }));
+
+    var worker: DataWorker = undefined;
+    worker.plane = &plane;
+    worker.control_queue = &events;
+    worker.runtime_barrier_acknowledgements = null;
+    worker.pending_snapshot_ack = null;
+    const desired: traffic.Config = .{
+        .cold_after_ns = 7 * std.time.ns_per_s,
+        .hot_pps = 1234,
+        .hot_bits_per_second = 9_876_543,
+        .saturated_queue_percent = 73,
+        .hysteresis_ns = 9 * std.time.ns_per_s,
+    };
+    try std.testing.expect(!worker.processCommand(DataCommand.applyRuntimeSettings(42, desired, 1420)));
+    try std.testing.expectEqual(@as(u16, 1420), plane.inner_mtu);
+    try std.testing.expectEqual(desired, plane.traffic_config);
+    try std.testing.expect(worker.pending_snapshot_ack != null);
+
+    _ = events.pop();
+    _ = events.pop();
+    worker.flushSnapshotAck();
+    const acknowledgement = events.pop().?;
+    try std.testing.expectEqual(ControlEventKind.runtime_settings_applied, acknowledgement.kind);
+    try std.testing.expectEqual(@as(u64, 42), acknowledgement.snapshot_generation);
+    try std.testing.expect(worker.pending_snapshot_ack == null);
+}
+
+test "Master runtime barriers bypass a saturated control queue in command order" {
+    var events = try ControlQueue.init(std.testing.allocator, 2);
+    defer events.deinit();
+    try std.testing.expect(events.push(.{ .kind = .traffic_state_changed, .receiver_session_id = 1 }));
+    try std.testing.expect(events.push(.{ .kind = .traffic_state_changed, .receiver_session_id = 2 }));
+
+    var acknowledgements = try RuntimeBarrierAcknowledgementQueue.init(std.testing.allocator, 2);
+    defer acknowledgements.deinit();
+    var worker: DataWorker = undefined;
+    worker.control_queue = &events;
+    worker.runtime_barrier_acknowledgements = &acknowledgements;
+    worker.pending_snapshot_ack = .{
+        .kind = .runtime_settings_applied,
+        .receiver_session_id = 0,
+        .snapshot_generation = 72,
+    };
+    worker.flushSnapshotAck();
+    worker.pending_snapshot_ack = .{
+        .kind = .snapshot_installed,
+        .receiver_session_id = 0,
+        .snapshot_generation = 73,
+    };
+
+    worker.flushSnapshotAck();
+    try std.testing.expect(worker.pending_snapshot_ack == null);
+    try std.testing.expectEqual(@as(usize, 2), events.occupancy());
+    try std.testing.expectEqual(
+        @as(u64, 72),
+        acknowledgements.pop().?.runtime_settings,
+    );
+    const snapshot = acknowledgements.pop().?.master_snapshot;
+    try std.testing.expectEqual(@as(u64, 73), snapshot.generation);
+    try std.testing.expect(snapshot.retired == null);
 }

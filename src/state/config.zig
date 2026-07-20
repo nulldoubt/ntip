@@ -4,6 +4,19 @@ const cli_common = @import("../cli/common.zig");
 
 pub const schema_version: u32 = 1;
 pub const max_config_bytes: usize = 1024 * 1024;
+pub const server_bootstrap_schema_version: u32 = 2;
+pub const max_server_bootstrap_bytes: usize = 16 * 1024;
+pub const default_service_socket_path = "/run/ntip-api/ntsrv-api.sock";
+
+/// Clean-break v0.2 Master bootstrap. Operational values are loaded from the
+/// effective SQLite settings revision and therefore cannot be shadowed by a
+/// second mutable configuration source.
+pub const ServerBootstrapConfig = struct {
+    schema_version: u32,
+    listen_port: u16 = 49152,
+    tun_name: []const u8 = "ntip0",
+    service_socket_path: []const u8 = default_service_socket_path,
+};
 
 pub const TrafficConfig = struct {
     cold_after_seconds: u32 = 30,
@@ -36,6 +49,21 @@ pub const ClientConfig = struct {
     tun_name: []const u8 = "ntip0",
     inner_mtu: u16 = 1380,
 };
+
+pub fn decodeServerBootstrap(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(ServerBootstrapConfig) {
+    if (bytes.len == 0 or bytes.len > max_server_bootstrap_bytes) return error.InvalidConfig;
+    const parsed = std.json.parseFromSlice(ServerBootstrapConfig, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidConfigJson;
+    errdefer parsed.deinit();
+    if (parsed.value.schema_version != server_bootstrap_schema_version) return error.UnsupportedSchemaVersion;
+    if (parsed.value.listen_port == 0) return error.InvalidConfig;
+    try validateTunName(parsed.value.tun_name);
+    try validateServiceSocketPath(parsed.value.service_socket_path);
+    return parsed;
+}
 
 pub fn decodeServer(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(ServerConfig) {
     if (bytes.len == 0 or bytes.len > max_config_bytes) return error.InvalidConfig;
@@ -120,9 +148,26 @@ pub fn decodePublicKey(text: []const u8) ![32]u8 {
 }
 
 fn validateTun(name: []const u8, mtu: u16) !void {
+    try validateTunName(name);
+    if (mtu < 576 or mtu > 65_535 - 34) return error.InvalidConfig;
+}
+
+fn validateTunName(name: []const u8) !void {
     if (name.len == 0 or name.len > 15) return error.InvalidConfig;
     for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return error.InvalidConfig;
-    if (mtu < 576 or mtu > 65_535 - 34) return error.InvalidConfig;
+}
+
+fn validateServiceSocketPath(path: []const u8) !void {
+    if (path.len < 2 or path.len > 107 or path[0] != '/' or
+        !std.mem.endsWith(u8, path, ".sock")) return error.InvalidConfig;
+    for (path) |byte| {
+        if (byte == 0 or byte == '\n' or byte == '\r') return error.InvalidConfig;
+    }
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return error.InvalidConfig;
+    }
 }
 
 fn validateLowerHex(text: []const u8, byte_len: usize) !void {
@@ -161,6 +206,28 @@ test "server config defaults pin v0.1 operational thresholds" {
     try std.testing.expectEqual(@as(u16, 45), parsed.value.offline_after_seconds);
 }
 
+test "v0.2 server bootstrap excludes operational settings and is strict" {
+    const bytes =
+        \\{"schema_version":2,"listen_port":49152,"tun_name":"ntip0","service_socket_path":"/run/ntip-api/ntsrv-api.sock"}
+    ;
+    const parsed = try decodeServerBootstrap(std.testing.allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 49152), parsed.value.listen_port);
+
+    const operational_shadow =
+        \\{"schema_version":2,"inner_mtu":1400}
+    ;
+    try std.testing.expectError(error.InvalidConfigJson, decodeServerBootstrap(std.testing.allocator, operational_shadow));
+    try std.testing.expectError(
+        error.InvalidConfig,
+        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"service_socket_path\":\"relative.sock\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"service_socket_path\":\"/run/../ntsrv-api.sock\"}"),
+    );
+}
+
 test "client config is strict and pins Master identity independently of DNS" {
     const bytes =
         \\{"schema_version":1,"master":"master.example:49152","node":"node01","master_public_key":"0100000000000000000000000000000000000000000000000000000000000000"}
@@ -180,7 +247,7 @@ test "packaged sample configurations satisfy the strict decoders" {
         std.testing.io,
         "packaging/config/server.json",
         std.testing.allocator,
-        .limited(max_config_bytes),
+        .limited(max_server_bootstrap_bytes),
     );
     defer std.testing.allocator.free(server_bytes);
     const client_bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -190,7 +257,7 @@ test "packaged sample configurations satisfy the strict decoders" {
         .limited(max_config_bytes),
     );
     defer std.testing.allocator.free(client_bytes);
-    const server = try decodeServer(std.testing.allocator, server_bytes);
+    const server = try decodeServerBootstrap(std.testing.allocator, server_bytes);
     defer server.deinit();
     const client = try decodeClient(std.testing.allocator, client_bytes);
     defer client.deinit();

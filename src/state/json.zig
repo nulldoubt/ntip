@@ -87,7 +87,12 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!model
     for (parsed.value.routes) |disk| {
         const prefix = model.Cidr.parse(disk.prefix) catch return error.InvalidState;
         const node = model.Name.parse(disk.node) catch return error.InvalidState;
-        store.routes.append(allocator, .{ .prefix = prefix, .node = node }) catch return error.OutOfMemory;
+        const owner = store.findNode(node.slice()) orelse return error.InvalidState;
+        store.routes.append(allocator, .{
+            .id = model.deriveLegacyRouteId(prefix, owner.id),
+            .prefix = prefix,
+            .node = node,
+        }) catch return error.OutOfMemory;
     }
 
     store.validate() catch return error.InvalidState;

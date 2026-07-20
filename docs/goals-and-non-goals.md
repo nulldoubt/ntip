@@ -2,106 +2,131 @@
 
 ## Purpose
 
-NTIP is a centrally managed Layer-3 interconnect for operators who need to
-place Nodes behind one authoritative Master and then use the host operating
-system for routing, NAT, firewalling, load balancing, and private access.
+NTIP is a centrally managed Layer-3 interconnect for small infrastructure
+teams. One authoritative Master enrolls and routes 10–250 Nodes while Linux
+continues to own forwarding, firewalling, NAT, policy routing, and load
+balancing.
 
-The v0.1 objective is a real, encrypted, recoverable Linux implementation with
-an intentionally portable fast path. It is acceptable for that implementation
-to be slower than WireGuard. Correctness, bounded resource use, stable
-contracts, and evidence-driven optimization come first.
+The v0.2 objective is to add a secure management plane and operator dashboard
+without changing the v0.1 Node wire protocol. Correctness, bounded resource
+use, durable state, explicit trust boundaries, and reproducible evidence take
+priority over throughput claims or a broad automation surface.
 
 ## Goals
 
-### Lightweight forwarding
+### Preserve the bounded data plane
 
-- Carry exactly one complete IPv4 packet in each v0.1 DATA datagram.
-- Keep ordinary packet handling to parse, session lookup, authentication,
-  replay check, decrypt, ownership validation, forwarding lookup, and I/O.
-- Perform no JSON parsing, persistence, unbounded allocation, formatted
-  logging, or global locking in the DATA hot path.
-- Reuse bounded packet buffers and drop traffic for offline destinations rather
-  than retaining unbounded queues.
+- Carry one complete IPv4 packet in each v0.1 DATA datagram.
+- Keep ordinary packet handling to bounded parsing, session lookup,
+  authentication, replay checks, ownership validation, routing, and I/O.
+- Keep JSON, SQLite, formatted logging, and unbounded work out of the DATA hot
+  path.
+- Reuse bounded packet buffers and drop traffic for offline destinations
+  instead of retaining unbounded queues.
+- Enroll and reconnect existing v0.1 Nodes without a protocol change.
 
-### Central authority with explicit identity
+### Keep one durable authority
 
-- Give every Node a persistent generated UUID, one registered public key, and
-  one explicitly assigned VNR `/32` address.
-- Keep identity, VNR address, current UDP endpoint, and optional routed prefixes
-  as distinct concepts.
-- Bind a locally generated Node key to its server-side record through a
-  single-use, expiring enrollment credential.
-- Treat the Master as authoritative for membership, address assignments,
-  routes, liveness, session keys, and configuration generation.
+- Make `ntsrv` the only live SQLite owner and the authority for inventory,
+  enrollment, access control, settings, operations, and immutable audit.
+- Preserve one VNR per Node, unique identities/addresses/keys, non-overlapping
+  VNRs and routes, reserved-address checks, and valid route ownership in
+  transactions.
+- Commit a mutation and its audit row before publishing one immutable runtime
+  generation through bounded queues.
+- Preserve Node-local identity and enrollment files independently of the
+  Master database.
+- Fail explicitly on unsupported legacy Master JSON instead of importing,
+  deleting, or reinterpreting it automatically.
 
-### Linux-native integration
+### Provide a narrow management boundary
 
-- Present ordinary Layer-3 packets through non-persistent TUN interfaces.
-- Let Linux own forwarding, nftables, conntrack, NAT, policy routing, and load
-  balancing.
-- Detect and explain missing host prerequisites without silently changing
-  forwarding, reverse-path filtering, firewall rules, or NAT policy.
-- Use explicit routes and source ownership checks to stop a Node from claiming
-  another Node or routed prefix.
+- Keep the human CLI socket OS-authorized and add a separately peer-authorized,
+  versioned service socket for the unprivileged `ntip-api` process.
+- Bind `ntip-api` to loopback, enforce bounded HTTP/1.1 parsing and connection
+  admission, and expose the canonical `/api/v1` OpenAPI contract.
+- Require opaque web sessions, CSRF and exact-Origin checks, RBAC, ETags,
+  idempotency keys, recent reauthentication, and typed confirmation where the
+  operation warrants them.
+- Redact protocol and enrollment secrets from public DTOs, logs, audit views,
+  and generated artifacts.
+- Keep QAWS as an architectural reference only; NTIP has no QAWS dependency.
 
-### Secure operation and recovery
+### Give operators a focused dashboard
 
-- Use fixed, reviewed primitives and fixed Noise patterns without negotiation.
-- Reject replay, fail closed on corrupt/newer persistent state, and validate a
-  changed endpoint before adopting it.
-- Make successful administrative mutations durable before reporting success.
-- Support deterministic installation, rollback, and uninstall while retaining
-  persistent identity and managed state unless the operator explicitly removes
-  them.
+- Serve authenticated Next.js App Router pages under pinned Bun from a
+  separately installed, unprivileged loopback service.
+- Cover overview, VNRs, Nodes, topology, activity, users, sessions, and
+  settings with role-aware workflows against real API contracts.
+- Provide deterministic topology plus an accessible table, bounded polling,
+  visible stale state, keyboard operation, reduced motion, and WCAG 2.2 AA
+  behavior.
+- Treat the TLS proxy as the sole browser router for `/api/v1`; the dashboard
+  never embeds a second browser API destination.
+- Support desktop administration at 1024 pixels and wider. Smaller viewports
+  receive an explicit unsupported-size state.
 
-### Portable production-beta baseline
+### Make operations recoverable and releases inspectable
 
-- Run on Linux kernel 6.1+ on native x86_64 and AArch64.
-- Cross-build from the Apple Silicon development host and run platform-neutral
-  tests there.
-- Ship static-musl `ReleaseSafe` artifacts, checksums, an SPDX SBOM, and build
-  provenance.
-- Publish benchmark context and results without an unsupported speed claim.
+- Use transactional migrations, WAL, `synchronous=FULL`, integrity-checked
+  backup/restore, a recoverable pre-restore copy, and restored-session
+  revocation.
+- Reconcile live and restart-required settings through immutable revisions and
+  explicit desired/effective state.
+- Package core and API as static-musl Zig artifacts for x86_64 and AArch64;
+  package the optional dashboard with the matching pinned glibc Bun runtime.
+- Publish checksums, component SPDX SBOMs, provenance, installer isolation,
+  reproducibility comparisons, systemd hardening evidence, and secret scans.
+- Make every architecture, schema, contract, configuration, deployment,
+  security, and milestone change update `CODEX.md` in the same changeset.
 
-## Non-goals for v0.1
+## Non-goals for v0.2
 
-NTIP v0.1 deliberately does not provide:
+NTIP v0.2 deliberately does not provide:
 
 - Ethernet emulation, Layer 2 frames, ARP, broadcast, STP, or multicast-domain
   behavior;
 - IPv6 inner packets or IPv6 VNRs;
-- overlapping VNRs, automatic address allocation, or multi-VNR Nodes;
-- multiple Masters, HA/failover, federation, or direct Node-to-Node transport;
+- overlapping VNRs, automatic address allocation, multi-VNR Nodes, multiple
+  Masters, HA/failover, federation, or direct Node-to-Node transport;
 - reliable or buffered DATA delivery;
-- automatic firewall, NAT, load-balancer, forwarding, or sysctl management;
+- automatic firewall, NAT, load-balancer, forwarding, sysctl, TLS-proxy, or
+  backup-schedule management;
 - cipher negotiation, AES/FIPS agility, post-quantum exchange, 0-RTT DATA, or
   0-RTT mutation;
-- database-backed state, runtime config reload, a remote management API, or an
-  exposed metrics server;
+- SSO, MFA, API tokens, a supported external-automation contract, SSE,
+  WebSockets, or mobile administration;
+- SQLCipher, automatic legacy JSON migration, Node software-version telemetry,
+  or direct Node-to-Node diagnostic probes;
+- Next Draft Mode or Server Actions in the dashboard;
 - multiqueue TUN, raw `recvmmsg`, per-core sharding, AF_XDP, DPDK, a kernel
   module, NUMA tuning, SmartNIC support, or hardware offload;
-- Windows, macOS, Android, or BSD runtime support.
+- Windows, macOS, Android, or BSD production runtime support.
 
-These exclusions are compatibility boundaries, not promises about later
-versions. A future feature must justify its security, wire, and operational
-cost independently.
+These exclusions are compatibility and security boundaries, not promises about
+later versions. A future feature must justify its wire, trust, persistence, and
+operational cost independently.
 
-## Production-beta definition
+## v0.2 release definition
 
-The `v0.1.0-beta.1` tag is permitted only after all of these are true:
+A v0.2 release tag is permitted only when all of the following are true:
 
-1. Formatting, unit, negative, fuzz, integration, and version-consistency gates
-   pass.
-2. Namespace scenarios pass for Master-to-Node, Node-to-Node through the
-   Master, routed-prefix traffic, NAT, roaming, restart, nftables denial, DNAT,
-   load balancing, packet loss/reorder/duplication, and MTU failure.
-3. Release artifacts execute natively on x86_64 and AArch64 Linux.
-4. The hot path allocates nothing after initialization and malformed traffic
-   cannot cause unbounded memory growth.
-5. A 24-hour loss/reorder soak completes cleanly.
-6. No critical or high-severity security finding remains unresolved.
-7. Independent reviewers examine Noise state handling, replay logic, parsers,
-   enrollment persistence, and endpoint migration.
+1. Zig formatting, unit, integration, negative, fuzz, migration, crash,
+   concurrency, and two-target static-musl build gates pass.
+2. Existing v0.1 Nodes enroll, exchange DATA, survive a current-Master restart,
+   and reconnect unchanged in the pinned compatibility scenario.
+3. HTTP/IPC framing, authentication, authorization, session, CSRF/Origin,
+   ETag, idempotency, secret-redaction, and unavailable-service tests pass.
+4. Dashboard lint, typecheck, unit tests, production build/start smoke, and
+   Playwright pass under exactly Bun 1.3.14 with no Node.js fallback.
+5. Core, API, and optional dashboard artifacts validate on native x86_64 and
+   AArch64 Linux, including checksums, exact SBOM coverage, installer lifecycle,
+   static/dynamic linkage policy, and systemd isolation.
+6. Two clean source roots produce byte-identical release artifacts for each
+   architecture and component.
+7. No unresolved critical or high-severity security finding remains, and the
+   release record identifies any still-open operational evidence explicitly.
 
-Production-beta does not mean NTIP has outperformed WireGuard, and project
-materials must not imply that claim without reproducible evidence.
+This release definition does not claim that NTIP outperforms WireGuard. Project
+materials require reproducible benchmark evidence before making a comparative
+performance claim.

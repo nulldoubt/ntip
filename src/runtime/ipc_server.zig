@@ -1,6 +1,7 @@
 const std = @import("std");
 const framing = @import("ipc.zig");
 const socket = @import("../platform/linux/ipc_socket.zig");
+const socket_deadline = @import("../platform/linux/socket_deadline.zig");
 const lifecycle = @import("../platform/linux/lifecycle.zig");
 
 pub const Handler = struct {
@@ -73,9 +74,18 @@ pub const Server = struct {
         defer arena.deinit();
         const request_allocator = arena.allocator();
 
-        var reader_buffer: [4096]u8 = undefined;
-        var stream_reader = std.Io.net.Stream.Reader.init(connection.stream, self.io, &reader_buffer);
-        const body = try framing.readFrame(&stream_reader.interface, self.request_storage);
+        const read_deadline = socket_deadline.Deadline.start(self.io);
+        var prefix: [framing.prefix_bytes]u8 = undefined;
+        try socket_deadline.readExact(self.io, connection.stream, &prefix, read_deadline);
+        const request_length = try framing.decodeLength(&prefix);
+        if (request_length > self.request_storage.len) return error.DestinationTooSmall;
+        try socket_deadline.readExact(
+            self.io,
+            connection.stream,
+            self.request_storage[0..request_length],
+            read_deadline,
+        );
+        const body = self.request_storage[0..request_length];
         const parsed = try framing.decodeRequest(request_allocator, body);
         defer parsed.deinit();
 
@@ -89,9 +99,21 @@ pub const Server = struct {
         };
         const encoded = try framing.encodeResponse(request_allocator, response);
 
-        var writer_buffer: [4096]u8 = undefined;
-        var stream_writer = std.Io.net.Stream.Writer.init(connection.stream, self.io, &writer_buffer);
-        try framing.writeFrame(&stream_writer.interface, encoded);
+        var response_prefix: [framing.prefix_bytes]u8 = undefined;
+        try framing.encodeLength(&response_prefix, encoded.len);
+        const write_deadline = socket_deadline.Deadline.start(self.io);
+        try socket_deadline.writeAll(
+            self.io,
+            connection.stream.socket,
+            &response_prefix,
+            write_deadline,
+        );
+        try socket_deadline.writeAll(
+            self.io,
+            connection.stream.socket,
+            encoded,
+            write_deadline,
+        );
     }
 };
 

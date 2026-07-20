@@ -1,6 +1,16 @@
 const std = @import("std");
 
-pub const version = "0.1.0-dev";
+pub const version = "0.2.0-dev";
+
+const sqlite_flags = &.{
+    "-DSQLITE_THREADSAFE=1",
+    "-DSQLITE_DQS=0",
+    "-DSQLITE_DEFAULT_MEMSTATUS=0",
+    "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=2",
+    "-DSQLITE_OMIT_DEPRECATED",
+    "-DSQLITE_OMIT_LOAD_EXTENSION",
+    "-DSQLITE_USE_URI=0",
+};
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,14 +26,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ntip.addOptions("build_options", options);
+    addSqlite(ntip, b);
+
+    // `ntcl` deliberately receives a separate shared-source module without
+    // SQLite C sources, so the Node artifact remains DB-free.
+    const client_ntip = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_ntip.addOptions("build_options", options);
 
     const ntsrv = addExecutable(b, "ntsrv", "src/apps/ntsrv.zig", ntip, target, optimize, options);
-    const ntcl = addExecutable(b, "ntcl", "src/apps/ntcl.zig", ntip, target, optimize, options);
+    const ntcl = addExecutable(b, "ntcl", "src/apps/ntcl.zig", client_ntip, target, optimize, options);
+    const ntip_api = addExecutable(b, "ntip-api", "src/apps/ntip-api.zig", client_ntip, target, optimize, options);
+    ntip_api.root_module.addImport("openapi_document", b.createModule(.{
+        .root_source_file = b.path("packages/contracts/src/openapi_document.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     b.installArtifact(ntsrv);
     b.installArtifact(ntcl);
+    b.installArtifact(ntip_api);
 
     addRunStep(b, "run-ntsrv", "Run the NTIP Master server CLI", ntsrv);
     addRunStep(b, "run-ntcl", "Run the NTIP Node client CLI", ntcl);
+    addRunStep(b, "run-ntip-api", "Run the NTIP management HTTP service", ntip_api);
 
     const unit_tests = b.addTest(.{ .root_module = ntip });
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -32,6 +60,17 @@ pub fn build(b: *std.Build) void {
     const run_server_tests = b.addRunArtifact(server_tests);
     const client_tests = b.addTest(.{ .root_module = ntcl.root_module });
     const run_client_tests = b.addRunArtifact(client_tests);
+    const api_tests = b.addTest(.{ .root_module = ntip_api.root_module });
+    const run_api_tests = b.addRunArtifact(api_tests);
+
+    const sqlite_test_module = b.createModule(.{
+        .root_source_file = b.path("src/state/sqlite_repository.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addSqlite(sqlite_test_module, b);
+    const sqlite_tests = b.addTest(.{ .root_module = sqlite_test_module });
+    const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
 
     const protocol_module = b.createModule(.{
         .root_source_file = b.path("src/protocol/mod.zig"),
@@ -57,12 +96,31 @@ pub fn build(b: *std.Build) void {
     const primitive_vector_step = b.step("primitive-vectors", "Check RFC 8439, RFC 5869, and RFC 7748 primitive vectors");
     primitive_vector_step.dependOn(&run_primitive_vector_tests.step);
 
+    const management_contract_module = b.createModule(.{
+        .root_source_file = b.path("tests/management_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ntip", .module = ntip },
+            .{ .name = "openapi_document", .module = b.createModule(.{
+                .root_source_file = b.path("packages/contracts/src/openapi_document.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+        },
+    });
+    const management_contract_tests = b.addTest(.{ .root_module = management_contract_module });
+    const run_management_contract_tests = b.addRunArtifact(management_contract_tests);
+
     const test_step = b.step("test", "Run portable unit and executable tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_server_tests.step);
     test_step.dependOn(&run_client_tests.step);
+    test_step.dependOn(&run_api_tests.step);
+    test_step.dependOn(&run_sqlite_tests.step);
     test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(primitive_vector_step);
+    test_step.dependOn(&run_management_contract_tests.step);
 
     const integration_module = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),
@@ -114,12 +172,28 @@ pub fn build(b: *std.Build) void {
             .strip = true,
         });
         release_ntip.addOptions("build_options", options);
+        addSqlite(release_ntip, b);
+        const release_client_ntip = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = linux_target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+        });
+        release_client_ntip.addOptions("build_options", options);
         const release_ntsrv = addExecutable(b, "ntsrv", "src/apps/ntsrv.zig", release_ntip, linux_target, .ReleaseSafe, options);
-        const release_ntcl = addExecutable(b, "ntcl", "src/apps/ntcl.zig", release_ntip, linux_target, .ReleaseSafe, options);
+        const release_ntcl = addExecutable(b, "ntcl", "src/apps/ntcl.zig", release_client_ntip, linux_target, .ReleaseSafe, options);
+        const release_ntip_api = addExecutable(b, "ntip-api", "src/apps/ntip-api.zig", release_client_ntip, linux_target, .ReleaseSafe, options);
+        release_ntip_api.root_module.addImport("openapi_document", b.createModule(.{
+            .root_source_file = b.path("packages/contracts/src/openapi_document.zig"),
+            .target = linux_target,
+            .optimize = .ReleaseSafe,
+        }));
         release_ntsrv.root_module.strip = true;
         release_ntcl.root_module.strip = true;
+        release_ntip_api.root_module.strip = true;
         cross_step.dependOn(&release_ntsrv.step);
         cross_step.dependOn(&release_ntcl.step);
+        cross_step.dependOn(&release_ntip_api.step);
 
         // Zig 0.16.0 can crash when an `addTest` compile-only probe combines
         // `-fstrip` with `-fno-emit-bin`. Keep release executables stripped,
@@ -131,6 +205,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         });
         probe_ntip.addOptions("build_options", options);
+        addSqlite(probe_ntip, b);
         const linux_probe_module = b.createModule(.{
             .root_source_file = b.path("tests/linux_compile.zig"),
             .target = linux_target,
@@ -140,16 +215,30 @@ pub fn build(b: *std.Build) void {
         const linux_probe = b.addTest(.{ .root_module = linux_probe_module });
         cross_step.dependOn(&linux_probe.step);
 
+        const sqlite_probe_module = b.createModule(.{
+            .root_source_file = b.path("src/state/sqlite_repository.zig"),
+            .target = linux_target,
+            .optimize = .ReleaseSafe,
+        });
+        addSqlite(sqlite_probe_module, b);
+        const sqlite_probe = b.addTest(.{ .root_module = sqlite_probe_module });
+        cross_step.dependOn(&sqlite_probe.step);
+
         const install_ntsrv = b.addInstallArtifact(release_ntsrv, .{
             .dest_dir = .{ .override = .{ .custom = b.fmt("release/{s}", .{entry.name}) } },
         });
         const install_ntcl = b.addInstallArtifact(release_ntcl, .{
             .dest_dir = .{ .override = .{ .custom = b.fmt("release/{s}", .{entry.name}) } },
         });
+        const install_ntip_api = b.addInstallArtifact(release_ntip_api, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("release/{s}", .{entry.name}) } },
+        });
         cross_step.dependOn(&install_ntsrv.step);
         cross_step.dependOn(&install_ntcl.step);
+        cross_step.dependOn(&install_ntip_api.step);
         release_step.dependOn(&install_ntsrv.step);
         release_step.dependOn(&install_ntcl.step);
+        release_step.dependOn(&install_ntip_api.step);
     }
 
     const version_check = b.addSystemCommand(&.{ "sh", "scripts/check-version.sh" });
@@ -168,6 +257,18 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(fmt_step);
     check_step.dependOn(version_step);
     check_step.dependOn(cross_step);
+}
+
+fn addSqlite(module: *std.Build.Module, b: *std.Build) void {
+    module.addIncludePath(b.path("ext/sqlite"));
+    module.addCSourceFiles(.{
+        .files = &.{
+            "ext/sqlite/sqlite3.c",
+            "ext/sqlite/ntip_sqlite.c",
+        },
+        .flags = sqlite_flags,
+    });
+    module.link_libc = true;
 }
 
 fn addExecutable(

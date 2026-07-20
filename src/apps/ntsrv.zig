@@ -1,9 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ntip = @import("ntip");
 
 const ExitCode = ntip.cli.common.ExitCode;
 const Command = ntip.cli.server.Command;
-const Credential = ntip.protocol.credential.Credential;
 
 const usage =
     \\NTIP Master
@@ -16,6 +16,8 @@ const usage =
     \\  node delete NAME | node list [--json] | node show NAME [--json]
     \\  node enrollment renew NAME | node enrollment reset NAME
     \\  route add CIDR NODE | route delete CIDR | route list [--json] | route show CIDR [--json]
+    \\  user bootstrap USERNAME --password-stdin
+    \\  backup --output-dir DIR | restore --input FILE
     \\  version
     \\
 ;
@@ -24,11 +26,21 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const process_args = try init.minimal.args.toSlice(allocator);
     const args = if (process_args.len > 0) process_args[1..] else process_args;
+    var stdin_buffer: [2048]u8 = undefined;
+    defer std.crypto.secureZero(u8, &stdin_buffer);
     var stdout_buffer: [4096]u8 = undefined;
     var stderr_buffer: [4096]u8 = undefined;
+    var stdin_file = std.Io.File.Reader.init(.stdin(), init.io, &stdin_buffer);
     var stdout_file = std.Io.File.Writer.init(.stdout(), init.io, &stdout_buffer);
     var stderr_file = std.Io.File.Writer.init(.stderr(), init.io, &stderr_buffer);
-    const code = try run(allocator, init.io, args, &stdout_file.interface, &stderr_file.interface);
+    const code = try runWithInput(
+        allocator,
+        init.io,
+        args,
+        &stdin_file.interface,
+        &stdout_file.interface,
+        &stderr_file.interface,
+    );
     try stdout_file.interface.flush();
     try stderr_file.interface.flush();
     if (code != .success) std.process.exit(@intFromEnum(code));
@@ -41,6 +53,18 @@ fn run(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !ExitCode {
+    var stdin = std.Io.Reader.fixed("");
+    return runWithInput(allocator, io, args, &stdin, stdout, stderr);
+}
+
+fn runWithInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !ExitCode {
     if (args.len == 0 or (args.len == 1 and isHelp(args[0]))) {
         try stdout.writeAll(usage);
         return .success;
@@ -50,7 +74,7 @@ fn run(
         try stderr.writeAll(usage);
         return code;
     };
-    return execute(allocator, io, args, parsed, stdout, stderr) catch |err|
+    return execute(allocator, io, args, parsed, stdin, stdout, stderr) catch |err|
         ntip.cli.runner.reportError(stderr, "ntsrv", err);
 }
 
@@ -59,6 +83,7 @@ fn execute(
     io: std.Io,
     args: []const []const u8,
     parsed: ntip.cli.server.Parsed,
+    stdin: *std.Io.Reader,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !ExitCode {
@@ -85,101 +110,169 @@ fn execute(
 
     var state_dir = try ntip.cli.runner.openPrivateDirectory(io, parsed.paths.state_dir);
     defer state_dir.close(io);
-    const repository = ntip.state.repository.Repository{ .dir = state_dir };
-    var transaction = try repository.begin(allocator, io, true);
-    defer transaction.deinit();
+    var lifetime_lock = try ntip.state.atomic_file.LifetimeLock.acquire(state_dir, io, "state.lock", true);
+    defer lifetime_lock.release(io);
 
-    switch (parsed.command) {
-        .vnr_list => |format| try ntip.cli.view.writeVnrList(stdout, &transaction.store, format),
-        .vnr_show => |show| try ntip.cli.view.writeVnrShow(stdout, &transaction.store, show.name, show.output),
-        .node_list => |format| try ntip.cli.view.writeNodeList(stdout, &transaction.store, format),
-        .node_show => |show| try ntip.cli.view.writeNodeShow(stdout, &transaction.store, show.name, show.output),
-        .route_list => |format| try ntip.cli.view.writeRouteList(stdout, &transaction.store, format),
-        .status => |format| try ntip.cli.view.writeServerStatus(stdout, &transaction.store, "stopped", format),
-        .route_show => |show| {
-            const prefix = ntip.domain.ipv4.Cidr.parse(show.cidr) catch return error.InvalidCidr;
-            try ntip.cli.view.writeRouteShow(stdout, &transaction.store, prefix, show.output);
-        },
-        .vnr_create => |create| {
-            const outcome = try ntip.cli.dispatch.applyServerMutation(&transaction.store, io, parsed.command);
-            try transaction.commit();
-            const vnr = transaction.store.findVnr(create.name).?;
-            var range_buffer: [18]u8 = undefined;
-            var master_buffer: [15]u8 = undefined;
-            try stdout.print("Created VNR \"{s}\"\n\nRange:          {s}\nMaster address: {s}\n", .{
-                create.name,
-                try vnr.range.write(&range_buffer),
-                try vnr.masterAddress().write(&master_buffer),
-            });
-            if (outcome.vnr_created.public_range_warning) {
-                try stderr.writeAll("warning: this VNR is not wholly within RFC 1918 private address space\n");
-            }
-        },
-        .vnr_delete => |name| {
-            _ = try ntip.cli.dispatch.applyServerMutation(&transaction.store, io, parsed.command);
-            try transaction.commit();
-            try stdout.print("Deleted VNR \"{s}\"\n", .{name});
-        },
-        .route_add => |add| {
-            _ = try ntip.cli.dispatch.applyServerMutation(&transaction.store, io, parsed.command);
-            try transaction.commit();
-            try stdout.print("Added route {s} via {s}\n", .{ add.cidr, add.node });
-        },
-        .route_delete => |prefix| {
-            _ = try ntip.cli.dispatch.applyServerMutation(&transaction.store, io, parsed.command);
-            try transaction.commit();
-            try stdout.print("Deleted route {s}\n", .{prefix});
-        },
-        .node_create => |create| {
-            const defaults = try configuredAdministrativeDefaults(allocator, io, parsed.paths.config);
-            if (transaction.store.nodes.items.len >= defaults.maximum_nodes) return error.MaximumNodesExceeded;
-            try createNode(
-                allocator,
-                io,
-                state_dir,
-                &transaction,
-                parsed.command,
-                create,
-                create.expires_seconds orelse defaults.enrollment_lifetime_seconds,
-                stdout,
-            );
-        },
-        .node_delete => |name| try deleteNode(allocator, io, state_dir, &transaction, parsed.command, name, stdout),
-        .node_enrollment_renew => |name| {
-            const defaults = try configuredAdministrativeDefaults(allocator, io, parsed.paths.config);
-            try renewEnrollment(allocator, io, state_dir, &transaction, name, false, defaults.enrollment_lifetime_seconds, stdout);
-        },
-        .node_enrollment_reset => |name| {
-            const defaults = try configuredAdministrativeDefaults(allocator, io, parsed.paths.config);
-            try renewEnrollment(allocator, io, state_dir, &transaction, name, true, defaults.enrollment_lifetime_seconds, stdout);
-        },
-        .up, .down, .version => unreachable,
+    if (parsed.command == .restore) {
+        try restoreDatabase(allocator, io, state_dir, parsed.paths.state_dir, parsed.command.restore.input, stdout);
+        return .success;
     }
+
+    var sqlite_owner = try ntip.state.sqlite_repository.Repository.open(allocator, io, state_dir);
+    defer sqlite_owner.deinit();
+    if (parsed.command == .user_bootstrap) {
+        try bootstrapUser(
+            allocator,
+            io,
+            &sqlite_owner.db,
+            parsed.command.user_bootstrap.username,
+            stdin,
+            stdout,
+        );
+        return .success;
+    }
+    const repository = ntip.state.management_repository.Repository.init(&sqlite_owner.db);
+    var store = try repository.loadInventory(allocator);
+    defer store.deinit();
+    const settings_state = try (ntip.state.settings_repository.Repository.init(&sqlite_owner.db)).loadState();
+    const settings = settings_state.effective.values;
+    try settings.validate(store.nodes.items.len);
+    var identity = try ntip.state.identity.loadOrCreate(allocator, io, state_dir);
+    defer std.crypto.secureZero(u8, &identity.secret);
+    var application = try ntip.management.server_application.Application.init(
+        allocator,
+        io,
+        repository,
+        &store,
+        identity.public,
+        settings,
+        ntip.version,
+    );
+    application.service_state = "stopped";
+    try application.execute(parsed.command, stdout, stderr);
     return .success;
 }
 
-const AdministrativeDefaults = struct {
-    maximum_nodes: u32,
-    enrollment_lifetime_seconds: u64,
-};
+fn bootstrapUser(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db: *ntip.state.sqlite.Database,
+    username_text: []const u8,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !void {
+    try requireRoot();
+    const username = try ntip.management.auth.Username.parse(username_text);
+    const password = try readPasswordInput(allocator, stdin);
+    defer {
+        std.crypto.secureZero(u8, password);
+        allocator.free(password);
+    }
+    var password_hash = try ntip.management.auth.PasswordHash.create(allocator, io, password);
+    defer std.crypto.secureZero(u8, &password_hash.bytes);
+    const now = try wallSeconds(io);
+    const repository = ntip.state.access_repository.Repository.init(db);
+    _ = try repository.bootstrapFirstSuperuser(.{
+        .id = randomUuid(io),
+        .username = username.slice(),
+        .role = .superuser,
+        .password_phc = password_hash.slice(),
+        .password_change_required = false,
+        .now = now,
+    }, .{
+        .id = randomUuid(io),
+        .occurred_at = now,
+        .actor_kind = .local_cli,
+        .action = "user.bootstrap",
+        .resource_type = "user",
+        .resource_id = username.slice(),
+        .details_json = "{}",
+    });
+    try stdout.print("Bootstrapped superuser \"{s}\"\n", .{username.slice()});
+}
 
-fn configuredAdministrativeDefaults(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !AdministrativeDefaults {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
+fn restoreDatabase(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_dir: std.Io.Dir,
+    state_path: []const u8,
+    input_path: []const u8,
+    stdout: *std.Io.Writer,
+) !void {
+    const source_basename = std.fs.path.basename(input_path);
+    if (source_basename.len == 0 or std.mem.eql(u8, source_basename, ".") or
+        std.mem.eql(u8, source_basename, "..")) return error.InvalidPath;
+    const source_path = std.fs.path.dirname(input_path) orelse ".";
+    var source_dir = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openDirAbsolute(io, source_path, .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(io, source_path, .{ .follow_symlinks = false });
+    defer source_dir.close(io);
+
+    const now = try wallSeconds(io);
+    var entropy: [8]u8 = undefined;
+    io.random(&entropy);
+    var suffix: [entropy.len * 2]u8 = undefined;
+    encodeLowerHex(&entropy, &suffix);
+    const recovery_name = try std.fmt.allocPrint(
         allocator,
-        .limited(ntip.state.config.max_config_bytes),
-    ) catch |err| switch (err) {
-        error.FileNotFound => return .{ .maximum_nodes = 4096, .enrollment_lifetime_seconds = 24 * 60 * 60 },
-        else => return err,
-    };
-    defer allocator.free(bytes);
-    const parsed = try ntip.state.config.decodeServer(allocator, bytes);
-    defer parsed.deinit();
-    return .{
-        .maximum_nodes = parsed.value.maximum_nodes,
-        .enrollment_lifetime_seconds = parsed.value.default_enrollment_lifetime_seconds,
-    };
+        "ntip-pre-restore-{d}-{s}.sqlite3",
+        .{ now, suffix },
+    );
+    defer allocator.free(recovery_name);
+
+    const result = try ntip.state.sqlite_maintenance.restoreStopped(
+        allocator,
+        io,
+        state_dir,
+        source_dir,
+        source_basename,
+        recovery_name,
+        .{
+            .id = randomUuid(io),
+            .occurred_at = now,
+        },
+    );
+    try stdout.print(
+        "Database restored; revoked {d} web session(s)\nRecoverable copy: {s}/{s}\n",
+        .{ result.revoked_sessions, state_path, recovery_name },
+    );
+}
+
+fn readPasswordInput(allocator: std.mem.Allocator, stdin: *std.Io.Reader) ![]u8 {
+    const line = (try stdin.takeDelimiter('\n')) orelse return error.EmptyPassword;
+    if (line.len > ntip.management.auth.password_max_bytes + 1) return error.PasswordTooLong;
+    const trimmed = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+    try ntip.management.auth.validatePassword(trimmed);
+    return allocator.dupe(u8, trimmed);
+}
+
+fn requireRoot() !void {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    if (std.os.linux.geteuid() != 0) return error.RootRequired;
+}
+
+fn wallSeconds(io: std.Io) !i64 {
+    const seconds = std.Io.Clock.real.now(io).toSeconds();
+    if (seconds < 0) return error.ClockBeforeUnixEpoch;
+    return seconds;
+}
+
+fn randomUuid(io: std.Io) [16]u8 {
+    var id: [16]u8 = undefined;
+    io.random(&id);
+    id[6] = (id[6] & 0x0f) | 0x40;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    return id;
+}
+
+fn encodeLowerHex(bytes: []const u8, output: []u8) void {
+    std.debug.assert(output.len == bytes.len * 2);
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, index| {
+        output[index * 2] = alphabet[byte >> 4];
+        output[index * 2 + 1] = alphabet[byte & 0x0f];
+    }
 }
 
 fn startRuntime(
@@ -195,7 +288,7 @@ fn startRuntime(
         .runtime_dir = paths.runtime_dir,
     };
     if (!daemonize) {
-        try ntip.runtime.service.runMaster(std.heap.smp_allocator, io, service_paths, null);
+        try runMasterProcess(io, service_paths, null);
         return .success;
     }
     switch (try ntip.platform.linux.lifecycle.forkForDaemon()) {
@@ -208,170 +301,38 @@ fn startRuntime(
             return .success;
         },
         .child => |child| {
-            try ntip.runtime.service.runMaster(std.heap.smp_allocator, io, service_paths, child.readiness_fd);
+            try runMasterProcess(io, service_paths, child.readiness_fd);
             return .success;
         },
     }
 }
 
-fn createNode(
-    allocator: std.mem.Allocator,
+/// `runMaster` has already unwound its sockets, worker thread, TUN device,
+/// database, and lifetime lock before this function observes a managed-restart
+/// signal. Exiting with the dedicated status then lets systemd restart the
+/// fully stopped service without turning normal shutdown into a failure.
+fn runMasterProcess(
     io: std.Io,
-    state_dir: std.Io.Dir,
-    transaction: *ntip.state.repository.Transaction,
-    command: Command,
-    create: ntip.cli.server.NodeCreate,
-    lifetime_seconds: u64,
-    stdout: *std.Io.Writer,
+    paths: ntip.runtime.service.Paths,
+    readiness_fd: ?i32,
 ) !void {
-    _ = try ntip.cli.dispatch.applyServerMutation(&transaction.store, io, command);
-    const node = transaction.store.findNode(create.name).?;
-    var identity = try ensureServerIdentity(allocator, io, state_dir);
-    defer std.crypto.secureZero(u8, &identity.secret);
-    var enrollments = try (ntip.state.enrollments.File{ .dir = state_dir }).loadOrEmpty(allocator, io);
-    defer enrollments.deinit();
-    var credential = try issueCredential(io, &enrollments, create.name, node.id, identity.public, lifetime_seconds);
-    defer std.crypto.secureZero(u8, &credential.secret);
-
-    // An explicitly requested credential file must be delivered before the
-    // durable node and enrollment mutation is published. A failed write then
-    // leaves both state files unchanged and emits no credential on stdout. A
-    // later commit failure leaves either an unused credential or a recoverable
-    // transaction intent that is still paired with the delivered credential.
-    if (create.credential_out) |path| try writeCredentialFile(io, credential, path);
-    try ntip.state.server_transaction.commit(allocator, io, state_dir, &transaction.store, &enrollments);
-
-    var address_buffer: [15]u8 = undefined;
-    try stdout.print("Created node \"{s}\"\n\nVNR:      {s}\nAddress:  {s}\nState:    unenrolled\n", .{
-        create.name,
-        create.vnr,
-        try node.address.write(&address_buffer),
-    });
-    try reportCredential(credential, create.credential_out, stdout);
+    const status = try runtimeTerminationStatus(ntip.runtime.service.runMaster(
+        std.heap.smp_allocator,
+        io,
+        paths,
+        readiness_fd,
+    ));
+    if (status) |value| std.process.exit(value);
 }
 
-fn deleteNode(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    state_dir: std.Io.Dir,
-    transaction: *ntip.state.repository.Transaction,
-    command: Command,
-    name: []const u8,
-    stdout: *std.Io.Writer,
-) !void {
-    _ = try ntip.cli.dispatch.applyServerMutation(&transaction.store, io, command);
-    var enrollments = try (ntip.state.enrollments.File{ .dir = state_dir }).loadOrEmpty(allocator, io);
-    defer enrollments.deinit();
-    const before = enrollments.generation;
-    enrollments.revokeNode(name) catch |err| switch (err) {
-        error.EnrollmentNotFound => {},
-        else => return err,
+fn runtimeTerminationStatus(result: anyerror!void) anyerror!?u8 {
+    result catch |err| {
+        if (err == error.ManagedRestartRequested) {
+            return ntip.management.operations_service.restart_exit_status;
+        }
+        return err;
     };
-    _ = before;
-    try ntip.state.server_transaction.commit(allocator, io, state_dir, &transaction.store, &enrollments);
-    try stdout.print("Deleted node \"{s}\"\n", .{name});
-}
-
-fn renewEnrollment(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    state_dir: std.Io.Dir,
-    transaction: *ntip.state.repository.Transaction,
-    name: []const u8,
-    reset: bool,
-    lifetime_seconds: u64,
-    stdout: *std.Io.Writer,
-) !void {
-    const node = transaction.store.findNode(name) orelse return error.NodeNotFound;
-    if (!reset and node.enrollment_state == .enrolled) return error.NodeAlreadyEnrolled;
-    if (reset) try transaction.store.resetNodeEnrollment(name);
-    var identity = try ensureServerIdentity(allocator, io, state_dir);
-    defer std.crypto.secureZero(u8, &identity.secret);
-    var enrollments = try (ntip.state.enrollments.File{ .dir = state_dir }).loadOrEmpty(allocator, io);
-    defer enrollments.deinit();
-    var credential = try issueCredential(io, &enrollments, name, node.id, identity.public, lifetime_seconds);
-    defer std.crypto.secureZero(u8, &credential.secret);
-    if (reset) {
-        try ntip.state.server_transaction.commit(allocator, io, state_dir, &transaction.store, &enrollments);
-    } else {
-        try (ntip.state.enrollments.File{ .dir = state_dir }).save(allocator, io, &enrollments);
-    }
-    try stdout.print("Enrollment {s} for node \"{s}\"\n", .{ if (reset) "reset" else "renewed", name });
-    try emitCredential(io, credential, null, stdout);
-}
-
-fn ensureServerIdentity(allocator: std.mem.Allocator, io: std.Io, state_dir: std.Io.Dir) !ntip.protocol.noise.KeyPair {
-    const secrets = ntip.state.secret_store.FileSecretStore{ .dir = state_dir };
-    const loaded = secrets.load(allocator, io, "identity.key", .identity_key) catch |err| switch (err) {
-        error.FileNotFound => {
-            while (true) {
-                var secret: [32]u8 = undefined;
-                io.random(&secret);
-                const identity = ntip.protocol.noise.KeyPair.fromSecret(secret) catch continue;
-                try secrets.write(allocator, io, "identity.key", .identity_key, &secret);
-                std.crypto.secureZero(u8, &secret);
-                return identity;
-            }
-        },
-        else => return err,
-    };
-    defer {
-        std.crypto.secureZero(u8, loaded);
-        allocator.free(loaded);
-    }
-    if (loaded.len != 32) return error.InvalidSecretLength;
-    return ntip.protocol.noise.KeyPair.fromSecret(loaded[0..32].*);
-}
-
-fn issueCredential(
-    io: std.Io,
-    enrollments: *ntip.state.enrollments.Registry,
-    node: []const u8,
-    node_id: ntip.domain.model.NodeId,
-    master_public: [32]u8,
-    lifetime_seconds: u64,
-) !Credential {
-    const now = try ntip.cli.runner.unixSeconds(io);
-    const expires_at = std.math.add(u64, now, lifetime_seconds) catch return error.InvalidExpiry;
-    while (true) {
-        var credential = Credential{ .handle = undefined, .secret = undefined, .master_public = master_public };
-        io.random(&credential.handle);
-        io.random(&credential.secret);
-        var psk = credential.derivePsk();
-        defer std.crypto.secureZero(u8, &psk);
-        enrollments.issueWithHandle(node, node_id, credential.handle, psk, now, expires_at) catch |err| switch (err) {
-            error.EnrollmentHandleInUse => continue,
-            else => return err,
-        };
-        return credential;
-    }
-}
-
-fn emitCredential(io: std.Io, credential: Credential, output_path: ?[]const u8, stdout: *std.Io.Writer) !void {
-    if (output_path) |path| try writeCredentialFile(io, credential, path);
-    try reportCredential(credential, output_path, stdout);
-}
-
-fn writeCredentialFile(io: std.Io, credential: Credential, path: []const u8) !void {
-    var text_buffer: [ntip.protocol.credential.text_len]u8 = undefined;
-    const text = credential.encode(&text_buffer);
-    defer std.crypto.secureZero(u8, &text_buffer);
-    var with_newline: [ntip.protocol.credential.text_len + 1]u8 = undefined;
-    defer std.crypto.secureZero(u8, &with_newline);
-    @memcpy(with_newline[0..text.len], text);
-    with_newline[text.len] = '\n';
-    try ntip.cli.runner.writePrivatePath(io, path, &with_newline);
-}
-
-fn reportCredential(credential: Credential, output_path: ?[]const u8, stdout: *std.Io.Writer) !void {
-    if (output_path) |path| {
-        try stdout.print("\nEnrollment credential written to {s}\n", .{path});
-    } else {
-        var text_buffer: [ntip.protocol.credential.text_len]u8 = undefined;
-        const text = credential.encode(&text_buffer);
-        defer std.crypto.secureZero(u8, &text_buffer);
-        try stdout.print("\nEnrollment credential (single use):\n{s}\n", .{text});
-    }
+    return null;
 }
 
 fn isHelp(arg: []const u8) bool {
@@ -408,11 +369,17 @@ fn validateCommand(command: Command) !void {
             const prefix = try ntip.domain.ipv4.Cidr.parse(show.cidr);
             try prefix.validateRouted();
         },
+        .user_bootstrap => |bootstrap| {
+            _ = try ntip.management.auth.Username.parse(bootstrap.username);
+            if (!bootstrap.password_stdin) return error.InvalidArguments;
+        },
+        .backup => |backup| if (backup.output_dir.len == 0) return error.InvalidPath,
+        .restore => |restore| if (restore.input.len == 0) return error.InvalidPath,
         .up, .down, .status, .vnr_list, .node_list, .route_list, .version => {},
     }
 }
 
-test "offline VNR mutation is durable and JSON-readable" {
+test "offline VNR mutation is durable and SQLite-readable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const state_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/server", .{tmp.sub_path});
@@ -429,6 +396,48 @@ test "offline VNR mutation is durable and JSON-readable" {
     const list_args = [_][]const u8{ "--state-dir", state_path, "vnr", "list", "--json" };
     try std.testing.expectEqual(ExitCode.success, try run(std.testing.allocator, std.testing.io, &list_args, &json_out.writer, &err.writer));
     try std.testing.expect(std.mem.indexOf(u8, json_out.written(), "\"name\":\"vnr0\"") != null);
+}
+
+test "offline Master rejects legacy JSON without modifying it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/server",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(state_path);
+    var state_dir = try ntip.cli.runner.openPrivateDirectory(std.testing.io, state_path);
+    defer state_dir.close(std.testing.io);
+    const legacy_bytes = "{\"schema_version\":1,\"generation\":0,\"vnrs\":[],\"nodes\":[],\"routes\":[]}";
+    var legacy = try state_dir.createFile(std.testing.io, "state.json", .{
+        .permissions = .fromMode(0o600),
+    });
+    try legacy.writeStreamingAll(std.testing.io, legacy_bytes);
+    legacy.close(std.testing.io);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    const args = [_][]const u8{ "--state-dir", state_path, "status", "--json" };
+    try std.testing.expectEqual(
+        ExitCode.usage_or_config,
+        try run(std.testing.allocator, std.testing.io, &args, &out.writer, &err.writer),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "LegacyMasterStateUnsupported") != null);
+    const after = try state_dir.readFileAlloc(
+        std.testing.io,
+        "state.json",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(legacy_bytes, after);
+    try std.testing.expectError(
+        error.FileNotFound,
+        state_dir.statFile(std.testing.io, "ntip.sqlite3", .{ .follow_symlinks = false }),
+    );
 }
 
 test "offline credential output failure leaves node and enrollment state unchanged" {
@@ -481,15 +490,23 @@ test "offline credential output failure leaves node and enrollment state unchang
 
     var state_dir = try ntip.cli.runner.openPrivateDirectory(std.testing.io, state_path);
     defer state_dir.close(std.testing.io);
-    var store = try (ntip.state.repository.Repository{ .dir = state_dir }).load(std.testing.allocator, std.testing.io);
+    var sqlite_owner = try ntip.state.sqlite_repository.Repository.open(
+        std.testing.allocator,
+        std.testing.io,
+        state_dir,
+    );
+    defer sqlite_owner.deinit();
+    const repository = ntip.state.management_repository.Repository.init(&sqlite_owner.db);
+    var store = try repository.loadInventory(std.testing.allocator);
     defer store.deinit();
-    var enrollments = try (ntip.state.enrollments.File{ .dir = state_dir }).loadOrEmpty(std.testing.allocator, std.testing.io);
-    defer enrollments.deinit();
     try std.testing.expectEqual(@as(u64, 1), store.generation);
     try std.testing.expect(store.findVnr("vnr0") != null);
     try std.testing.expect(store.findNode("node01") == null);
-    try std.testing.expectEqual(@as(u64, 0), enrollments.generation);
-    try std.testing.expectEqual(@as(usize, 0), enrollments.records.items.len);
+    var enrollment_count = try sqlite_owner.db.prepare("SELECT count(*) FROM enrollment_credentials;");
+    defer enrollment_count.deinit();
+    try std.testing.expectEqual(ntip.state.sqlite.Step.row, try enrollment_count.step());
+    try std.testing.expectEqual(@as(i64, 0), enrollment_count.columnInt64(0));
+    try std.testing.expectEqual(ntip.state.sqlite.Step.done, try enrollment_count.step());
 }
 
 test "offline credential output success is private and matches durable enrollment" {
@@ -552,23 +569,34 @@ test "offline credential output success is private and matches durable enrollmen
     }
     try std.testing.expectEqual(@as(usize, ntip.protocol.credential.text_len + 1), credential_bytes.len);
     try std.testing.expectEqual(@as(u8, '\n'), credential_bytes[credential_bytes.len - 1]);
-    var credential = try Credential.decode(credential_bytes[0..ntip.protocol.credential.text_len]);
+    var credential = try ntip.protocol.credential.Credential.decode(
+        credential_bytes[0..ntip.protocol.credential.text_len],
+    );
     defer credential.deinit();
     var derived_psk = credential.derivePsk();
     defer std.crypto.secureZero(u8, &derived_psk);
 
     var state_dir = try ntip.cli.runner.openPrivateDirectory(std.testing.io, state_path);
     defer state_dir.close(std.testing.io);
-    var store = try (ntip.state.repository.Repository{ .dir = state_dir }).load(std.testing.allocator, std.testing.io);
+    var sqlite_owner = try ntip.state.sqlite_repository.Repository.open(
+        std.testing.allocator,
+        std.testing.io,
+        state_dir,
+    );
+    defer sqlite_owner.deinit();
+    const repository = ntip.state.management_repository.Repository.init(&sqlite_owner.db);
+    var store = try repository.loadInventory(std.testing.allocator);
     defer store.deinit();
-    var enrollments = try (ntip.state.enrollments.File{ .dir = state_dir }).loadOrEmpty(std.testing.allocator, std.testing.io);
-    defer enrollments.deinit();
     const node = store.findNode("node01") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 1), enrollments.records.items.len);
-    const record = enrollments.records.items[0];
-    try std.testing.expect(record.node_id.eql(node.id));
-    try std.testing.expectEqualSlices(u8, &credential.handle, &record.handle);
-    try std.testing.expectEqualSlices(u8, &derived_psk, &record.derived_psk);
+    var enrollment = try sqlite_owner.db.prepare(
+        "SELECT node_id, handle, derived_psk FROM enrollment_credentials WHERE status = 'unused';",
+    );
+    defer enrollment.deinit();
+    try std.testing.expectEqual(ntip.state.sqlite.Step.row, try enrollment.step());
+    try std.testing.expectEqualSlices(u8, &node.id.bytes, enrollment.columnBlob(0).?);
+    try std.testing.expectEqualSlices(u8, &credential.handle, enrollment.columnBlob(1).?);
+    try std.testing.expectEqualSlices(u8, &derived_psk, enrollment.columnBlob(2).?);
+    try std.testing.expectEqual(ntip.state.sqlite.Step.done, try enrollment.step());
 }
 
 test "down without a daemon fails explicitly with exit code four" {
@@ -676,5 +704,18 @@ test "stale IPC fallback cannot bypass a live daemon lifetime lock" {
     try std.testing.expectEqual(
         ntip.cli.runner.SocketState.socket,
         try ntip.cli.runner.socketState(std.testing.io, socket_path),
+    );
+}
+
+test "managed restart signal maps to the dedicated systemd exit status" {
+    const success: anyerror!void = {};
+    try std.testing.expectEqual(@as(?u8, null), try runtimeTerminationStatus(success));
+    try std.testing.expectEqual(
+        @as(?u8, ntip.management.operations_service.restart_exit_status),
+        try runtimeTerminationStatus(error.ManagedRestartRequested),
+    );
+    try std.testing.expectError(
+        error.DataWorkerFailed,
+        runtimeTerminationStatus(error.DataWorkerFailed),
     );
 }

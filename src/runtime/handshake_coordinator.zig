@@ -63,7 +63,7 @@ pub const NodeRecord = struct {
 pub const MasterRegistry = struct {
     context: *anyopaque,
     lookup_enrollment_fn: *const fn (*anyopaque, [16]u8) anyerror!EnrollmentRecord,
-    consume_and_bind_fn: *const fn (*anyopaque, [16]u8, [16]u8, [32]u8) anyerror!void,
+    consume_and_bind_fn: *const fn (*anyopaque, [16]u8, [16]u8, [32]u8, [32]u8) anyerror!void,
     lookup_node_fn: *const fn (*anyopaque, [16]u8) anyerror!NodeRecord,
 
     pub fn lookupEnrollment(self: MasterRegistry, handle: [16]u8) !EnrollmentRecord {
@@ -74,9 +74,10 @@ pub const MasterRegistry = struct {
         self: MasterRegistry,
         handle: [16]u8,
         node_uuid: [16]u8,
+        verified_psk: [32]u8,
         public_key: [32]u8,
     ) !void {
-        return self.consume_and_bind_fn(self.context, handle, node_uuid, public_key);
+        return self.consume_and_bind_fn(self.context, handle, node_uuid, verified_psk, public_key);
     }
 
     pub fn lookupNode(self: MasterRegistry, node_uuid: [16]u8) !NodeRecord {
@@ -1094,7 +1095,8 @@ pub const MasterCoordinator = struct {
         const completion = try handshake_protocol.EnrollmentMessage2.decode(finish.payload);
         if (!std.mem.eql(u8, &completion.node_uuid, &slot.node_uuid)) return error.RegistryIdentityMismatch;
         const node_public = try slot.xk.?.remoteStatic();
-        try self.registry.consumeAndBind(slot.identity_context, slot.node_uuid, node_public);
+        const verified_psk = if (slot.enrollment) |record| record.psk else return error.InvalidEnrollmentRecord;
+        try self.registry.consumeAndBind(slot.identity_context, slot.node_uuid, verified_psk, node_public);
         slot.xk = null;
         self.installResponderSession(slot, finish.keys, now_ns) catch |err| {
             if (err == error.CommandQueueFull) self.counters.queue_drops +|= 1;
@@ -1448,12 +1450,16 @@ const TestRegistry = struct {
         context: *anyopaque,
         handle: [16]u8,
         node_uuid: [16]u8,
+        verified_psk: [32]u8,
         public_key: [32]u8,
     ) anyerror!void {
         const self: *TestRegistry = @ptrCast(@alignCast(context));
         if (self.consumed) return error.EnrollmentConsumed;
         if (!std.mem.eql(u8, &handle, &self.handle) or !std.mem.eql(u8, &node_uuid, &self.enrollment.node_uuid)) {
             return error.RegistryIdentityMismatch;
+        }
+        if (!std.crypto.timing_safe.eql([32]u8, verified_psk, self.enrollment.psk)) {
+            return error.InvalidEnrollmentCredential;
         }
         self.public_key = public_key;
         self.consumed = true;
