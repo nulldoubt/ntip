@@ -11,10 +11,11 @@ security policy, or milestone status.
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
 - Current milestone: segmented inventory inputs and actionable management
-  errors are implemented and pass the complete local pre-deployment gate.
-  Settled-tree backend, contract, dashboard, browser, production-runtime,
-  archive, SBOM, and secret-exposure proofs pass; live deployment and native
-  x86_64 service evidence remain pending.
+  errors are implemented, pass the complete local release gate, and are live
+  on the native x86_64 vps02 Master. Settled-tree backend, contract, dashboard,
+  browser, production-runtime, archive, SBOM, secret-exposure, online-backup,
+  same-origin HTTPS, service, inventory-preservation, and native-execution
+  proofs pass.
 - SQLite schema version: `1`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -26,9 +27,12 @@ security policy, or milestone status.
   Next.js 16.2.10 standalone service. The current segmented-input/actionable-
   error tree passes typecheck, lint, 37/37 unit tests, the 12-route production
   build, exact-Bun runtime smoke, and 19/19 Playwright journeys.
-- Last verified commit: `a718a835107438da545c56787689ca5c4e8530f6`
-  (v0.2 implementation)
-- Last verified implementation: commit `a718a835107438da545c56787689ca5c4e8530f6`;
+- Last verified commit: `d5ae54d2b89f5157472510e0dfc3c4337d5fb639`
+  (segmented network inputs and actionable inventory errors)
+- Last verified implementation: commit `d5ae54d2b89f5157472510e0dfc3c4337d5fb639`;
+  selection-only segmented VNR/Node/route inputs, allocation-aware Node
+  completion, actionable bounded inventory violations, private service IPC v2,
+  OpenAPI 1.0.1, shared browser error handling, and the prior
   live/offline SQLite Master cutover, DB-free
   `ntip-api`, embedded contract, authenticated auth/inventory/security and
   operations dispatch, both live admin sockets, encrypted-path connectivity
@@ -39,7 +43,7 @@ security policy, or milestone status.
   staged service control, transition-only runtime events, revision
   acknowledgement, contract-aligned percent-decoded management queries,
   Direction A dashboard pages, and three separately installable deployment
-  packaging paths, 2026-07-20
+  packaging paths; deployed and verified on vps02, 2026-07-21
 - Migration 0001 SHA-256:
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
 - Proof commands: `zig build check --summary all` (429/429 aggregate tests)
@@ -55,7 +59,7 @@ security policy, or milestone status.
   14/14 Playwright, different-root dashboard reproducibility,
   archive/installer and packaging checks, privileged AArch64 systemd/runtime
   and namespace checks, and exact-v0.1 compatibility execution. Native x86_64
-  hardware execution remains open.
+  core/API/dashboard installation and service execution pass on vps02.
 
 ## Current State
 
@@ -622,16 +626,37 @@ state, database handle, or Unix socket access.
   numeric identity. Both scenarios passed in the privileged,
   architecture-matched AArch64 Linux container; native x86_64 remains CI-only.
 
-### Deployment-pending
+### Live verification
 
-- Take an online SQLite backup, then deploy `ntsrv` and `ntip-api` together
-  because private IPC v1 and v2 are
-  intentionally incompatible. Exercise VNR, Node, route, collision,
-  unavailable, and exhausted flows through the real same-origin UI before
-  recording live verification.
-- Complete native x86_64 hardware execution during that deployment. No current
-  statement in this brief claims that the segmented-input/actionable-error tree
-  is deployed or release-final.
+- vps02 was backed up online before service shutdown. The integrity-checked,
+  root-owned recovery copy is
+  `/var/backups/ntip/ntip-backup-1784666973-8a181b2e63c2e33e.sqlite3`, SHA-256
+  `b074851c0490f05902d4d9344ef484bf6f0bedae639ff952126b4826d9a87398`.
+- Native x86_64 `ntsrv`, `ntip-api`, and dashboard artifacts were installed as
+  one matched `0.2.0-dev` set. `ntsrv`, `ntip-api`, `ntip-dashboard`, and nginx
+  are active; the Zig binaries match the validated archive payloads and remain
+  statically linked. The pre-existing non-fatal `SysctlProbeFailed` warning is
+  unchanged from earlier vps02 deployments.
+- `/api/v1/health/ready`, OpenAPI 1.0.1, login, same-origin raw-IP HTTPS, and
+  the real Add Node dialog pass. After installing the exported certificate and
+  restarting Codex, the operator also confirmed login through the built-in
+  browser. For `primary`, the dialog renders fixed
+  `10.10.1` octets, selects `10.10.1.4`, and excludes allocated `.2`/`.3` plus
+  the broadcast address. Direct non-mutating probes return
+  `address_reserved_master`, `address_outside_vnr`, and `address_in_use`; the
+  duplicate is HTTP 409 `conflict`, and every response carries its request ID.
+- Deployment and the non-mutating verification probes preserved generation 3
+  with VNR `primary` (`10.10.1.0/24`, Master `10.10.1.1`) and Nodes `vps01`
+  (`10.10.1.2`) plus `ubuntu110` (`10.10.1.3`). Subsequent operator browser
+  activity added `test01` at `10.10.1.4`; the final observed state is
+  generation 4 with those three Nodes, and it is intentionally preserved. UDP
+  49152 remains bound on IPv4/IPv6 and UFW retains public 49152/udp plus
+  443/tcp rules. No Node binary, service, configuration, state, or
+  wire-protocol source was changed.
+- The public certificate exported to `/Users/alkhatib/Desktop/ntip-vps02.crt`
+  has SANs `43.157.23.67` and `10.9.16.169`, expires 2026-08-20, and has
+  SHA-256 fingerprint
+  `6F:6F:EF:3E:CB:7B:A6:B6:EE:EF:56:F5:BA:F7:56:36:CD:67:23:0E:05:34:56:39:B7:AA:AC:D8:80:F6:DC:5E`.
 
 ### Deferred or out of scope
 
@@ -656,7 +681,7 @@ state, database handle, or Unix socket access.
   backend/dashboard verification
 - [x] Settled-tree contract, production dashboard, browser, and release-archive
   proof for the segmented-input/actionable-error milestone
-- [ ] Live deployment, native x86_64 service, and same-origin verification
+- [x] Live deployment, native x86_64 service, and same-origin verification
 - [x] Packaging, systemd, CI, documentation, and release evidence
 
 ## Verification Commands
@@ -718,9 +743,15 @@ Latest evidence:
   exact-Bun runtime smoke, and 19/19 Playwright journeys pass on the same tree.
   The core and API x86_64 static-musl archives and dashboard x86_64 glibc
   archive pass contract/SBOM checks; source and all 3,333 archive members pass
-  the secret-exposure scan. Live deployment and native x86_64 service proof
-  remain pending. These working-tree results do not advance the Last verified
-  commit field or claim release-final verification.
+  the secret-exposure scan.
+- Commit `d5ae54d2b89f5157472510e0dfc3c4337d5fb639` was deployed as a matched
+  service set on native x86_64 vps02 after the online backup recorded above.
+  All management services, the loopback API/dashboard listeners, raw-IP nginx
+  HTTPS path, OpenAPI 1.0.1, native/static binaries, actionable failures,
+  lowest-free `.4` UI selection, deployment-time generation/inventory
+  preservation, UDP listener, and UFW rules passed live verification. The
+  later operator-created `test01` transition to generation 4 is recorded in
+  the live-verification section above.
 
 The remaining evidence in this section records the previously verified
 implementation unless a bullet explicitly identifies the current working-tree
@@ -816,7 +847,8 @@ private IPC v2.
   AMD64-emulated Ubuntu runs executed the pinned Bun 1.3.14 runtime, started the
   strict packaged launcher, rejected the exact forged preview cookie, served
   `/login`, and passed staged install, repeated upgrade, and uninstall
-  isolation. Native x86_64 hardware proof remains pending.
+  isolation. The live vps02 deployment now supplies native x86_64 hardware
+  execution for the current dashboard artifact.
 - Dashboard reproducibility copied the current source into two different
   absolute roots, performed separate frozen installs and cache-free Next
   production builds, and produced byte-identical `x86_64-linux` and
@@ -850,8 +882,8 @@ private IPC v2.
   install/upgrade/uninstall checks, including documented-but-not-enabled backup
   examples and absence of API state access. Native AArch64 executed all three
   static binaries; Docker Desktop's x86_64 Rosetta path rejected the static
-  binary with `bss_size overflow`, so native x86_64 execution remains CI-only
-  evidence and is not counted as passed here.
+  binary with `bss_size overflow`; that development-host limitation is now
+  superseded by matching native x86_64 core/API execution on live vps02.
 - Repackaging the same current core/API binaries twice produced byte-identical
   archives, external SPDX documents, and checksum sidecars for both targets.
   This package-construction result is complemented by the clean compiler proof
@@ -884,9 +916,9 @@ private IPC v2.
   intent recovery limitation remains deferred. A separate read-only review of
   the pending-capacity fix found no actionable P0/P1/P2.
 
-Native x86_64 hardware execution remains release work. macOS cannot provide
-that matching-host proof; the architecture-matched AArch64 container and
-AMD64-emulated checks recorded above are strong preflight evidence, not a
-substitute for the native x86_64 CI job.
+Native x86_64 installation and execution now pass on vps02 for the current
+core, API, and dashboard artifacts. The AArch64 container, namespace, and
+exact-v0.1 compatibility scenarios remain separate architecture/protocol
+evidence and are not replaced by the live deployment.
 A milestone is not complete until its commands have been run against the
 current working tree and the result is recorded here.
