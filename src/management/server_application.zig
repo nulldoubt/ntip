@@ -13,11 +13,12 @@ const cli_dispatch = @import("../cli/dispatch.zig");
 const cli_view = @import("../cli/view.zig");
 const cli_runner = @import("../cli/runner.zig");
 const model = @import("../domain/model.zig");
-const credential_mod = @import("../protocol/credential.zig");
 const socket = @import("../platform/linux/ipc_socket.zig");
 const management_repository = @import("../state/management_repository.zig");
 const operations_repository = @import("../state/operations_repository.zig");
 const sqlite = @import("../state/sqlite.zig");
+const api_response = @import("api_response.zig");
+const bootstrap_service = @import("bootstrap_service.zig");
 const sqlite_maintenance = @import("../state/sqlite_maintenance.zig");
 const settings_mod = @import("settings.zig");
 
@@ -54,6 +55,7 @@ pub const Application = struct {
     repository: management_repository.Repository,
     store: *model.Store,
     master_public: [32]u8,
+    bootstrap: ?*bootstrap_service.Service = null,
     settings: settings_mod.OperationalSettings,
     version: []const u8,
     service_state: []const u8 = "running",
@@ -92,6 +94,10 @@ pub const Application = struct {
 
     pub fn handler(self: *Application) ipc_server.Handler {
         return .{ .context = self, .handle_fn = handleOpaque };
+    }
+
+    pub fn setBootstrapService(self: *Application, bootstrap: *bootstrap_service.Service) void {
+        self.bootstrap = bootstrap;
     }
 
     fn handleOpaque(
@@ -174,8 +180,8 @@ pub const Application = struct {
             },
             .node_create => |create| try self.createNode(command, create, stdout),
             .node_delete => |name| try self.deleteNode(command, name, stdout),
-            .node_enrollment_renew => |name| try self.replaceEnrollment(name, false, stdout),
-            .node_enrollment_reset => |name| try self.replaceEnrollment(name, true, stdout),
+            .node_enrollment_renew => |request| try self.replaceEnrollment(request, false, stdout),
+            .node_enrollment_reset => |request| try self.replaceEnrollment(request, true, stdout),
             .backup => |request| try self.backup(request.output_dir, stdout),
             // Bootstrap and restore require stopped-service checks which only
             // the outer `ntsrv` process can prove while holding `state.lock`.
@@ -265,31 +271,56 @@ pub const Application = struct {
             try self.repository.nodeAdmissionCapacity(),
         );
         if (self.store.nodes.items.len >= admission_capacity) return error.MaximumNodesExceeded;
+
+        if (create.no_bootstrap) {
+            var candidate = try cloneStore(self.allocator, self.store);
+            defer candidate.deinit();
+            const expected_generation = self.store.generation;
+            _ = try cli_dispatch.applyServerMutation(&candidate, self.io, command);
+            const now = try unixTimestamp(self.io);
+            _ = try self.repository.persistInventory(
+                &candidate,
+                expected_generation,
+                now,
+                self.auditFor(command, now),
+            );
+            self.installStore(&candidate);
+            try self.reportCreatedNode(create, stdout);
+            try stdout.writeAll("Setup invitation: not issued (--no-bootstrap)\n");
+            return;
+        }
+
+        const output_path = create.bootstrap_out orelse return error.MissingRequiredOption;
+        var output = try cli_runner.reservePrivatePath(self.io, output_path, bootstrap_output_max_bytes);
+        defer output.deinit();
+        const bootstrap = self.bootstrap orelse return error.OperationUnavailable;
         var candidate = try cloneStore(self.allocator, self.store);
         defer candidate.deinit();
         const expected_generation = self.store.generation;
         const outcome = try cli_dispatch.applyServerMutation(&candidate, self.io, command);
         const node_id = outcome.node_created;
         const now = try unixTimestamp(self.io);
-        var issued = try self.issueCredential(
-            node_id,
-            now,
-            create.expires_seconds orelse self.settings.default_enrollment_lifetime_seconds,
-        );
-        defer issued.deinit();
-
-        // A specifically requested private file is delivered first. Failure
-        // therefore leaves both SQLite and the live projection untouched.
-        if (create.credential_out) |path| try writeCredentialFile(&issued.credential, path, self.io);
-        _ = try self.repository.persistInventoryWithEnrollment(
+        var resource_id_buffer: [32]u8 = undefined;
+        var issued = try bootstrap.createWithInventory(
             &candidate,
-            issued.pending,
-            expected_generation,
+            node_id,
+            create.expires_seconds orelse self.settings.default_enrollment_lifetime_seconds,
             now,
-            self.auditFor(command, now),
+            expected_generation,
+            self.bootstrapAudit(node_id.write(&resource_id_buffer), "enrollment.bootstrap.issue", now),
         );
+        defer issued.clear();
         self.installStore(&candidate);
+        try writeBootstrapOutput(&output, &issued);
+        try self.reportCreatedNode(create, stdout);
+        try stdout.print("Setup invitation written to {s}\n", .{output_path});
+    }
 
+    fn reportCreatedNode(
+        self: *Application,
+        create: cli_server.NodeCreate,
+        stdout: *std.Io.Writer,
+    ) !void {
         const node = self.store.findNode(create.name).?;
         var address_buffer: [15]u8 = undefined;
         try stdout.print("Created node \"{s}\"\n\nVNR:      {s}\nAddress:  {s}\nState:    unenrolled\n", .{
@@ -297,7 +328,6 @@ pub const Application = struct {
             create.vnr,
             try node.address.write(&address_buffer),
         });
-        try reportCredential(&issued.credential, create.credential_out, stdout);
     }
 
     fn deleteNode(
@@ -327,10 +357,18 @@ pub const Application = struct {
 
     fn replaceEnrollment(
         self: *Application,
-        name: []const u8,
+        request: cli_server.EnrollmentBootstrap,
         reset: bool,
         stdout: *std.Io.Writer,
     ) !void {
+        var output = try cli_runner.reservePrivatePath(
+            self.io,
+            request.bootstrap_out,
+            bootstrap_output_max_bytes,
+        );
+        defer output.deinit();
+        const bootstrap = self.bootstrap orelse return error.OperationUnavailable;
+        const name = request.name;
         const node = self.store.findNode(name) orelse return error.NodeNotFound;
         if (!reset and node.enrollment_state == .enrolled) return error.NodeAlreadyEnrolled;
         const node_id = node.id;
@@ -350,86 +388,27 @@ pub const Application = struct {
         }
 
         const now = try unixTimestamp(self.io);
-        var issued = try self.issueCredential(
+        var resource_id_buffer: [32]u8 = undefined;
+        var issued = try bootstrap.issueForNode(
             node_id,
-            now,
             self.settings.default_enrollment_lifetime_seconds,
-        );
-        defer issued.deinit();
-        const command: cli_server.Command = if (reset)
-            .{ .node_enrollment_reset = name }
-        else
-            .{ .node_enrollment_renew = name };
-        _ = try self.repository.replaceEnrollment(
-            node_id,
-            issued.credential.handle,
-            issued.pending.derived_psk,
-            reset,
             now,
-            issued.pending.expires_at,
             expected_generation,
-            self.auditFor(command, now),
+            reset,
+            self.bootstrapAudit(
+                node_id.write(&resource_id_buffer),
+                if (reset) "enrollment.bootstrap.reset" else "enrollment.bootstrap.replace",
+                now,
+            ),
         );
+        defer issued.clear();
         self.installStore(&candidate);
         if (reset and was_enrolled) {
             if (self.association_callback) |callback| callback.retire(node_id.bytes);
         }
+        try writeBootstrapOutput(&output, &issued);
         try stdout.print("Enrollment {s} for node \"{s}\"\n", .{ if (reset) "reset" else "renewed", name });
-        try reportCredential(&issued.credential, null, stdout);
-    }
-
-    fn issueCredential(
-        self: *Application,
-        node_id: model.NodeId,
-        created_at: i64,
-        lifetime_seconds: u64,
-    ) !IssuedCredential {
-        if (lifetime_seconds == 0) return error.InvalidExpiry;
-        const lifetime: i64 = std.math.cast(i64, lifetime_seconds) orelse return error.InvalidExpiry;
-        const expires_at = std.math.add(i64, created_at, lifetime) catch return error.InvalidExpiry;
-        while (true) {
-            var issued = IssuedCredential{
-                .credential = .{
-                    .handle = undefined,
-                    .secret = undefined,
-                    .master_public = self.master_public,
-                },
-                .pending = .{
-                    .node_id = node_id,
-                    .handle = undefined,
-                    .derived_psk = undefined,
-                    .expires_at = expires_at,
-                },
-            };
-            self.io.random(&issued.credential.handle);
-            self.io.random(&issued.credential.secret);
-            if (allZero(&issued.credential.handle) or allZero(&issued.credential.secret)) {
-                issued.deinit();
-                continue;
-            }
-            if (try self.enrollmentHandleExists(issued.credential.handle)) {
-                issued.deinit();
-                continue;
-            }
-            issued.pending.handle = issued.credential.handle;
-            issued.pending.derived_psk = issued.credential.derivePsk();
-            return issued;
-        }
-    }
-
-    fn enrollmentHandleExists(self: *Application, enrollment_handle: [16]u8) !bool {
-        var statement = try self.repository.db.prepare(
-            "SELECT 1 FROM enrollment_credentials WHERE handle = ?1;",
-        );
-        defer statement.deinit();
-        try statement.bindBlob(1, &enrollment_handle);
-        return switch (try statement.step()) {
-            .done => false,
-            .row => blk: {
-                if (try statement.step() != .done) return error.CorruptEnrollmentCredential;
-                break :blk true;
-            },
-        };
+        try stdout.print("Setup invitation written to {s}\n", .{request.bootstrap_out});
     }
 
     fn auditFor(self: *Application, command: cli_server.Command, now: i64) management_repository.AuditEntry {
@@ -447,24 +426,28 @@ pub const Application = struct {
         };
     }
 
+    fn bootstrapAudit(
+        self: *Application,
+        resource_id: []const u8,
+        action: []const u8,
+        now: i64,
+    ) management_repository.AuditEntry {
+        return .{
+            .id = randomUuid(self.io),
+            .occurred_at = now,
+            .actor_kind = .local_cli,
+            .action = action,
+            .resource_type = "node",
+            .resource_id = resource_id,
+            .details_json = "{}",
+        };
+    }
+
     fn installStore(self: *Application, candidate: *model.Store) void {
         const previous = self.store.*;
         self.store.* = candidate.*;
         candidate.* = previous;
         if (self.generation_callback) |callback| callback.changed(self.store.generation);
-    }
-};
-
-const IssuedCredential = struct {
-    credential: credential_mod.Credential,
-    pending: management_repository.PendingEnrollment,
-
-    fn deinit(self: *IssuedCredential) void {
-        self.credential.deinit();
-        std.crypto.secureZero(u8, &self.pending.handle);
-        std.crypto.secureZero(u8, &self.pending.derived_psk);
-        self.pending.node_id = .{ .bytes = [_]u8{0} ** 16 };
-        self.pending.expires_at = 0;
     }
 };
 
@@ -480,8 +463,8 @@ fn mutationMetadata(command: cli_server.Command) MutationMetadata {
         .vnr_delete => |name| .{ .action = "vnr.delete", .resource_type = "vnr", .resource_id = name },
         .node_create => |value| .{ .action = "node.create", .resource_type = "node", .resource_id = value.name },
         .node_delete => |name| .{ .action = "node.delete", .resource_type = "node", .resource_id = name },
-        .node_enrollment_renew => |name| .{ .action = "node.enrollment.renew", .resource_type = "node", .resource_id = name },
-        .node_enrollment_reset => |name| .{ .action = "node.enrollment.reset", .resource_type = "node", .resource_id = name },
+        .node_enrollment_renew => |request| .{ .action = "node.enrollment.renew", .resource_type = "node", .resource_id = request.name },
+        .node_enrollment_reset => |request| .{ .action = "node.enrollment.reset", .resource_type = "node", .resource_id = request.name },
         .route_add => |value| .{ .action = "route.create", .resource_type = "route", .resource_id = value.cidr },
         .route_delete => |prefix| .{ .action = "route.delete", .resource_type = "route", .resource_id = prefix },
         else => unreachable,
@@ -526,33 +509,28 @@ fn allZero(bytes: []const u8) bool {
     return combined == 0;
 }
 
-fn writeCredentialFile(
-    credential: *const credential_mod.Credential,
-    output_path: []const u8,
-    io: std.Io,
-) !void {
-    var text_buffer: [credential_mod.text_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &text_buffer);
-    const text = credential.encode(&text_buffer);
-    var with_newline: [credential_mod.text_len + 1]u8 = undefined;
-    defer std.crypto.secureZero(u8, &with_newline);
-    @memcpy(with_newline[0..text.len], text);
-    with_newline[text.len] = '\n';
-    try cli_runner.writePrivatePath(io, output_path, &with_newline);
-}
+const bootstrap_output_max_bytes: usize = 256;
 
-fn reportCredential(
-    credential: *const credential_mod.Credential,
-    output_path: ?[]const u8,
-    stdout: *std.Io.Writer,
+fn writeBootstrapOutput(
+    output: *cli_runner.PrivatePathReservation,
+    issued: *const bootstrap_service.IssuedBootstrap,
 ) !void {
-    if (output_path) |path| {
-        try stdout.print("Enrollment credential written to {s}\n", .{path});
-        return;
-    }
-    var text_buffer: [credential_mod.text_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &text_buffer);
-    try stdout.print("Enrollment credential (single use):\n{s}\n", .{credential.encode(&text_buffer)});
+    var bytes: [bootstrap_output_max_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &bytes);
+    var writer = std.Io.Writer.fixed(&bytes);
+    var json: std.json.Stringify = .{ .writer = &writer, .options = .{} };
+    var expires: [api_response.timestamp_text_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &expires);
+    try json.beginObject();
+    try json.objectField("bootstrapId");
+    try json.write(issued.bootstrap_id[0..]);
+    try json.objectField("secretCode");
+    try json.write(issued.secret_code[0..]);
+    try json.objectField("expiresAt");
+    try json.write(try api_response.formatTimestamp(issued.expires_at, &expires));
+    try json.endObject();
+    try writer.writeByte('\n');
+    try output.commit(writer.buffered());
 }
 
 fn requestArgv(allocator: std.mem.Allocator, arguments: std.json.Value) ![]const []const u8 {
@@ -688,7 +666,7 @@ test "SQLite application persists before publishing generation" {
     try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, "SELECT count(*) FROM audit_entries WHERE actor_kind = 'local_cli';"));
 }
 
-test "credential output failure leaves SQLite and live Store unchanged" {
+test "bootstrap output preflight failure leaves SQLite and live Store unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -700,6 +678,10 @@ test "credential output failure leaves SQLite and live Store unchanged" {
     defer store.deinit();
     try persistTestVnr(repository, &store);
     var app = try Application.init(std.testing.allocator, std.testing.io, repository, &store, [_]u8{3} ** 32, .{}, "test");
+    const identity_secret = [_]u8{0x51} ** 32;
+    var bootstrap = try bootstrap_service.Service.init(&app.repository, std.testing.io, &identity_secret, app.master_public);
+    defer bootstrap.deinit();
+    app.setBootstrapService(&bootstrap);
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -713,7 +695,7 @@ test "credential output failure leaves SQLite and live Store unchanged" {
         .name = "node01",
         .vnr = "vnr0",
         .address = "10.1.0.2",
-        .credential_out = missing,
+        .bootstrap_out = missing,
     } }, &output.writer, &errors.writer));
 
     try std.testing.expectEqual(@as(u64, 1), store.generation);
@@ -724,7 +706,7 @@ test "credential output failure leaves SQLite and live Store unchanged" {
     try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, "SELECT count(*) FROM audit_entries;"));
 }
 
-test "Node and one-time credential commit atomically" {
+test "Node and short bootstrap disclosure commit without exposing the credential" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -736,11 +718,15 @@ test "Node and one-time credential commit atomically" {
     defer store.deinit();
     try persistTestVnr(repository, &store);
     var app = try Application.init(std.testing.allocator, std.testing.io, repository, &store, [_]u8{3} ** 32, .{}, "test");
+    const identity_secret = [_]u8{0x52} ** 32;
+    var bootstrap = try bootstrap_service.Service.init(&app.repository, std.testing.io, &identity_secret, app.master_public);
+    defer bootstrap.deinit();
+    app.setBootstrapService(&bootstrap);
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
-    const credential_path = try std.fs.path.join(std.testing.allocator, &.{ root, "node01.enroll" });
-    defer std.testing.allocator.free(credential_path);
+    const bootstrap_path = try std.fs.path.join(std.testing.allocator, &.{ root, "node01-bootstrap.json" });
+    defer std.testing.allocator.free(bootstrap_path);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -749,17 +735,49 @@ test "Node and one-time credential commit atomically" {
         .name = "node01",
         .vnr = "vnr0",
         .address = "10.1.0.2",
-        .credential_out = credential_path,
+        .bootstrap_out = bootstrap_path,
     } }, &output.writer, &errors.writer);
 
     try std.testing.expectEqual(@as(u64, 2), store.generation);
     try std.testing.expect(store.findNode("node01") != null);
     try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, "SELECT count(*) FROM nodes WHERE name = 'node01';"));
     try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, "SELECT count(*) FROM enrollment_credentials WHERE status = 'unused' AND derived_psk IS NOT NULL;"));
-    try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, "SELECT count(*) FROM audit_entries WHERE action = 'node.create' AND details_json = '{}';"));
-    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, credential_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, "SELECT count(*) FROM audit_entries WHERE action = 'enrollment.bootstrap.issue' AND details_json = '{}';"));
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, bootstrap_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
     try std.testing.expectEqual(@as(u32, 0), stat.permissions.toMode() & 0o077);
+
+    const disclosure = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        bootstrap_path,
+        std.testing.allocator,
+        .limited(bootstrap_output_max_bytes),
+    );
+    defer {
+        std.crypto.secureZero(u8, disclosure);
+        std.testing.allocator.free(disclosure);
+    }
+    const Disclosure = struct {
+        bootstrapId: []const u8,
+        secretCode: []const u8,
+        expiresAt: []const u8,
+    };
+    const parsed = try std.json.parseFromSlice(Disclosure, std.testing.allocator, disclosure, .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, bootstrap_service.locator_len), parsed.value.bootstrapId.len);
+    try std.testing.expectEqual(@as(usize, bootstrap_service.code_text_len), parsed.value.secretCode.len);
+    try std.testing.expectEqual(@as(usize, api_response.timestamp_text_len), parsed.value.expiresAt.len);
+    var redeemed = try bootstrap.redeem(
+        parsed.value.bootstrapId,
+        parsed.value.secretCode,
+        try unixTimestamp(std.testing.io),
+        null,
+    );
+    defer redeemed.clear();
+    try std.testing.expect(std.mem.indexOf(u8, disclosure, "ntip-enroll-v1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), parsed.value.secretCode) == null);
 
     try app.execute(.{ .node_delete = "node01" }, &output.writer, &errors.writer);
     try std.testing.expect(store.findNode("node01") == null);
@@ -826,12 +844,23 @@ test "enrollment reset commits before retiring active association" {
     };
     var seen: Seen = .{ .db = &db, .node_id = node_id };
     var app = try Application.init(std.testing.allocator, std.testing.io, repository, &store, [_]u8{3} ** 32, .{}, "test");
+    const identity_secret = [_]u8{0x53} ** 32;
+    var bootstrap = try bootstrap_service.Service.init(&app.repository, std.testing.io, &identity_secret, app.master_public);
+    defer bootstrap.deinit();
+    app.setBootstrapService(&bootstrap);
     app.association_callback = .{ .context = &seen, .retire_fn = Seen.retire };
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer errors.deinit();
-    try app.execute(.{ .node_enrollment_reset = "node01" }, &output.writer, &errors.writer);
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const bootstrap_path = try std.fs.path.join(std.testing.allocator, &.{ root, "reset-bootstrap.json" });
+    defer std.testing.allocator.free(bootstrap_path);
+    try app.execute(.{ .node_enrollment_reset = .{
+        .name = "node01",
+        .bootstrap_out = bootstrap_path,
+    } }, &output.writer, &errors.writer);
 
     try std.testing.expect(seen.retired_after_commit);
     try std.testing.expectEqual(model.EnrollmentState.unenrolled, store.findNode("node01").?.enrollment_state);

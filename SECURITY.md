@@ -12,8 +12,8 @@ Use the repository's **private vulnerability reporting** feature under the
 Security tab. If that feature is unavailable, contact a project maintainer over
 a private channel and ask for a secure reporting path before sending details.
 Do not open a public issue, discussion, or pull request containing an exploit,
-private key, enrollment credential, packet capture with secrets, or unredacted
-state file.
+private key, bootstrap short code, redemption bundle, legacy enrollment
+credential, packet capture with secrets, or unredacted state file.
 
 Include, when safe:
 
@@ -36,8 +36,11 @@ pre-release phase.
   secrets. Enrollment PSKs stored by the Master remain bearer-equivalent while
   unused. Protect `ntip.sqlite3`, backups, password verifiers, and web-session
   hashes as security-sensitive state.
-- Prefer file, standard-input, or hidden-prompt credential ingestion. Positional
-  credentials can leak through shell history or process inspection.
+- Enter bootstrap short codes only at the installer's hidden `/dev/tty` prompt;
+  never put them in a URL, command argument, environment variable, ticket, or
+  log. File/standard-input credential ingestion remains for already-issued
+  pending v0.1 credentials only. Positional legacy credentials can leak through
+  shell history or process inspection.
 - Keep `/var/lib/ntip` and configuration backups encrypted and access-limited.
 - Use nftables to define trust boundaries. VNRs are allocation domains and are
   routable across each other by default.
@@ -45,7 +48,10 @@ pre-release phase.
   `ntcl` require `CAP_NET_ADMIN`; they do not require unrestricted root after
   initialization.
 - Keep `ntip-api` on canonical loopback behind the exact configured same-origin
-  HTTPS proxy. It needs no capabilities or access to `/var/lib/ntip`.
+  HTTPS proxy. Serve the strict installer/redeem routes through that API and
+  immutable Node archives from the root-owned bootstrap-assets directory. Keep
+  the configured SPKI pin synchronized with the TLS key. `ntip-api` needs no
+  capabilities or access to `/var/lib/ntip`.
 - Keep `ntip-dashboard` on canonical loopback behind that same proxy. Route
   pages to its listener and `/api/v1` directly to `ntip-api`; never expose
   ports 3000 or 8787. The dashboard identity must have no supplementary groups,
@@ -71,6 +77,10 @@ pre-release phase.
   document; dashboard packages are not static-musl and NTIP has no Node.js
   production fallback. Dashboard payload checks reject symlinks, native
   `.node` modules, and ELF files outside the separately validated Bun runtime.
+  Verify Node-only archives separately: they must contain `ntcl` but no Master,
+  API, dashboard, server configuration, or server unit. Verify the combined
+  bootstrap-assets manifest and packaged NGINX configuration before enabling
+  new-Node enrollment.
 
 ## Cryptography policy
 

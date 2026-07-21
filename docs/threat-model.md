@@ -76,7 +76,8 @@ The protocol attacker may:
 - observe endpoints, sizes, timing, and packet direction;
 - redirect or poison DNS for the configured Master name;
 - replay captured enrollment and session traffic;
-- steal an unused enrollment credential through an operator mistake;
+- obtain a public bootstrap locator and steal its short code through an
+  operator mistake, or capture a live redemption bundle on a compromised Node;
 - flood the Master with first handshake messages, unknown session IDs, invalid
   tags, extreme sequence numbers, and malformed control or IPv4 data;
 - operate one legitimately enrolled but malicious Node;
@@ -93,9 +94,9 @@ The management-plane attacker may also:
 - induce cross-site requests, spoof `Origin`, replay CSRF or idempotency values,
   or use stale ETags;
 - compromise an ordinary viewer/operator account and attempt role escalation;
-- race inventory edits, enrollment credential replacement, session revocation,
+- race inventory edits, bootstrap replacement/redemption, session revocation,
   settings application, restart, audit export, or audit pruning;
-- disconnect during a streaming export or one-time credential download;
+- disconnect during a streaming export or one-time invitation disclosure;
 - send crafted route/query/form data through dashboard Client Components,
   resize or hide the page, force polling failures, or attempt to make stale
   display state appear current;
@@ -120,13 +121,17 @@ credential PSK.
 The Node generates its static key locally. The Master accepts it only through
 XKpsk1 authenticated by a live single-use PSK, then atomically binds that public
 key to the pre-created Node UUID. The public key is never treated as a secret.
-Enrollment records expire, renewal invalidates the prior unused credential, and
-reset revokes the permanent binding and sessions.
+Enrollment records expire, invitation replacement invalidates the prior unused
+enrollment state, and reset revokes the permanent binding and sessions.
 
-Residual risk: anyone who steals an unused credential can enroll before the
-intended Node. The 24-hour default lifetime, protected transfer, single-use
-atomic consumption, audit record, and explicit reset reduce but do not remove
-that bearer-token risk.
+Residual risk: anyone who obtains both a live invitation's public locator and
+short code can redeem its internal credential and race the intended Node to
+protocol enrollment. A compromised Node can also steal the redemption bundle
+while it exists in process memory. The 24-hour cap, separate code entry,
+per-layer throttling, SPKI pin, single-use protocol consumption, audit record,
+and explicit replacement/reset reduce but do not remove that bearer-token
+risk. An already-issued pending v0.1 long credential retains its original
+bearer risk until it is consumed, expires, or is revoked.
 
 New v0.2 browser-driven enrollment discloses a public eight-character locator
 and a separate 45-bit short code instead of the long credential. The database
@@ -388,11 +393,13 @@ The protocol runtime has no third-party Zig modules or dynamically linked librar
 `ntsrv` statically includes the pinned, checksummed SQLite amalgamation;
 `ntcl` and `ntip-api` are DB-free. It relies on the Linux kernel and invokes
 host `iproute2`; packaged operation also relies on systemd. The optional
-dashboard additionally relies on the host glibc loader. Core/API releases are
-static-musl archives built from a tag, accompanied by SHA-256 checksums, an
-SPDX SBOM, and GitHub build-provenance attestations. Consumers must verify the
-checksum and attestation. The core SBOM must identify SQLite and its upstream digest; the API
-SBOM must not. The separate dashboard archive uses the glibc
+dashboard additionally relies on the host glibc loader. Core/API and Node-only
+releases are static-musl archives built from a tag, accompanied by SHA-256
+checksums, SPDX SBOMs, and GitHub build-provenance attestations. The combined
+bootstrap-assets archive contains both Node architectures and its checksummed
+manifest. Consumers must verify checksums and attestations. The core SBOM must
+identify SQLite and its upstream digest; the API and Node SBOMs must not. The
+separate dashboard archive uses the glibc
 `x86_64-linux`/`aarch64-linux` Bun 1.3.14 binary because Bun's musl assets
 require a loader absent on supported Ubuntu/systemd hosts; this does not change
 the static-musl Zig core/API artifacts. The dashboard also contains the

@@ -1,0 +1,239 @@
+#!/bin/bash
+set -euo pipefail
+set +x
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+IFS=$' \t\n'
+umask 077
+
+# These tokens are replaced only from already validated Master configuration,
+# invitation state, and the root-owned bootstrap-assets manifest.
+readonly bootstrap_id='@NTIP_BOOTSTRAP_ID@'
+readonly public_origin='@NTIP_PUBLIC_HTTPS_ORIGIN@'
+readonly spki_pin='@NTIP_BOOTSTRAP_SPKI_PIN@'
+readonly node_version='@NTIP_NODE_VERSION@'
+readonly x86_path='@NTIP_X86_64_ARCHIVE_PATH@'
+readonly x86_sha256='@NTIP_X86_64_ARCHIVE_SHA256@'
+readonly x86_size='@NTIP_X86_64_ARCHIVE_SIZE@'
+readonly arm_path='@NTIP_AARCH64_ARCHIVE_PATH@'
+readonly arm_sha256='@NTIP_AARCH64_ARCHIVE_SHA256@'
+readonly arm_size='@NTIP_AARCH64_ARCHIVE_SIZE@'
+
+fail() {
+    printf 'NTIP bootstrap failed: %s\n' "$1" >&2
+    exit 1
+}
+
+cleanup() {
+    unset -v secret_code 2>/dev/null || true
+    if [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
+        rm -rf --one-file-system "$work_dir" 2>/dev/null || true
+    fi
+}
+
+install_dependencies() {
+    local missing=() command
+    for command in curl gzip ip mktemp python3 sha256sum stat systemctl tar; do
+        command -v "$command" >/dev/null 2>&1 || missing+=("$command")
+    done
+    ((${#missing[@]} == 0)) && return
+
+    printf 'Installing required bootstrap tools: %s\n' "${missing[*]}" >&2
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get -qq update
+        DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
+            ca-certificates coreutils curl gzip iproute2 python3 tar
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf -q -y install ca-certificates coreutils curl gzip iproute python3 tar
+    elif command -v yum >/dev/null 2>&1; then
+        yum -q -y install ca-certificates coreutils curl gzip iproute python3 tar
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive --quiet install ca-certificates coreutils curl gzip iproute2 python3 tar
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman --noconfirm --sync --needed ca-certificates coreutils curl gzip iproute2 python tar
+    else
+        fail "missing required tools (${missing[*]}) and no supported package manager was found"
+    fi
+    for command in curl gzip ip mktemp python3 sha256sum stat systemctl tar; do
+        command -v "$command" >/dev/null 2>&1 || fail "dependency installation did not provide $command"
+    done
+}
+
+validate_generated_constants() {
+    [[ "$bootstrap_id" =~ ^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$ ]] || \
+        fail "generated bootstrap ID is invalid"
+    local origin_pattern='^https://[a-z0-9.:\[\]-]+$'
+    [[ "$public_origin" =~ $origin_pattern ]] || fail "generated HTTPS origin is invalid"
+    [[ "$spki_pin" =~ ^sha256//[A-Za-z0-9+/]{43}=$ ]] || fail "generated SPKI pin is invalid"
+    [[ "$node_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$ ]] || \
+        fail "generated Node version is invalid"
+    local path digest size
+    for path in "$x86_path" "$arm_path"; do
+        [[ "$path" =~ ^/enrollment/assets/[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$ ]] || \
+            fail "generated archive path is invalid"
+    done
+    for digest in "$x86_sha256" "$arm_sha256"; do
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || fail "generated archive digest is invalid"
+    done
+    for size in "$x86_size" "$arm_size"; do
+        if [[ ! "$size" =~ ^[1-9][0-9]{0,8}$ ]] || ((size > 268435456)); then
+            fail "generated archive size is invalid"
+        fi
+    done
+}
+
+preflight_host() {
+    [[ -n "${BASH_VERSION:-}" ]] || fail "run the command with Bash"
+    ((EUID == 0)) || fail "run the command as root (for example, pipe it to sudo bash)"
+    [[ $(uname -s) == Linux ]] || fail "NTIP v0.2 supports Linux only"
+    [[ -r /dev/tty && -w /dev/tty ]] || fail "a controlling terminal is required"
+    [[ -d /run/systemd/system ]] || fail "systemd is not the active service manager"
+    [[ -c /dev/net/tun ]] || fail "TUN is unavailable at /dev/net/tun"
+
+    local kernel_release kernel_major kernel_rest kernel_minor
+    kernel_release=$(uname -r)
+    kernel_major=${kernel_release%%.*}
+    kernel_rest=${kernel_release#*.}
+    kernel_minor=${kernel_rest%%.*}
+    [[ "$kernel_major" =~ ^[0-9]+$ && "$kernel_minor" =~ ^[0-9]+$ ]] || \
+        fail "could not parse Linux kernel release $kernel_release"
+    if ((kernel_major < 6 || (kernel_major == 6 && kernel_minor < 1))); then
+        fail "Linux kernel 6.1 or newer is required (found $kernel_release)"
+    fi
+
+    if ip link show dev ntip0 >/dev/null 2>&1; then
+        fail "network interface ntip0 is already occupied"
+    fi
+    for service in ntsrv.service ntip-api.service ntip-dashboard.service ntcl.service; do
+        systemctl is-active --quiet "$service" && fail "$service is already active"
+    done
+    for path in /usr/bin/ntsrv /etc/ntip/server.json /var/lib/ntip/server /run/ntip-api; do
+        [[ ! -e "$path" && ! -L "$path" ]] || fail "Master or management-plane state exists at $path"
+    done
+
+    if [[ -e /var/lib/ntip/client/bootstrap.id || -L /var/lib/ntip/client/bootstrap.id ]]; then
+        [[ -f /var/lib/ntip/client/bootstrap.id && ! -L /var/lib/ntip/client/bootstrap.id ]] || \
+            fail "existing bootstrap marker is invalid"
+        [[ $(</var/lib/ntip/client/bootstrap.id) == "$bootstrap_id" ]] || \
+            fail "this host contains a different bootstrap ticket"
+    fi
+    if [[ -e /var/lib/ntip/client/identity.key || -L /var/lib/ntip/client/identity.key ]]; then
+        [[ -f /var/lib/ntip/client/identity.key && ! -L /var/lib/ntip/client/identity.key ]] || \
+            fail "the existing Node identity is not a regular file"
+        [[ -f /var/lib/ntip/client/bootstrap.id && ! -L /var/lib/ntip/client/bootstrap.id ]] || \
+            fail "this host already contains an unrelated Node identity"
+        [[ $(</var/lib/ntip/client/bootstrap.id) == "$bootstrap_id" ]] || \
+            fail "this host already contains an identity for another bootstrap ticket"
+    fi
+}
+
+select_target() {
+    case "$(uname -m)" in
+        x86_64)
+            target=x86_64-linux-musl
+            archive_path=$x86_path
+            archive_sha256=$x86_sha256
+            archive_size=$x86_size
+            ;;
+        aarch64)
+            target=aarch64-linux-musl
+            archive_path=$arm_path
+            archive_sha256=$arm_sha256
+            archive_size=$arm_size
+            ;;
+        *) fail "only Linux x86_64 and AArch64 are supported" ;;
+    esac
+    archive_name=${archive_path##*/}
+    expected_name=ntip-node-v${node_version}-${target}.tar.gz
+    [[ "$archive_name" == "$expected_name" ]] || fail "generated archive filename does not match its target"
+    archive_root=${archive_name%.tar.gz}
+}
+
+download_archive() {
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ntip-node-bootstrap.XXXXXX")
+    archive_file=$work_dir/$archive_name
+    curl -q --http1.1 --proto '=https' --tlsv1.2 --insecure \
+        --pinnedpubkey "$spki_pin" --globoff --fail --silent --show-error \
+        --connect-timeout 10 --max-time 300 --max-redirs 0 \
+        --output "$archive_file" "$public_origin$archive_path"
+    actual_size=$(stat -c %s -- "$archive_file")
+    [[ "$actual_size" == "$archive_size" ]] || fail "downloaded archive size differs from the signed metadata"
+    actual_sha256=$(sha256sum "$archive_file")
+    actual_sha256=${actual_sha256%% *}
+    [[ "$actual_sha256" == "$archive_sha256" ]] || fail "downloaded archive checksum differs"
+
+    python3 -c '
+import pathlib, sys, tarfile
+archive, root = pathlib.Path(sys.argv[1]), sys.argv[2]
+seen = set()
+with tarfile.open(archive, "r:gz") as bundle:
+    for member in bundle.getmembers():
+        path = pathlib.PurePosixPath(member.name)
+        if member.name in seen or path.is_absolute() or ".." in path.parts:
+            raise SystemExit("unsafe or duplicate archive member")
+        seen.add(member.name)
+        if not path.parts or path.parts[0] != root:
+            raise SystemExit("archive member escapes its release root")
+        if not (member.isdir() or member.isfile()):
+            raise SystemExit("archive links and special files are forbidden")
+' "$archive_file" "$archive_root" || fail "downloaded archive structure is unsafe"
+    mkdir -m 0700 "$work_dir/extract"
+    tar --no-same-owner --no-same-permissions -xzf "$archive_file" -C "$work_dir/extract"
+    package_root=$work_dir/extract/$archive_root
+    [[ -x "$package_root/bin/ntcl" && -x "$package_root/scripts/install-node.sh" ]] || \
+        fail "downloaded Node package is incomplete"
+}
+
+redeem_invitation() {
+    IFS= read -r -s -p 'NTIP bootstrap code: ' secret_code </dev/tty || fail "could not read bootstrap code"
+    printf '\n' >/dev/tty
+    [[ "$secret_code" =~ ^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}$ ]] || \
+        fail "bootstrap code must use the form XXX-XXX-XXX"
+    if ! printf '{"bootstrapId":"%s","secretCode":"%s"}' "$bootstrap_id" "$secret_code" | \
+        curl -q --http1.1 --proto '=https' --tlsv1.2 --insecure \
+            --pinnedpubkey "$spki_pin" --globoff --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 --max-redirs 0 \
+            --request POST --header 'Content-Type: application/json' \
+            --header 'Accept: application/json' --data-binary @- \
+            "$public_origin/enrollment/v1/redeem" | \
+        /usr/bin/ntcl \
+            --config /etc/ntip/client.json \
+            --state-dir /var/lib/ntip/client \
+            --runtime-dir /run/ntip \
+            bootstrap-import --stdin
+    then
+        unset -v secret_code
+        fail "the invitation could not be redeemed and imported"
+    fi
+    unset -v secret_code
+}
+
+install_payload() {
+    bash "$package_root/scripts/install-node.sh" --bootstrap-id "$bootstrap_id"
+}
+
+start_node() {
+    bash "$package_root/scripts/install-node.sh" --bootstrap-id "$bootstrap_id" --start
+}
+
+main() {
+    trap cleanup EXIT INT TERM HUP
+    validate_generated_constants
+    [[ -n "${BASH_VERSION:-}" ]] || fail "run the command with Bash"
+    ((EUID == 0)) || fail "run the command as root (for example, pipe it to sudo bash)"
+    [[ $(uname -s) == Linux ]] || fail "NTIP v0.2 supports Linux only"
+    [[ -r /dev/tty && -w /dev/tty ]] || fail "a controlling terminal is required"
+    install_dependencies
+    preflight_host
+    select_target
+    download_archive
+    install_payload
+    redeem_invitation
+    start_node
+    trap - EXIT INT TERM HUP
+    cleanup
+}
+
+main "$@"

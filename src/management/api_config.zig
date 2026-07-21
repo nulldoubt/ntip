@@ -3,8 +3,9 @@
 //! live here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-pub const schema_version: u16 = 1;
+pub const schema_version: u16 = 2;
 pub const maximum_config_bytes: usize = 16 * 1024;
 pub const default_bind_address = "127.0.0.1";
 pub const default_port: u16 = 8787;
@@ -16,6 +17,8 @@ pub const Config = struct {
     port: u16 = default_port,
     service_socket: []const u8 = default_service_socket,
     public_https_origin: []const u8,
+    bootstrap_spki_pin: []const u8,
+    bootstrap_manifest_path: []const u8,
     workers: u16 = 4,
     maximum_connections: u32 = 256,
 };
@@ -38,12 +41,85 @@ pub fn validate(config: Config) !void {
     if (config.port == 0) return error.InvalidBindPort;
     try validateServiceSocket(config.service_socket);
     try validatePublicHttpsOrigin(config.public_https_origin);
+    try validateSpkiPin(config.bootstrap_spki_pin);
+    try validateManifestPath(config.bootstrap_manifest_path);
     if (config.workers == 0 or config.workers > 64) return error.InvalidWorkerCount;
     if (config.maximum_connections == 0 or config.maximum_connections > 65_535 or
         config.maximum_connections < config.workers)
     {
         return error.InvalidConnectionLimit;
     }
+}
+
+pub fn validateSpkiPin(pin: []const u8) !void {
+    const prefix = "sha256//";
+    if (!std.mem.startsWith(u8, pin, prefix)) return error.InvalidBootstrapSpkiPin;
+    const encoded = pin[prefix.len..];
+    if (encoded.len != std.base64.standard.Encoder.calcSize(32)) {
+        return error.InvalidBootstrapSpkiPin;
+    }
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch
+        return error.InvalidBootstrapSpkiPin;
+    if (decoded_size != 32) return error.InvalidBootstrapSpkiPin;
+    var digest: [32]u8 = undefined;
+    std.base64.standard.Decoder.decode(&digest, encoded) catch
+        return error.InvalidBootstrapSpkiPin;
+    var canonical: [std.base64.standard.Encoder.calcSize(32)]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&canonical, &digest);
+    if (!std.mem.eql(u8, &canonical, encoded)) return error.InvalidBootstrapSpkiPin;
+}
+
+pub fn validateManifestPath(path: []const u8) !void {
+    if (path.len < 2 or path.len > 4095 or path[0] != '/' or
+        !std.mem.endsWith(u8, path, ".json"))
+    {
+        return error.InvalidBootstrapManifestPath;
+    }
+    for (path) |byte| {
+        if (byte == 0 or byte == '\n' or byte == '\r' or byte < 0x20) {
+            return error.InvalidBootstrapManifestPath;
+        }
+    }
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.InvalidBootstrapManifestPath;
+        }
+    }
+}
+
+/// Reads the configured manifest from the same no-follow handle whose owner
+/// and mode are validated, closing the check/use race at the API boundary.
+pub fn readManifestFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    maximum_bytes: usize,
+) ![]u8 {
+    try validateManifestPath(path);
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    const metadata = try file.stat(io);
+    if (metadata.kind != .file or metadata.permissions.toMode() & 0o022 != 0) {
+        return error.InsecureBootstrapManifest;
+    }
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const request: linux.STATX = .{ .UID = true };
+        var statx = std.mem.zeroes(linux.Statx);
+        switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, request, &statx))) {
+            .SUCCESS => {},
+            else => return error.BootstrapManifestMetadataLookupFailed,
+        }
+        if (statx.uid != 0) return error.InsecureBootstrapManifest;
+    }
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(maximum_bytes)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |other| return other,
+    };
 }
 
 /// Accepts canonical IPv4 addresses inside 127/8 and the IPv6 loopback
@@ -128,7 +204,7 @@ fn validateServiceSocket(path: []const u8) !void {
 
 test "API bootstrap config defaults are strict and loopback-only" {
     const bytes =
-        \\{"schema_version":1,"public_https_origin":"https://ntip.example.test"}
+        \\{"schema_version":2,"public_https_origin":"https://ntip.example.test","bootstrap_spki_pin":"sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","bootstrap_manifest_path":"/etc/ntip/bootstrap-assets.json"}
     ;
     const parsed = try decode(std.testing.allocator, bytes);
     defer parsed.deinit();
@@ -137,9 +213,21 @@ test "API bootstrap config defaults are strict and loopback-only" {
     try std.testing.expectEqual(@as(u32, 256), parsed.value.maximum_connections);
 
     const unknown =
-        \\{"schema_version":1,"public_https_origin":"https://ntip.example.test","unexpected":true}
+        \\{"schema_version":2,"public_https_origin":"https://ntip.example.test","bootstrap_spki_pin":"sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","bootstrap_manifest_path":"/etc/ntip/bootstrap-assets.json","unexpected":true}
     ;
     try std.testing.expectError(error.InvalidApiConfigJson, decode(std.testing.allocator, unknown));
+}
+
+test "bootstrap SPKI pin and manifest path are canonical" {
+    try validateSpkiPin("sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    try std.testing.expectError(error.InvalidBootstrapSpkiPin, validateSpkiPin("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    try std.testing.expectError(error.InvalidBootstrapSpkiPin, validateSpkiPin("sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    try std.testing.expectError(error.InvalidBootstrapSpkiPin, validateSpkiPin("sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="));
+
+    try validateManifestPath("/etc/ntip/bootstrap-assets.json");
+    try std.testing.expectError(error.InvalidBootstrapManifestPath, validateManifestPath("etc/ntip/bootstrap-assets.json"));
+    try std.testing.expectError(error.InvalidBootstrapManifestPath, validateManifestPath("/etc/../bootstrap-assets.json"));
+    try std.testing.expectError(error.InvalidBootstrapManifestPath, validateManifestPath("/etc/ntip/bootstrap-assets.txt"));
 }
 
 test "loopback bind validation rejects hostnames and routable addresses" {

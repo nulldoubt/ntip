@@ -20,6 +20,8 @@ pub const api_application = @import("api_application.zig");
 pub const operations_service = @import("operations_service.zig");
 pub const operations_api = @import("operations_api.zig");
 pub const enrollment_service = @import("enrollment_service.zig");
+pub const bootstrap_assets = @import("bootstrap_assets.zig");
+pub const bootstrap_service = @import("bootstrap_service.zig");
 pub const read_models_service = @import("read_models_service.zig");
 
 test {
@@ -42,6 +44,8 @@ test {
     _ = operations_service;
     _ = operations_api;
     _ = enrollment_service;
+    _ = bootstrap_assets;
+    _ = bootstrap_service;
     _ = read_models_service;
     _ = @import("http_integration_test.zig");
 }

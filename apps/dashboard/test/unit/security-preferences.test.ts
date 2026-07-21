@@ -117,12 +117,12 @@ describe("mutation attempts", () => {
 
   test("never allows automatic retry for a one-time response", () => {
     const attempt = createMutationAttempt({
-      url: "https://ntip.example/api/v1/nodes/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/enrollment-credentials",
+      url: "https://ntip.example/api/v1/nodes/actions/bootstrap",
       method: "POST",
       csrfToken: "csrf-token",
       responseKind: "one-time",
       idempotencyKeyFactory: () => "fedcba9876543210fedcba9876543210",
-      body: { confirmation: "east-core", expiresInSeconds: 3600 },
+      body: { name: "east-core", confirmation: "east-core", address: "10.10.0.2", vnrName: "east" },
     });
 
     expect(attempt.responseKind).toBe("one-time");

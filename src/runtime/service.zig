@@ -33,6 +33,7 @@ const server_application = @import("../management/server_application.zig");
 const service_server = @import("../management/service_server.zig");
 const auth_application = @import("../management/auth_application.zig");
 const api_application = @import("../management/api_application.zig");
+const bootstrap_service = @import("../management/bootstrap_service.zig");
 const enrollment_service = @import("../management/enrollment_service.zig");
 const inventory_service = @import("../management/inventory_service.zig");
 const operations_service = @import("../management/operations_service.zig");
@@ -127,6 +128,13 @@ fn runMasterLinux(
     defer std.crypto.secureZero(u8, &identity.secret);
     var idempotency_request_hash_key = state.idempotency_repository.deriveRequestHashKey(&identity.secret);
     defer std.crypto.secureZero(u8, &idempotency_request_hash_key);
+    var enrollment_bootstrap = try bootstrap_service.Service.init(
+        &repository,
+        io,
+        &identity.secret,
+        identity.public,
+    );
+    defer enrollment_bootstrap.deinit();
 
     if (store.nodes.items.len > config.maximum_nodes) return error.MaximumNodesExceeded;
     const snapshots = try topology.createMaster(allocator, &store, &.{});
@@ -247,6 +255,7 @@ fn runMasterLinux(
     admin.association_callback = .{ .context = &coordinator, .retire_fn = retireMasterAssociation };
     admin.runtime_lookup = runtime_view.lookup();
     admin.shutdown_callback = applicationShutdownCallback();
+    admin.setBootstrapService(&enrollment_bootstrap);
 
     var api_callbacks: ApiInventoryCallbacks = .{
         .coordinator = &coordinator,
@@ -276,6 +285,8 @@ fn runMasterLinux(
             .publish_generation = ApiInventoryCallbacks.publish,
         },
     );
+    enrollment.setBootstrapService(&enrollment_bootstrap);
+    enrollment.setMaximumNodesSource(&config.maximum_nodes);
     var read_models = try read_models_service.Service.init(
         allocator,
         &inventory,
@@ -362,6 +373,7 @@ fn runMasterLinux(
     );
     api.setEnrollmentService(&enrollment);
     api.setReadModelsService(&read_models);
+    api.setPublicUdpEndpoint(bootstrap.public_udp_endpoint);
 
     const socket_path = try std.fs.path.join(allocator, &.{ paths.runtime_dir, "ntsrv.sock" });
     defer allocator.free(socket_path);

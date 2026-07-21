@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const model = @import("../domain/model.zig");
 const management_repository = @import("management_repository.zig");
 const operations_repository = @import("operations_repository.zig");
 const settings_repository = @import("settings_repository.zig");
@@ -43,6 +44,8 @@ pub const RestoreResult = struct {
     /// Number of sessions removed from the restored snapshot. The source
     /// artifact and recoverable pre-restore copy are never modified.
     revoked_sessions: u64,
+    /// Unused setup invitations invalidated in the staged restored image.
+    revoked_bootstraps: u64,
 };
 
 /// Caller-supplied identity for the fixed local restore audit entry. This
@@ -50,6 +53,7 @@ pub const RestoreResult = struct {
 /// cannot omit or mislabel its immutable restore record.
 pub const RestoreAudit = struct {
     id: [16]u8,
+    bootstrap_revoke_id: [16]u8,
     occurred_at: i64,
 };
 
@@ -218,6 +222,16 @@ pub fn restoreStopped(
         .details_json = "{\"sessionsRevoked\":true}",
     });
     try transaction.commit();
+
+    const revoked_bootstraps = try management_repository.Repository.init(&staged_db)
+        .revokeRestoredBootstrapCredentials(audit.occurred_at, .{
+        .id = audit.bootstrap_revoke_id,
+        .occurred_at = audit.occurred_at,
+        .actor_kind = .local_cli,
+        .action = "enrollment.bootstrap.restore_revoke",
+        .resource_type = "database",
+        .details_json = "{}",
+    });
     try staged_db.integrityCheck();
     try staged_db.validateCurrentSchema();
     staged_db.close();
@@ -248,7 +262,10 @@ pub fn restoreStopped(
     _ = try validateDatabaseFile(state_dir, io, database_file);
     try rejectSidecars(state_dir, io, database_file);
 
-    return .{ .revoked_sessions = revoked_sessions };
+    return .{
+        .revoked_sessions = revoked_sessions,
+        .revoked_bootstraps = revoked_bootstraps,
+    };
 }
 
 fn validateDatabasePath(allocator: std.mem.Allocator, path: [:0]const u8) !void {
@@ -493,6 +510,7 @@ fn makePrivate(dir: std.Io.Dir) !void {
 fn testRestoreAudit(seed: u8) RestoreAudit {
     return .{
         .id = [_]u8{seed} ** 16,
+        .bootstrap_revoke_id = [_]u8{seed +% 1} ** 16,
         .occurred_at = 42,
     };
 }
@@ -605,6 +623,37 @@ fn expectAuditCount(
     defer statement.deinit();
     try std.testing.expectEqual(sqlite.Step.row, try statement.step());
     try std.testing.expectEqual(expected, statement.columnInt64(0));
+}
+
+fn expectBootstrapState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    expected_status: []const u8,
+    expected_reason: ?[]const u8,
+    verifier_present: bool,
+) !void {
+    const path = try databasePath(allocator, io, dir, name);
+    defer allocator.free(path);
+    var db = try sqlite.Database.openReadOnly(path);
+    defer db.close();
+    var statement = try db.prepare(
+        "SELECT b.status,b.invalidation_reason,c.status,c.derived_psk " ++
+            "FROM enrollment_bootstraps AS b JOIN enrollment_credentials AS c " ++
+            "ON c.handle=b.enrollment_handle WHERE b.locator='ABC23456';",
+    );
+    defer statement.deinit();
+    try std.testing.expectEqual(sqlite.Step.row, try statement.step());
+    try std.testing.expectEqualStrings(expected_status, statement.columnText(0).?);
+    if (expected_reason) |reason| {
+        try std.testing.expectEqualStrings(reason, statement.columnText(1).?);
+    } else {
+        try std.testing.expect(statement.columnIsNull(1));
+    }
+    try std.testing.expectEqualStrings(if (verifier_present) "unused" else "revoked", statement.columnText(2).?);
+    try std.testing.expectEqual(verifier_present, !statement.columnIsNull(3));
+    try std.testing.expectEqual(sqlite.Step.done, try statement.step());
 }
 
 const LiveBackupCheckpoint = struct {
@@ -750,7 +799,7 @@ test "online backup is private, standalone, consistent, and non-replacing" {
     );
 }
 
-test "stopped restore retains current database and revokes restored sessions" {
+test "stopped restore retains current database and revokes restored sessions and invitations" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var state_tmp = std.testing.tmpDir(.{});
@@ -766,6 +815,30 @@ test "stopped restore retains current database and revokes restored sessions" {
 
     var source = try createInitializedDatabase(allocator, io, source_tmp.dir, "source-live.sqlite3");
     try insertMarkerAndSession(&source, "restored");
+    var source_repository = management_repository.Repository.init(&source);
+    var source_store = try source_repository.loadInventory(allocator);
+    defer source_store.deinit();
+    const node_id: model.NodeId = .{ .bytes = [_]u8{0x31} ** 16 };
+    try source_store.createNode(node_id, "node01", "restored", try model.Ipv4.parse("10.0.0.2"));
+    _ = try source_repository.persistInventoryWithBootstrap(
+        &source_store,
+        .{
+            .locator = "ABC23456".*,
+            .node_id = node_id,
+            .handle = [_]u8{0x41} ** 16,
+            .derived_psk = [_]u8{0x42} ** 32,
+            .expires_at = 100,
+        },
+        0,
+        10,
+        .{
+            .id = [_]u8{0x70} ** 16,
+            .occurred_at = 10,
+            .actor_kind = .system,
+            .action = "test.bootstrap.issue",
+            .resource_type = "node",
+        },
+    );
     try onlineBackup(allocator, io, &source, source_tmp.dir, "source.sqlite3");
     source.close();
 
@@ -779,12 +852,15 @@ test "stopped restore retains current database and revokes restored sessions" {
         testRestoreAudit(0x40),
     );
     try std.testing.expectEqual(@as(u64, 1), result.revoked_sessions);
+    try std.testing.expectEqual(@as(u64, 1), result.revoked_bootstraps);
     try expectCounts(allocator, io, state_tmp.dir, database_file, "restored", 0);
     try expectRestoreAudit(allocator, io, state_tmp.dir, database_file, testRestoreAudit(0x40));
+    try expectBootstrapState(allocator, io, state_tmp.dir, database_file, "revoked", "restore", false);
     try expectCounts(allocator, io, state_tmp.dir, "before-restore.sqlite3", "current", 1);
     try expectAuditCount(allocator, io, state_tmp.dir, "before-restore.sqlite3", 0);
     try expectCounts(allocator, io, source_tmp.dir, "source.sqlite3", "restored", 1);
-    try expectAuditCount(allocator, io, source_tmp.dir, "source.sqlite3", 0);
+    try expectAuditCount(allocator, io, source_tmp.dir, "source.sqlite3", 1);
+    try expectBootstrapState(allocator, io, source_tmp.dir, "source.sqlite3", "active", null, true);
     try rejectSidecars(state_tmp.dir, io, database_file);
     try rejectSidecars(state_tmp.dir, io, "before-restore.sqlite3");
 }

@@ -54,7 +54,13 @@ def validate(repo: Path) -> None:
     server = load_object(repo / "packaging/config/server.json")
     require_exact(
         server,
-        {"schema_version", "listen_port", "tun_name", "service_socket_path"},
+        {
+            "schema_version",
+            "listen_port",
+            "tun_name",
+            "service_socket_path",
+            "public_udp_endpoint",
+        },
         "server bootstrap",
     )
     require(type(server["schema_version"]) is int and server["schema_version"] == 2, "server schema must be 2")
@@ -63,6 +69,10 @@ def validate(repo: Path) -> None:
     require(
         server["service_socket_path"] == "/run/ntip-api/ntsrv-api.sock",
         "unexpected server API socket",
+    )
+    require(
+        server["public_udp_endpoint"] == "ntip.example.invalid:49152",
+        "unexpected authoritative public UDP endpoint placeholder",
     )
 
     api = load_object(repo / "packaging/config/api.json")
@@ -74,12 +84,14 @@ def validate(repo: Path) -> None:
             "port",
             "service_socket",
             "public_https_origin",
+            "bootstrap_spki_pin",
+            "bootstrap_manifest_path",
             "workers",
             "maximum_connections",
         },
         "API bootstrap",
     )
-    require(type(api["schema_version"]) is int and api["schema_version"] == 1, "API schema must be 1")
+    require(type(api["schema_version"]) is int and api["schema_version"] == 2, "API schema must be 2")
     require(api["bind_address"] == "127.0.0.1" and api["port"] == 8787, "API must bind to loopback:8787")
     require(api["service_socket"] == server["service_socket_path"], "service socket samples differ")
     origin = api["public_https_origin"]
@@ -91,6 +103,14 @@ def validate(repo: Path) -> None:
         "API origin must be an exact HTTPS placeholder",
     )
     require(type(api["workers"]) is int and 0 < api["workers"] <= 64, "invalid fixed worker count")
+    require(
+        api["bootstrap_spki_pin"] == "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "API SPKI pin must be an exact non-production placeholder",
+    )
+    require(
+        api["bootstrap_manifest_path"] == "/etc/ntip/bootstrap-assets.json",
+        "API bootstrap manifest path differs",
+    )
     require(
         type(api["maximum_connections"]) is int
         and api["workers"] <= api["maximum_connections"] <= 65_535,
@@ -133,7 +153,7 @@ def validate(repo: Path) -> None:
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
         "InaccessiblePaths=/var/lib/ntip /run/ntip",
-        "ReadOnlyPaths=/etc/ntip/api.json /run/ntip-api",
+        "ReadOnlyPaths=/etc/ntip/api.json /etc/ntip/bootstrap-assets.json /run/ntip-api",
         "IPAddressDeny=any",
         "IPAddressAllow=localhost",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
@@ -143,6 +163,47 @@ def validate(repo: Path) -> None:
         not any(line.startswith(("StateDirectory=", "ReadWritePaths=/var/lib/ntip")) for line in api_unit),
         "API unit must not receive a writable state directory",
     )
+    require(
+        "ConditionPathExists=/etc/ntip/bootstrap-assets.json" in api_unit,
+        "API must not start without the root-owned bootstrap manifest",
+    )
+
+    nginx = (repo / "packaging/nginx/ntip.conf.example").read_text(encoding="utf-8")
+    for contract in {
+        "limit_req_zone $binary_remote_addr zone=ntip_enrollment_redeem:1m rate=10r/m;",
+        "location = /enrollment/v1/redeem",
+        "client_max_body_size 128;",
+        "limit_req zone=ntip_enrollment_redeem burst=5 nodelay;",
+        "proxy_request_buffering off;",
+        "proxy_buffering off;",
+        "proxy_cache off;",
+        "access_log off;",
+        "alias /usr/share/ntip/bootstrap-assets/$1;",
+        'add_header Cache-Control "public, max-age=31536000, immutable";',
+        "location ^~ /api/v1/",
+        "proxy_pass http://127.0.0.1:3000;",
+    }:
+        require(contract in nginx, f"NGINX bootstrap example lacks contract: {contract}")
+    require("$http_x_forwarded_for" not in nginx, "NGINX must not trust a forwarded socket peer")
+
+    bootstrap_installer = (repo / "scripts/install-bootstrap-assets.sh").read_text(encoding="utf-8")
+    for contract in {
+        "python3 \"$validator\" \"$version\" \"$manifest\" \"$asset_source\"",
+        "install_dir root root 0755 /usr/share/ntip/bootstrap-assets",
+        "install_file root root 0644 \"$source\" \"/usr/share/ntip/bootstrap-assets/$name\"",
+        "install -o root -g ntip-api -m 0640 \"$manifest\" \"$manifest_tmp\"",
+        "mv -f \"$manifest_tmp\" /etc/ntip/bootstrap-assets.json",
+        "/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example",
+    }:
+        require(contract in bootstrap_installer, f"bootstrap-assets installer lacks contract: {contract}")
+    bootstrap_packager = (repo / "scripts/package-bootstrap-assets.sh").read_text(encoding="utf-8")
+    for package_path in {
+        "scripts/install-bootstrap-assets.sh",
+        "scripts/uninstall-bootstrap-assets.sh",
+        "scripts/check-bootstrap-assets.py",
+        "packaging/nginx/ntip.conf.example",
+    }:
+        require(package_path in bootstrap_packager, f"bootstrap-assets package omits {package_path}")
     for line in {
         "User=ntip-dashboard",
         "Group=ntip-dashboard",

@@ -11,6 +11,7 @@ const usage =
     \\commands:
     \\  config MASTER_ENDPOINT NODE [ENROLLMENT_CREDENTIAL]
     \\         [--credential-file FILE | --credential-stdin]
+    \\  bootstrap-import --stdin
     \\  up [-d] | down | status [--json]
     \\  version
     \\
@@ -44,6 +45,15 @@ fn run(
         try stdout.writeAll(usage);
         return .success;
     }
+    const bootstrap_paths = parseBootstrapImport(args) catch |err| {
+        const code = try ntip.cli.runner.reportError(stderr, "ntcl", err);
+        try stderr.writeAll(usage);
+        return code;
+    };
+    if (bootstrap_paths) |paths| {
+        return bootstrapImport(allocator, io, paths, stdin, stdout) catch |err|
+            reportBootstrapError(stderr, err);
+    }
     const parsed = ntip.cli.client.parse(args) catch |err| {
         const code = try ntip.cli.runner.reportError(stderr, "ntcl", err);
         try stderr.writeAll(usage);
@@ -52,6 +62,203 @@ fn run(
     return execute(allocator, io, args, parsed, stdin, stdout, stderr) catch |err|
         ntip.cli.runner.reportError(stderr, "ntcl", err);
 }
+
+fn parseBootstrapImport(args: []const []const u8) !?ntip.cli.common.Paths {
+    var paths = ntip.cli.common.Paths.client_defaults;
+    var index: usize = 0;
+    while (try ntip.cli.common.consumeGlobal(args, &index, &paths)) {}
+    if (index >= args.len or !std.mem.eql(u8, args[index], "bootstrap-import")) return null;
+    const rest = args[index + 1 ..];
+    if (rest.len != 1 or !std.mem.eql(u8, rest[0], "--stdin")) return error.InvalidArguments;
+    return paths;
+}
+
+fn bootstrapImport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: ntip.cli.common.Paths,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !ExitCode {
+    const bundle_bytes = stdin.allocRemaining(
+        allocator,
+        .limited(ntip.state.client_bootstrap.maximum_bundle_bytes),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => return error.RequestTooLarge,
+        else => return err,
+    };
+    defer {
+        std.crypto.secureZero(u8, bundle_bytes);
+        allocator.free(bundle_bytes);
+    }
+
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    if (now < 0) return error.ClockBeforeUnixEpoch;
+    var validated = try ntip.state.client_bootstrap.parseAndValidate(allocator, bundle_bytes, now);
+    defer validated.deinit(allocator);
+
+    // Nothing on disk is touched until the complete strict bundle, including
+    // expiry, archive projection, endpoint, identity anchor, and credential,
+    // has passed validation.
+    var state_dir = try ntip.cli.runner.openPrivateDirectory(io, paths.state_dir);
+    defer state_dir.close(io);
+    var lock = ntip.state.atomic_file.LifetimeLock.acquire(state_dir, io, "state.lock", true) catch |err| switch (err) {
+        error.WouldBlock => return error.DaemonRunning,
+        else => return err,
+    };
+    defer lock.release(io);
+
+    _ = try ntip.state.client_transaction.recover(allocator, io, state_dir, paths.config);
+    const persistent_state = try (ntip.state.client.File{ .dir = state_dir }).loadOrEmpty(allocator, io);
+    if (persistent_state.enrollment_state == .enrolled) return error.NodeAlreadyEnrolled;
+
+    var credential_buffer: [ntip.protocol.credential.text_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &credential_buffer);
+    const credential_text = validated.credential.encode(&credential_buffer);
+
+    if (try ntip.state.client_bootstrap.loadMarker(allocator, state_dir, io)) |existing_id| {
+        if (!std.mem.eql(u8, &existing_id, &validated.bootstrap_id)) return error.AlreadyBootstrapped;
+        try validateResumeStateDirectory(state_dir, io);
+        const existing_config = (try readConfigOptional(allocator, io, paths.config)) orelse
+            return error.AlreadyBootstrapped;
+        defer allocator.free(existing_config);
+        if (!std.mem.eql(u8, existing_config, validated.config_json)) return error.AlreadyBootstrapped;
+        const existing_credential = (ntip.state.secret_store.FileSecretStore{ .dir = state_dir }).load(
+            allocator,
+            io,
+            "enrollment.token",
+            .enrollment_token,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.AlreadyBootstrapped,
+            else => return err,
+        };
+        defer {
+            std.crypto.secureZero(u8, existing_credential);
+            allocator.free(existing_credential);
+        }
+        if (!constantTimeEqual(existing_credential, credential_text)) return error.AlreadyBootstrapped;
+        try stdout.print("Bootstrap {s} is already imported; enrollment can resume.\n", .{&validated.bootstrap_id});
+        return .success;
+    }
+
+    try validateFreshStateDirectory(state_dir, io);
+    const existing_config = try readConfigOptional(allocator, io, paths.config);
+    defer if (existing_config) |bytes| allocator.free(bytes);
+    if (existing_config) |bytes| {
+        if (!std.mem.eql(u8, bytes, packaged_client_sample)) return error.AlreadyBootstrapped;
+    }
+
+    try ntip.state.client_transaction.commitBootstrap(
+        allocator,
+        io,
+        state_dir,
+        paths.config,
+        validated.config_json,
+        credential_text,
+        validated.bootstrap_id,
+    );
+    try stdout.print("Imported bootstrap {s} for node configuration; enrollment can start.\n", .{&validated.bootstrap_id});
+    return .success;
+}
+
+fn validateFreshStateDirectory(dir: std.Io.Dir, io: std.Io) !void {
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "state.lock")) continue;
+        return error.AlreadyBootstrapped;
+    }
+}
+
+fn validateResumeStateDirectory(dir: std.Io.Dir, io: std.Io) !void {
+    var found_state = false;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "state.lock") or
+            std.mem.eql(u8, entry.name, ntip.state.client_bootstrap.marker_file) or
+            std.mem.eql(u8, entry.name, "enrollment.token") or
+            std.mem.eql(u8, entry.name, "identity.key"))
+        {
+            continue;
+        }
+        if (std.mem.eql(u8, entry.name, "state.json")) {
+            found_state = true;
+            continue;
+        }
+        return error.AlreadyBootstrapped;
+    }
+    if (!found_state) return error.AlreadyBootstrapped;
+}
+
+fn readConfigOptional(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !?[]u8 {
+    var file = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        }
+    else
+        std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+    defer file.close(io);
+    const metadata = try file.stat(io);
+    if (metadata.kind != .file or metadata.permissions.toMode() & 0o022 != 0) {
+        return error.InsecureConfigFile;
+    }
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(ntip.state.config.max_config_bytes)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |other| return other,
+    };
+}
+
+fn constantTimeEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    var difference: u8 = 0;
+    for (left, right) |a, b| difference |= a ^ b;
+    return difference == 0;
+}
+
+fn reportBootstrapError(stderr: *std.Io.Writer, err: anyerror) !ExitCode {
+    return switch (err) {
+        error.InvalidBootstrapBundle,
+        error.UnsupportedBootstrapSchema,
+        error.InvalidBootstrapId,
+        error.InvalidBootstrapExpiry,
+        error.InvalidBootstrapArchive,
+        error.InvalidBootstrapMarker,
+        error.InvalidBootstrapMarkerType,
+        => blk: {
+            try stderr.print("ntcl: invalid bootstrap data ({s})\n", .{@errorName(err)});
+            break :blk .usage_or_config;
+        },
+        error.ExpiredBootstrapBundle => blk: {
+            try stderr.writeAll("ntcl: bootstrap invitation has expired\n");
+            break :blk .conflict_or_not_found;
+        },
+        error.InvalidBootstrapCredential => blk: {
+            try stderr.writeAll("ntcl: authentication/protocol failure (InvalidBootstrapCredential)\n");
+            break :blk .authentication_or_protocol;
+        },
+        else => ntip.cli.runner.reportError(stderr, "ntcl", err),
+    };
+}
+
+const packaged_client_sample =
+    \\{
+    \\  "schema_version": 1,
+    \\  "master": "203.0.113.10:49152",
+    \\  "node": "node01",
+    \\  "master_public_key": "0100000000000000000000000000000000000000000000000000000000000000",
+    \\  "tun_name": "ntip0",
+    \\  "inner_mtu": 1380
+    \\}
+    \\
+;
 
 fn execute(
     allocator: std.mem.Allocator,
@@ -197,6 +404,17 @@ fn configure(
 
 fn isHelp(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+test "bootstrap sample guard matches the packaged Node configuration exactly" {
+    const packaged = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "packaging/config/client.json",
+        std.testing.allocator,
+        .limited(ntip.state.config.max_config_bytes),
+    );
+    defer std.testing.allocator.free(packaged);
+    try std.testing.expectEqualStrings(packaged_client_sample, packaged);
 }
 
 test "config with a credential file persists public config and private enrollment state" {
@@ -437,4 +655,142 @@ test "client configuration reports a live daemon from the lifetime lock" {
         &err.writer,
     ));
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "DaemonRunning") != null);
+}
+
+test "bootstrap import accepts the packaged sample and same ticket resumes exactly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "client" });
+    defer std.testing.allocator.free(state_path);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ root, "client.json" });
+    defer std.testing.allocator.free(config_path);
+    try ntip.cli.runner.writeConfigPath(std.testing.io, config_path, packaged_client_sample);
+
+    var credential = Credential{
+        .handle = .{0x11} ** 16,
+        .secret = .{0x22} ** 32,
+        .master_public = .{0x33} ** 32,
+    };
+    defer credential.deinit();
+    const bundle = try testBootstrapBundle(std.testing.allocator, "ABC23456", credential);
+    defer {
+        std.crypto.secureZero(u8, bundle);
+        std.testing.allocator.free(bundle);
+    }
+    const args = [_][]const u8{ "--config", config_path, "--state-dir", state_path, "bootstrap-import", "--stdin" };
+
+    var first_input = std.Io.Reader.fixed(bundle);
+    var first_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first_out.deinit();
+    var first_err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first_err.deinit();
+    try std.testing.expectEqual(
+        ExitCode.success,
+        try run(std.testing.allocator, std.testing.io, &args, &first_input, &first_out.writer, &first_err.writer),
+    );
+
+    var state_dir = try std.Io.Dir.cwd().openDir(std.testing.io, state_path, .{});
+    defer state_dir.close(std.testing.io);
+    const marker = (try ntip.state.client_bootstrap.loadMarker(std.testing.allocator, state_dir, std.testing.io)).?;
+    try std.testing.expectEqualStrings("ABC23456", &marker);
+    const state = try (ntip.state.client.File{ .dir = state_dir }).loadOrEmpty(std.testing.allocator, std.testing.io);
+    try std.testing.expectEqual(ntip.domain.model.EnrollmentState.unenrolled, state.enrollment_state);
+    try std.testing.expect(state.node_id == null);
+
+    var retry_input = std.Io.Reader.fixed(bundle);
+    var retry_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer retry_out.deinit();
+    var retry_err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer retry_err.deinit();
+    try std.testing.expectEqual(
+        ExitCode.success,
+        try run(std.testing.allocator, std.testing.io, &args, &retry_input, &retry_out.writer, &retry_err.writer),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, retry_out.written(), "already imported") != null);
+
+    const other_bundle = try testBootstrapBundle(std.testing.allocator, "DEF23456", credential);
+    defer {
+        std.crypto.secureZero(u8, other_bundle);
+        std.testing.allocator.free(other_bundle);
+    }
+    var other_input = std.Io.Reader.fixed(other_bundle);
+    var other_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer other_out.deinit();
+    var other_err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer other_err.deinit();
+    try std.testing.expectEqual(
+        ExitCode.conflict_or_not_found,
+        try run(std.testing.allocator, std.testing.io, &args, &other_input, &other_out.writer, &other_err.writer),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, other_err.written(), "AlreadyBootstrapped") != null);
+}
+
+test "bootstrap import rejects unrelated Node identity without replacing it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "client" });
+    defer std.testing.allocator.free(state_path);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ root, "client.json" });
+    defer std.testing.allocator.free(config_path);
+    var state_dir = try ntip.cli.runner.openPrivateDirectory(std.testing.io, state_path);
+    defer state_dir.close(std.testing.io);
+    const identity = [_]u8{0x77} ** 32;
+    try (ntip.state.secret_store.FileSecretStore{ .dir = state_dir }).write(
+        std.testing.allocator,
+        std.testing.io,
+        "identity.key",
+        .identity_key,
+        &identity,
+    );
+
+    var credential = Credential{
+        .handle = .{0x11} ** 16,
+        .secret = .{0x22} ** 32,
+        .master_public = .{0x33} ** 32,
+    };
+    defer credential.deinit();
+    const bundle = try testBootstrapBundle(std.testing.allocator, "ABC23456", credential);
+    defer {
+        std.crypto.secureZero(u8, bundle);
+        std.testing.allocator.free(bundle);
+    }
+    const args = [_][]const u8{ "--config", config_path, "--state-dir", state_path, "bootstrap-import", "--stdin" };
+    var input = std.Io.Reader.fixed(bundle);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    try std.testing.expectEqual(
+        ExitCode.conflict_or_not_found,
+        try run(std.testing.allocator, std.testing.io, &args, &input, &out.writer, &err.writer),
+    );
+    const persisted = try (ntip.state.secret_store.FileSecretStore{ .dir = state_dir }).load(
+        std.testing.allocator,
+        std.testing.io,
+        "identity.key",
+        .identity_key,
+    );
+    defer {
+        std.crypto.secureZero(u8, persisted);
+        std.testing.allocator.free(persisted);
+    }
+    try std.testing.expectEqualSlices(u8, &identity, persisted);
+}
+
+fn testBootstrapBundle(
+    allocator: std.mem.Allocator,
+    bootstrap_id: []const u8,
+    credential: Credential,
+) ![]u8 {
+    var credential_buffer: [ntip.protocol.credential.text_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &credential_buffer);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":1,\"bootstrapId\":\"{s}\",\"nodeName\":\"node01\",\"masterEndpoint\":\"203.0.113.10:49152\",\"expiresAt\":\"2099-01-02T03:04:05Z\",\"enrollmentCredential\":\"{s}\",\"archives\":[{{\"version\":\"0.2.0\",\"target\":\"x86_64-linux-musl\",\"path\":\"/enrollment/assets/ntip-node-v0.2.0-x86_64-linux-musl.tar.gz\",\"sha256\":\"abababababababababababababababababababababababababababababababab\",\"sizeBytes\":1234}},{{\"version\":\"0.2.0\",\"target\":\"aarch64-linux-musl\",\"path\":\"/enrollment/assets/ntip-node-v0.2.0-aarch64-linux-musl.tar.gz\",\"sha256\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"sizeBytes\":1234}}]}}",
+        .{ bootstrap_id, credential.encode(&credential_buffer) },
+    );
 }

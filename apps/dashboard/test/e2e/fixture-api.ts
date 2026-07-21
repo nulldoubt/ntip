@@ -14,6 +14,7 @@ type AuditPage = components["schemas"]["AuditPage"];
 type AuthContext = components["schemas"]["AuthContext"];
 type ConnectivityCheck = components["schemas"]["ConnectivityCheck"];
 type ConnectivityCheckPage = components["schemas"]["ConnectivityCheckPage"];
+type EnrollmentBootstrapDisclosure = components["schemas"]["EnrollmentBootstrapDisclosure"];
 type ErrorCode = components["schemas"]["ErrorCode"];
 type FieldViolation = components["schemas"]["FieldViolation"];
 type Event = components["schemas"]["Event"];
@@ -135,11 +136,18 @@ interface FixtureSession {
   csrfToken: string;
   session: Session;
   reauthenticatedUntil: number;
+  oneTimeIdempotency: Map<string, Readonly<{ requestHash: string }>>;
+}
+
+interface OneTimeIdempotencyAttempt {
+  readonly key: string;
+  readonly requestHash: string;
 }
 
 interface FaultRule {
   path: string;
   status?: number;
+  afterRoute: boolean;
   delayMilliseconds: number;
   remaining: number;
 }
@@ -164,6 +172,7 @@ interface FixtureState {
   events: Event[];
   checks: ConnectivityCheck[];
   audit: AuditEntry[];
+  bootstrapLocators: Map<string, string>;
   settings: SettingsState;
   revisions: SettingsRevision[];
   faults: FaultRule[];
@@ -237,6 +246,7 @@ function freshState(): FixtureState {
     events: [event],
     checks: [check],
     audit: [audit],
+    bootstrapLocators: new Map(),
     settings: { desired: structuredClone(activeRevision), effective: structuredClone(activeRevision), pendingRestart: false },
     revisions: [structuredClone(activeRevision), structuredClone(priorRevision)],
     faults: [],
@@ -304,7 +314,7 @@ function redact(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
   return Object.fromEntries(Object.entries(value).map(([key, child]) => {
     const normalized = key.toLowerCase();
-    if (normalized.includes("password") || normalized.includes("credential") || normalized.includes("csrf") || normalized.includes("token")) {
+    if (normalized.includes("password") || normalized.includes("secret") || normalized.includes("credential") || normalized.includes("csrf") || normalized.includes("token")) {
       return [key, "<redacted>"];
     }
     return [key, redact(child)];
@@ -413,10 +423,11 @@ export class FixtureApi {
     this.#state.maximumConcurrentRequests = 0;
   }
 
-  addFault(rule: Readonly<{ path: string; status?: number; delayMilliseconds?: number; remaining?: number }>): void {
+  addFault(rule: Readonly<{ path: string; status?: number; afterRoute?: boolean; delayMilliseconds?: number; remaining?: number }>): void {
     this.#state.faults.push({
       path: rule.path,
       ...(rule.status === undefined ? {} : { status: rule.status }),
+      afterRoute: rule.afterRoute ?? false,
       delayMilliseconds: rule.delayMilliseconds ?? 0,
       remaining: rule.remaining ?? 1,
     });
@@ -459,12 +470,15 @@ export class FixtureApi {
       if (fault !== undefined) {
         fault.remaining -= 1;
         if (fault.delayMilliseconds > 0) await Bun.sleep(fault.delayMilliseconds);
-        if (fault.status !== undefined) {
+        if (!fault.afterRoute && fault.status !== undefined) {
           return apiError(sequence, fault.status, fault.status === 503 ? "service_unavailable" : "internal_error", "Injected fixture fault");
         }
       }
-
-      return await this.#route(request, url, sequence);
+      const response = await this.#route(request, url, sequence);
+      if (fault?.afterRoute === true && fault.status !== undefined) {
+        return apiError(sequence, fault.status, fault.status === 503 ? "service_unavailable" : "internal_error", "Injected post-commit fixture fault");
+      }
+      return response;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Fixture failure";
       return apiError(sequence, 500, "internal_error", message);
@@ -475,7 +489,7 @@ export class FixtureApi {
 
   async #route(request: Request, url: URL, sequence: number): Promise<Response> {
     if (request.method === "GET" && url.pathname === "/api/v1/health/live") return json(sequence, { status: "live" }, 200, { ETag: '"live"' });
-    if (request.method === "GET" && url.pathname === "/api/v1/health/ready") return json(sequence, { status: "ready", ntsrv: "ready", databaseSchemaVersion: 1 });
+    if (request.method === "GET" && url.pathname === "/api/v1/health/ready") return json(sequence, { status: "ready", ntsrv: "ready", databaseSchemaVersion: 2 });
 
     if (request.method === "POST" && url.pathname === "/api/v1/auth/login") {
       const validation = this.#validateOriginAndIdempotency(request, sequence, false);
@@ -501,6 +515,13 @@ export class FixtureApi {
     const { user, session } = authenticated;
 
     if (request.method === "GET" && url.pathname === "/api/v1/auth/me") return json(sequence, this.#authContext(user, session));
+
+    if (request.method === "GET" && url.pathname === "/api/v1/enrollment/bootstrap-config") {
+      return json(sequence, {
+        installerOrigin: this.#publicOrigin,
+        spkiPin: "sha256//KFgtXcDvCiDozs2cJZwVJ8wagYkpqbJXfT3ew5HlGDY=",
+      });
+    }
 
     if (request.method === "POST" && url.pathname === "/api/v1/auth/reauth") {
       const validation = this.#validateMutation(request, sequence, session, false);
@@ -546,11 +567,14 @@ export class FixtureApi {
     const vnrMatch = /^\/api\/v1\/vnrs\/([^/]+)$/.exec(url.pathname);
     if (vnrMatch?.[1] !== undefined) return this.#vnr(request, sequence, user, session, decodeURIComponent(vnrMatch[1]));
 
+    if (request.method === "POST" && url.pathname === "/api/v1/nodes/actions/bootstrap") {
+      return this.#createNodeBootstrap(request, sequence, user, session);
+    }
     if (url.pathname === "/api/v1/nodes") return this.#nodes(request, sequence, user, session);
     const nodeMatch = /^\/api\/v1\/nodes\/([0-9a-f]{32})$/.exec(url.pathname);
     if (nodeMatch?.[1] !== undefined) return this.#node(request, sequence, user, session, nodeMatch[1]);
-    const enrollmentMatch = /^\/api\/v1\/nodes\/([0-9a-f]{32})\/enrollment-credentials$/.exec(url.pathname);
-    if (enrollmentMatch?.[1] !== undefined) return this.#enrollmentCredential(request, sequence, user, session, enrollmentMatch[1]);
+    const enrollmentMatch = /^\/api\/v1\/nodes\/([0-9a-f]{32})\/enrollment-bootstrap$/.exec(url.pathname);
+    if (enrollmentMatch?.[1] !== undefined) return this.#enrollmentBootstrap(request, sequence, user, session, enrollmentMatch[1]);
     const resetEnrollmentMatch = /^\/api\/v1\/nodes\/([0-9a-f]{32})\/actions\/reset-enrollment$/.exec(url.pathname);
     if (resetEnrollmentMatch?.[1] !== undefined) return this.#resetEnrollment(request, sequence, user, session, resetEnrollmentMatch[1]);
 
@@ -599,6 +623,38 @@ export class FixtureApi {
     return null;
   }
 
+  async #checkOneTimeIdempotency(
+    request: Request,
+    sequence: number,
+    session: FixtureSession,
+  ): Promise<OneTimeIdempotencyAttempt | Response> {
+    const key = request.headers.get("idempotency-key")?.trim();
+    if (key === undefined || key.length === 0) {
+      return apiError(sequence, 400, "idempotency_required", "Idempotency-Key required");
+    }
+    const url = new URL(request.url);
+    const material = [
+      request.method,
+      url.pathname,
+      request.headers.get("if-match") ?? "",
+      await request.clone().text(),
+    ].join("\n");
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(material)));
+    const requestHash = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const existing = session.oneTimeIdempotency.get(key);
+    if (existing !== undefined) {
+      if (existing.requestHash !== requestHash) {
+        return apiError(sequence, 409, "idempotency_conflict", "Idempotency-Key was already used for a different request");
+      }
+      return apiError(sequence, 409, "conflict", "The one-time response for this request was already consumed");
+    }
+    return { key, requestHash };
+  }
+
+  #consumeOneTimeIdempotency(session: FixtureSession, attempt: OneTimeIdempotencyAttempt): void {
+    session.oneTimeIdempotency.set(attempt.key, { requestHash: attempt.requestHash });
+  }
+
   #requireRole(user: User, minimum: Role, sequence: number): Response | null {
     return roleRank(user.role) < roleRank(minimum) ? apiError(sequence, 403, "forbidden", "Role does not permit this operation") : null;
   }
@@ -614,6 +670,7 @@ export class FixtureApi {
       token,
       csrfToken: `csrf-${crypto.randomUUID().replaceAll("-", "")}`,
       reauthenticatedUntil: 0,
+      oneTimeIdempotency: new Map(),
       session: {
         id,
         userId: user.id,
@@ -988,25 +1045,87 @@ export class FixtureApi {
     return apiError(sequence, 400, "invalid_request", "Unsupported Node method");
   }
 
-  async #enrollmentCredential(request: Request, sequence: number, user: User, session: FixtureSession, id: string): Promise<Response> {
-    if (request.method !== "POST") return apiError(sequence, 400, "invalid_request", "Unsupported enrollment method");
+  async #createNodeBootstrap(request: Request, sequence: number, user: User, session: FixtureSession): Promise<Response> {
+    const roleError = this.#requireRole(user, "superuser", sequence);
+    if (roleError !== null) return roleError;
+    const validation = this.#validateMutation(request, sequence, session, false);
+    if (validation !== null) return validation;
+    const reauth = this.#requireReauthentication(session, sequence);
+    if (reauth !== null) return reauth;
+    const idempotency = await this.#checkOneTimeIdempotency(request, sequence, session);
+    if (idempotency instanceof Response) return idempotency;
+    const body: unknown = await request.json().catch(() => null);
+    if (
+      !exactFields(body, ["name", "address", "vnrName", "confirmation"]) ||
+      typeof body.name !== "string" ||
+      typeof body.address !== "string" ||
+      typeof body.vnrName !== "string" ||
+      typeof body.confirmation !== "string" ||
+      body.confirmation !== body.name
+    ) {
+      return apiError(sequence, 400, "validation_failed", "Node fields and exact confirmation are required");
+    }
+    const state = this.#validateNodeState(sequence, {
+      name: body.name,
+      address: body.address,
+      vnrName: body.vnrName,
+    });
+    if (state instanceof Response) return state;
+    const id = (this.#state.nodes.length + 100).toString(16).padStart(32, "0");
+    const node: Node = {
+      id,
+      name: body.name,
+      address: body.address,
+      vnrName: body.vnrName,
+      enrollmentState: "unenrolled",
+      generation: 1,
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    this.#state.nodes.push(node);
+    this.#state.runtime.push({ nodeId: id, liveness: "unknown", sessionState: "disconnected", trafficState: "unknown", observedEndpoint: null, authenticatedRxAt: null, authenticatedTxAt: null, observedAt: NOW });
+    this.#state.generation += 1;
+    const disclosed = this.#issueBootstrap(node, sequence);
+    this.#consumeOneTimeIdempotency(session, idempotency);
+    return json(sequence, disclosed, 201, {
+      ETag: entityTag("node", id, disclosed.node.generation),
+      Location: `/api/v1/nodes/${id}`,
+    });
+  }
+
+  async #enrollmentBootstrap(request: Request, sequence: number, user: User, session: FixtureSession, id: string): Promise<Response> {
+    if (!["POST", "DELETE"].includes(request.method)) return apiError(sequence, 400, "invalid_request", "Unsupported enrollment method");
     const roleError = this.#requireRole(user, "superuser", sequence);
     if (roleError !== null) return roleError;
     const validation = this.#validateMutation(request, sequence, session, true);
     if (validation !== null) return validation;
     const reauth = this.#requireReauthentication(session, sequence);
     if (reauth !== null) return reauth;
-    const node = this.#state.nodes.find((item) => item.id === id);
+    const idempotency = request.method === "POST"
+      ? await this.#checkOneTimeIdempotency(request, sequence, session)
+      : null;
+    if (idempotency instanceof Response) return idempotency;
+    const index = this.#state.nodes.findIndex((item) => item.id === id);
+    const node = this.#state.nodes[index];
     if (node === undefined) return apiError(sequence, 404, "not_found", "Node not found");
     if (request.headers.get("if-match") !== entityTag("node", id, node.generation)) return apiError(sequence, 412, "precondition_failed", "The Node changed");
-    const credential = `ntip-enroll-v1:${crypto.randomUUID()}:${crypto.randomUUID()}`;
-    return new Response(credential, {
-      status: 200,
-      headers: standardHeaders(sequence, {
-        "Content-Type": "application/vnd.ntip.enrollment-credential",
-        "Content-Disposition": `attachment; filename="${node.name}.ntip-enrollment"`,
-      }),
-    });
+    const body: unknown = await request.json().catch(() => null);
+    if (!exactFields(body, ["confirmation"]) || body.confirmation !== node.name) {
+      return apiError(sequence, 400, "validation_failed", "Exact Node confirmation is required");
+    }
+    if (request.method === "DELETE") {
+      this.#state.bootstrapLocators.delete(node.id);
+      const updated: Node = { ...node, enrollmentState: "unenrolled", generation: node.generation + 1, updatedAt: NOW };
+      this.#state.nodes[index] = updated;
+      this.#state.generation += 1;
+      return json(sequence, updated, 200, { ETag: entityTag("node", id, updated.generation) });
+    }
+    if (node.enrollmentState === "enrolled") {
+      return apiError(sequence, 409, "conflict", "Reset enrollment before generating a setup invitation");
+    }
+    const disclosed = this.#issueBootstrap(node, sequence);
+    if (idempotency !== null) this.#consumeOneTimeIdempotency(session, idempotency);
+    return json(sequence, disclosed, 200, { ETag: entityTag("node", id, disclosed.node.generation) });
   }
 
   async #resetEnrollment(request: Request, sequence: number, user: User, session: FixtureSession, id: string): Promise<Response> {
@@ -1017,12 +1136,44 @@ export class FixtureApi {
     if (validation !== null) return validation;
     const reauth = this.#requireReauthentication(session, sequence);
     if (reauth !== null) return reauth;
+    const idempotency = await this.#checkOneTimeIdempotency(request, sequence, session);
+    if (idempotency instanceof Response) return idempotency;
     const index = this.#state.nodes.findIndex((item) => item.id === id);
     const node = this.#state.nodes[index];
     if (node === undefined) return apiError(sequence, 404, "not_found", "Node not found");
-    const updated: Node = { ...node, enrollmentState: "unenrolled", generation: node.generation + 1, updatedAt: NOW };
-    this.#state.nodes[index] = updated;
-    return json(sequence, updated, 200, { ETag: entityTag("node", id, updated.generation) });
+    if (request.headers.get("if-match") !== entityTag("node", id, node.generation)) return apiError(sequence, 412, "precondition_failed", "The Node changed");
+    const body: unknown = await request.json().catch(() => null);
+    if (!exactFields(body, ["confirmation"]) || body.confirmation !== node.name) {
+      return apiError(sequence, 400, "validation_failed", "Exact Node confirmation is required");
+    }
+    if (node.enrollmentState !== "enrolled") {
+      return apiError(sequence, 409, "conflict", "Only an enrolled Node can have its enrollment reset");
+    }
+    const disclosed = this.#issueBootstrap(node, sequence);
+    this.#consumeOneTimeIdempotency(session, idempotency);
+    return json(sequence, disclosed, 200, { ETag: entityTag("node", id, disclosed.node.generation) });
+  }
+
+  #issueBootstrap(node: Node, sequence: number): Readonly<{ node: Node; bootstrap: EnrollmentBootstrapDisclosure }> {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let value = BigInt(sequence);
+    let locator = "";
+    for (let index = 0; index < 8; index += 1) {
+      locator = alphabet[Number(value & 31n)] + locator;
+      value >>= 5n;
+    }
+    this.#state.bootstrapLocators.set(node.id, locator);
+    const updated: Node = { ...node, enrollmentState: "credential_issued", generation: node.generation + 1, updatedAt: NOW };
+    this.#state.nodes = this.#state.nodes.map((candidate) => candidate.id === node.id ? updated : candidate);
+    this.#state.generation += 1;
+    return {
+      node: updated,
+      bootstrap: {
+        bootstrapId: locator,
+        secretCode: "ABC-DEF-GHJ",
+        expiresAt: "2026-07-22T19:00:00Z",
+      },
+    };
   }
 
   async #routes(request: Request, sequence: number, user: User, session: FixtureSession): Promise<Response> {
@@ -1248,7 +1399,7 @@ export class FixtureApi {
     if (kind === "restart") {
       // Model the managed process cycling twice before readiness returns so the
       // dashboard's stale/recovery state is exercised against real polling.
-      this.#state.faults.push({ path: "/api/v1/health/ready", status: 503, delayMilliseconds: 0, remaining: 2 });
+      this.#state.faults.push({ path: "/api/v1/health/ready", status: 503, afterRoute: false, delayMilliseconds: 0, remaining: 2 });
     }
     return json(sequence, operation, 202);
   }

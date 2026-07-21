@@ -101,23 +101,30 @@ zig-out/release/
     └── ntip-api
 ```
 
-Packaging emits three architecture-matched artifacts per architecture: the core
-`ntip-v...` archive (`ntsrv` and `ntcl`), optional `ntip-api-v...` archive, and
-optional `ntip-dashboard-v...` archive. The API installer verifies its version
-against the installed core and receives no SQLite or state-directory access.
-The dashboard installer requires matching installed core and API versions and
-bundles Bun 1.3.14 with architecture-neutral Next standalone output.
+Packaging emits four architecture-matched artifacts per architecture: the core
+`ntip-v...` archive (`ntsrv` and `ntcl`), `ntip-api-v...`,
+`ntip-dashboard-v...`, and the Node-only `ntip-node-v...` archive. One
+architecture-neutral `ntip-bootstrap-assets-v...` Master package contains both
+Node-only archives, their checksum/SBOM sidecars, the strict manifest, the
+installer template, and the operator-owned NGINX example. The API installer
+verifies its version against the installed core and receives no SQLite or
+state-directory access. The bootstrap-assets installer validates both Node
+archives and installs the manifest required by `ntip-api`; it does not enable
+NGINX. The dashboard installer requires matching installed core and API
+versions and bundles Bun 1.3.14 with architecture-neutral Next standalone
+output.
 
 The target names deliberately differ by component:
 
 | Component | x86_64 target | AArch64 target | Runtime model |
 |---|---|---|---|
-| Core/API | `x86_64-linux-musl` | `aarch64-linux-musl` | static-musl Zig binaries |
+| Core/API/Node | `x86_64-linux-musl` | `aarch64-linux-musl` | static-musl Zig binaries |
 | Dashboard | `x86_64-linux` | `aarch64-linux` | glibc Bun runtime plus standalone JavaScript |
+| Bootstrap assets | both Node targets in one package | both Node targets in one package | immutable static archives and strict JSON manifest |
 
 Bun's musl assets require a musl loader that is absent on the supported
 Ubuntu/systemd hosts, so they are not valid dashboard service artifacts. This
-does not change the static-musl core/API contract.
+does not change the static-musl core/API/Node contract.
 
 ## Mechanical release-artifact checks
 
@@ -129,14 +136,20 @@ committed tree and Zig 0.16.0:
 export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
 scripts/check-clean-release-reproducibility.sh "$(scripts/check-version.sh)"
 scripts/check-installer-isolation.sh dist/*.tar.gz
+scripts/check-bootstrap-assets-install.sh
+scripts/check-nginx-bootstrap-config.sh
 ```
 
-The core/API clean-build script exports the committed tree into two different
+The static-musl clean-build script exports the committed tree into two different
 source roots, gives each build a separate local cache, global cache, and install
 prefix, runs `zig build release` twice, and compares `ntsrv`, `ntcl`,
-`ntip-api`, both core/API component archives, external SBOMs, and checksum
-sidecars byte-for-byte. Only one verified result
-is copied into the repository's `zig-out/release` and `dist` directories.
+`ntip-api`, every core/API/Node component archive, both Node SBOMs, the combined
+bootstrap-assets archive, manifests, and checksum sidecars byte-for-byte. Only
+one verified result is copied into the repository's `zig-out/release` and
+`dist` directories. Installer-isolation checks reject Master/API material in a
+Node package and exercise installation/removal of the real bootstrap-assets
+archive. The NGINX check parses the packaged example with an ephemeral test
+certificate.
 
 The dashboard has a separate two-build archive check:
 
@@ -155,18 +168,19 @@ proof.
 
 For a faster packaging-only development check after `zig build release`, run
 `check-release-reproducibility.sh`. That helper packages the same binaries
-twice. It proves deterministic archive construction but is intentionally not
-used as the clean compiler-output reproducibility gate.
+twice, including Node-only and—when both Node targets are selected—the combined
+bootstrap-assets package. It proves deterministic archive construction but is
+intentionally not used as the clean compiler-output reproducibility gate.
 
-`check-release-archive.py` rejects unexpected archive entries, unsafe paths,
+`check-release-archive.py` validates core, API, and Node-only archives and
+rejects unexpected entries, unsafe paths,
 links or special files, wrong modes/owners/timestamps, target-architecture
 mismatches, checksum-sidecar mismatches, incomplete SPDX coverage, incorrect
 file digests, and an incorrect SPDX package verification code. The core SBOM
 must identify the exact statically linked SQLite version, upstream SHA3-256,
 license, and `DEPENDS_ON` relationship; the DB-free API SBOM must omit SQLite.
 On a matching Linux architecture it extracts and executes packaged static
-`ntsrv`, `ntcl`, and `ntip-api`, verifies exact version output, and uses
-`readelf` to
+the component binaries, verifies exact version output, and uses `readelf` to
 reject an ELF interpreter or `NEEDED` dynamic-library entry. Native CI passes
 `--require-native-execution`, so a skipped execution is a failure there.
 

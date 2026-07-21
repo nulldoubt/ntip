@@ -8,6 +8,7 @@ pub const client = @import("client.zig");
 pub const identity = @import("identity.zig");
 pub const server_transaction = @import("server_transaction.zig");
 pub const client_transaction = @import("client_transaction.zig");
+pub const client_bootstrap = @import("client_bootstrap.zig");
 pub const migrations = @import("migrations.zig");
 pub const sqlite = @import("sqlite.zig");
 pub const sqlite_repository = @import("sqlite_repository.zig");
@@ -29,6 +30,7 @@ test {
     _ = identity;
     _ = server_transaction;
     _ = client_transaction;
+    _ = client_bootstrap;
     _ = migrations;
     _ = sqlite;
     _ = sqlite_repository;

@@ -27,11 +27,12 @@ import {
   TableHeader,
   TableRow,
 } from "@ntip/ui";
-import { AlertCircle, ArrowRight, Plus, RefreshCw, Search, Server } from "lucide-react";
+import { AlertCircle, ArrowRight, KeyRound, Plus, RefreshCw, Search, Server } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "@/components/auth-context";
+import { BootstrapDisclosure } from "@/components/nodes/bootstrap-disclosure";
 import {
   fieldError,
   InlineFieldError,
@@ -41,7 +42,7 @@ import {
 } from "@/components/network/inventory-form-errors";
 import { NodeAddressSelect } from "@/components/network/segmented-network-input";
 import { createMutationAttempt } from "@/lib/behavior/mutation";
-import { fetchJson } from "@/components/nodes/browser-api";
+import { fetchJson, fetchJsonWithEtag, reauthenticate } from "@/components/nodes/browser-api";
 import {
   enrollmentTone,
   formatUtc,
@@ -62,9 +63,19 @@ import {
   type NodeAddressAvailability,
   type SegmentedIpv4Selection,
 } from "@/lib/network/segmented-network";
+import {
+  buildNodeInstallationCommand,
+  parseEnrollmentBootstrapConfig,
+  parseNodeBootstrapDisclosure,
+  shouldRecoverLostBootstrapResponse,
+  type EnrollmentBootstrapConfig,
+  type NodeBootstrapDisclosure,
+} from "@/lib/node-bootstrap";
 
 type Node = components["schemas"]["Node"];
+type NodeBootstrapCreate = components["schemas"]["NodeBootstrapCreate"];
 type NodeCreate = components["schemas"]["NodeCreate"];
+type NodeDetail = components["schemas"]["NodeDetail"];
 type NodePage = components["schemas"]["NodePage"];
 type NodeRuntime = components["schemas"]["NodeRuntime"];
 type NodeRuntimePage = components["schemas"]["NodeRuntimePage"];
@@ -170,40 +181,95 @@ function nextAddressAfterConflict(topology: Topology, vnrName: string, rejectedA
 function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
   const { auth, can } = useAuth();
   const router = useRouter();
+  const canBootstrap = can("enrollment:manage");
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
   const [name, setName] = useState("");
   const [vnrName, setVnrName] = useState("");
   const [address, setAddress] = useState<string | null>(null);
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
   const [topology, setTopology] = useState<Topology | null>(null);
   const [topologyPhase, setTopologyPhase] = useState<TopologyPhase>("idle");
   const [topologyError, setTopologyError] = useState<string | null>(null);
+  const [bootstrapConfig, setBootstrapConfig] = useState<EnrollmentBootstrapConfig | null>(null);
+  const [bootstrapConfigPhase, setBootstrapConfigPhase] = useState<TopologyPhase>("idle");
+  const [bootstrapConfigError, setBootstrapConfigError] = useState<string | null>(null);
+  const [disclosure, setDisclosure] = useState<NodeBootstrapDisclosure | null>(null);
+  const [lostNode, setLostNode] = useState<Node | null>(null);
+  const [discardPending, setDiscardPending] = useState(false);
+  const [discardError, setDiscardError] = useState<string | null>(null);
   const [formError, setFormError] = useState<InventoryFormErrorState | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [collisionNotice, setCollisionNotice] = useState<string | null>(null);
   const topologyAbortRef = useRef<AbortController | null>(null);
+  const bootstrapConfigAbortRef = useRef<AbortController | null>(null);
   const errorSummaryRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (formError !== null) errorSummaryRef.current?.focus();
   }, [formError]);
 
-  useEffect(() => () => topologyAbortRef.current?.abort(), []);
+  useEffect(() => () => {
+    topologyAbortRef.current?.abort();
+    topologyAbortRef.current = null;
+    bootstrapConfigAbortRef.current?.abort();
+    bootstrapConfigAbortRef.current = null;
+  }, []);
 
   if (!can("inventory:write")) return null;
 
   function reset() {
     topologyAbortRef.current?.abort();
     topologyAbortRef.current = null;
+    bootstrapConfigAbortRef.current?.abort();
+    bootstrapConfigAbortRef.current = null;
     setName("");
     setVnrName("");
     setAddress(null);
+    setPassword("");
+    setConfirmation("");
     setTopology(null);
     setTopologyPhase("idle");
     setTopologyError(null);
+    setBootstrapConfig(null);
+    setBootstrapConfigPhase("idle");
+    setBootstrapConfigError(null);
+    setDisclosure(null);
+    setLostNode(null);
+    setDiscardPending(false);
+    setDiscardError(null);
     setFormError(null);
     setAnnouncement("");
     setCollisionNotice(null);
+  }
+
+  async function refreshBootstrapConfig(): Promise<void> {
+    if (!canBootstrap) return;
+    bootstrapConfigAbortRef.current?.abort();
+    const controller = new AbortController();
+    bootstrapConfigAbortRef.current = controller;
+    setBootstrapConfig(null);
+    setBootstrapConfigError(null);
+    setBootstrapConfigPhase("loading");
+    try {
+      const config = parseEnrollmentBootstrapConfig(
+        await fetchJson<unknown>("/api/v1/enrollment/bootstrap-config", controller.signal),
+      );
+      if (controller.signal.aborted || bootstrapConfigAbortRef.current !== controller) return;
+      setBootstrapConfig(config);
+      setBootstrapConfigPhase("ready");
+    } catch (reason) {
+      if (isAbortError(reason) || bootstrapConfigAbortRef.current !== controller) return;
+      setBootstrapConfig(null);
+      setBootstrapConfigPhase("unavailable");
+      setBootstrapConfigError(actionableApiError(reason, {
+        resourceLabel: "Node installer configuration",
+        includeRequestId: true,
+      }));
+    } finally {
+      if (bootstrapConfigAbortRef.current === controller) bootstrapConfigAbortRef.current = null;
+    }
   }
 
   async function refreshTopology(options: Readonly<{
@@ -267,6 +333,23 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
     }
   }
 
+  async function findNodeByExactName(requestedName: string): Promise<Node | null> {
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    do {
+      const suffix: string = cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`;
+      const page: NodePage = await fetchJson<NodePage>(`/api/v1/nodes?limit=200${suffix}`);
+      const existing = page.items.find((node) => node.name === requestedName);
+      if (existing !== undefined) return existing;
+      cursor = page.nextCursor;
+      if (cursor !== null) {
+        if (seen.has(cursor)) throw new Error("The Node cursor did not advance");
+        seen.add(cursor);
+      }
+    } while (cursor !== null);
+    return null;
+  }
+
   function changeVnr(nextVnrName: string) {
     if (
       topology === null ||
@@ -295,28 +378,65 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (topologyPhase !== "ready" || topology === null || vnrName.length === 0 || address === null) return;
+    const requestedName = name.trim();
+    if (canBootstrap && (
+      bootstrapConfig === null ||
+      bootstrapConfigPhase !== "ready" ||
+      confirmation !== requestedName
+    )) return;
     setPending(true);
     setFormError(null);
     setCollisionNotice(null);
-    setAnnouncement("Creating Node.");
+    setLostNode(null);
+    setAnnouncement(canBootstrap ? "Confirming your password and creating the Node setup invitation." : "Creating Node inventory.");
     const body: NodeCreate = {
-      name: name.trim(),
+      name: requestedName,
       address,
       vnrName,
     };
+    let provisioningDispatched = false;
     try {
+      if (canBootstrap) {
+        const currentPassword = password;
+        setPassword("");
+        await reauthenticate(auth.csrfToken, currentPassword);
+      }
       const attempt = createMutationAttempt({
         method: "POST",
-        url: "/api/v1/nodes",
+        url: canBootstrap ? "/api/v1/nodes/actions/bootstrap" : "/api/v1/nodes",
         csrfToken: auth.csrfToken,
-        body,
+        body: canBootstrap
+          ? ({ ...body, confirmation: requestedName } satisfies NodeBootstrapCreate)
+          : body,
+        responseKind: canBootstrap ? "one-time" : "json",
       });
-      const response = await fetch(attempt.buildRequest());
-      const node = await readBrowserApiJson<Node>(response);
-      setOpen(false);
-      router.push(`/nodes/${node.id}`);
-      router.refresh();
+      const request = attempt.buildRequest();
+      if (canBootstrap) provisioningDispatched = true;
+      const response = await fetch(request);
+      if (canBootstrap) {
+        const created = parseNodeBootstrapDisclosure(await readBrowserApiJson<unknown>(response));
+        setDisclosure(created);
+        setAnnouncement("Node created. Save the installation command and one-time setup code.");
+      } else {
+        const node = await readBrowserApiJson<Node>(response);
+        setOpen(false);
+        router.push(`/nodes/${node.id}`);
+        router.refresh();
+      }
     } catch (reason) {
+      if (canBootstrap && shouldRecoverLostBootstrapResponse(reason, provisioningDispatched)) {
+        try {
+          const existing = await findNodeByExactName(requestedName);
+          if (existing !== null) {
+            setLostNode(existing);
+            setFormError(null);
+            setAnnouncement("The Node exists, but its setup code was not received. Generate a replacement from the Node detail page.");
+            return;
+          }
+        } catch {
+          // Preserve the original failure when the recovery read is unavailable.
+        }
+      }
       setFormError(inventoryFormErrorState(reason, "Node"));
       setAnnouncement("Node was not created. Review the error summary and the marked fields.");
       const addressWasClaimed = reason instanceof BrowserApiError && (
@@ -336,16 +456,64 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
   const addressViolation = collisionNotice === null ? fieldError(formError, "address") : null;
   const topologyReady = topologyPhase === "ready" && topology !== null;
   const exhausted = topologyReady && vnrName.length > 0 && address === null;
+  const requestedName = name.trim();
+  const bootstrapReady = !canBootstrap || (bootstrapConfigPhase === "ready" && bootstrapConfig !== null);
+  const command = disclosure === null || bootstrapConfig === null
+    ? null
+    : buildNodeInstallationCommand(bootstrapConfig, disclosure.bootstrap.bootstrapId);
+
+  function completeDisclosure(): void {
+    if (disclosure === null) return;
+    const nodeId = disclosure.node.id;
+    setDisclosure(null);
+    setBootstrapConfig(null);
+    setOpen(false);
+    router.push(`/nodes/${nodeId}`);
+    router.refresh();
+  }
+
+  async function discardDisclosure(): Promise<void> {
+    if (disclosure === null || discardPending) return;
+    setDiscardPending(true);
+    setDiscardError(null);
+    try {
+      const current = await fetchJsonWithEtag<NodeDetail>(`/api/v1/nodes/${disclosure.node.id}`);
+      const attempt = createMutationAttempt({
+        method: "DELETE",
+        url: `/api/v1/nodes/${disclosure.node.id}/enrollment-bootstrap`,
+        csrfToken: auth.csrfToken,
+        ifMatch: current.etag,
+        requiresIfMatch: true,
+        body: { confirmation: disclosure.node.name },
+      });
+      const response = await fetch(attempt.buildRequest());
+      await readBrowserApiJson<Node>(response);
+      const nodeId = disclosure.node.id;
+      setDisclosure(null);
+      setBootstrapConfig(null);
+      setOpen(false);
+      router.push(`/nodes/${nodeId}`);
+      router.refresh();
+    } catch (reason) {
+      setDiscardError(actionableApiError(reason, {
+        resourceLabel: "setup invitation",
+        includeRequestId: true,
+      }));
+    } finally {
+      setDiscardPending(false);
+    }
+  }
 
   return (
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        if (pending) return;
+        if (pending || disclosure !== null || discardPending) return;
         setOpen(nextOpen);
         if (nextOpen) {
           reset();
           void refreshTopology();
+          void refreshBootstrapConfig();
         } else {
           reset();
         }
@@ -354,11 +522,43 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
       <DialogTrigger asChild>
         <Button disabled={vnrs.length === 0}><Plus aria-hidden="true" />Add Node</Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent
+        className={disclosure === null ? undefined : "max-h-[calc(100vh-2rem)] w-[min(46rem,calc(100vw-2rem))] overflow-y-auto [&>button:last-child]:hidden"}
+        onEscapeKeyDown={(event) => { if (disclosure !== null) event.preventDefault(); }}
+        onPointerDownOutside={(event) => { if (disclosure !== null) event.preventDefault(); }}
+        onInteractOutside={(event) => { if (disclosure !== null) event.preventDefault(); }}
+      >
         <DialogHeader>
           <DialogTitle>Create Node</DialogTitle>
-          <DialogDescription>Create the inventory record first. Enrollment credentials are issued separately.</DialogDescription>
+          <DialogDescription>{canBootstrap
+            ? "Create the inventory record and a short-lived setup invitation in one audited operation."
+            : "Create the inventory record. A superuser must generate its setup invitation afterward."}</DialogDescription>
         </DialogHeader>
+        {disclosure !== null && command !== null ? (
+          <BootstrapDisclosure
+            command={command}
+            disclosure={disclosure}
+            discardError={discardError}
+            discardPending={discardPending}
+            onComplete={completeDisclosure}
+            onDiscard={() => void discardDisclosure()}
+          />
+        ) : lostNode !== null ? (
+          <div className="grid gap-4">
+            <Alert tone="warning" role="alert">
+              <AlertCircle aria-hidden="true" />
+              <AlertDescription>
+                <strong>{lostNode.name}</strong> exists at <span className="font-mono">{lostNode.address}</span>, but the one-time setup response did not reach this browser. No duplicate was created. Open the Node and explicitly generate a replacement code.
+              </AlertDescription>
+            </Alert>
+            <DialogFooter>
+              <Button type="button" variant="ghost" onClick={() => { setOpen(false); reset(); }}>Close</Button>
+              <Button type="button" onClick={() => { const nodeId = lostNode.id; setOpen(false); reset(); router.push(`/nodes/${nodeId}`); router.refresh(); }}>
+                Open Node <ArrowRight aria-hidden="true" />
+              </Button>
+            </DialogFooter>
+          </div>
+        ) : (
         <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
           <InventoryErrorSummary ref={errorSummaryRef} error={formError} title="Node was not created" />
           <div className="grid gap-1.5">
@@ -440,6 +640,43 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
             </p>
             <InlineFieldError id="node-address-error" violation={addressViolation} />
           </div>
+          {canBootstrap ? (
+            <>
+              <div className="grid gap-1.5">
+                <Label htmlFor="node-bootstrap-password">Current password</Label>
+                <Input
+                  id="node-bootstrap-password"
+                  type="password"
+                  autoComplete="current-password"
+                  minLength={14}
+                  maxLength={256}
+                  required
+                  value={password}
+                  disabled={pending}
+                  onChange={(event) => setPassword(event.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">The password is sent only to reauthentication and is cleared before Node provisioning.</p>
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor="node-bootstrap-confirmation">Type “{requestedName || "the Node name"}”</Label>
+                <Input
+                  id="node-bootstrap-confirmation"
+                  autoComplete="off"
+                  required
+                  value={confirmation}
+                  disabled={pending || requestedName.length === 0}
+                  onChange={(event) => setConfirmation(event.target.value)}
+                  aria-describedby="node-bootstrap-confirmation-help"
+                />
+                <p id="node-bootstrap-confirmation-help" className="text-xs text-muted-foreground">Exact confirmation is required because the invitation is disclosed only once.</p>
+              </div>
+            </>
+          ) : (
+            <Alert tone="info">
+              <KeyRound aria-hidden="true" />
+              <AlertDescription>This creates inventory only. Ask a superuser to open the new Node and generate its setup code.</AlertDescription>
+            </Alert>
+          )}
           {topologyError === null ? null : (
             <Alert tone="warning">
               <AlertCircle aria-hidden="true" />
@@ -450,6 +687,12 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
             <Alert role="alert" tone="warning">
               <RefreshCw aria-hidden="true" />
               <AlertDescription>{collisionNotice}</AlertDescription>
+            </Alert>
+          )}
+          {bootstrapConfigError === null ? null : (
+            <Alert tone="warning">
+              <AlertCircle aria-hidden="true" />
+              <AlertDescription>{bootstrapConfigError} Setup invitation creation is disabled until it is available.</AlertDescription>
             </Alert>
           )}
           <p className="sr-only" aria-live="polite" aria-atomic="true">{collisionNotice === null ? announcement : ""}</p>
@@ -466,11 +709,12 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={pending || !topologyReady || vnrName.length === 0 || address === null}>
-              {pending ? "Creating" : "Create Node"}
+            <Button type="submit" disabled={pending || !topologyReady || !bootstrapReady || vnrName.length === 0 || address === null || (canBootstrap && (password.length < 14 || confirmation !== requestedName))}>
+              {pending ? "Creating" : canBootstrap ? "Create Node and setup code" : "Create Node"}
             </Button>
           </DialogFooter>
         </form>
+        )}
       </DialogContent>
     </Dialog>
   );

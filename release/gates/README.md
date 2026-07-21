@@ -54,8 +54,9 @@ read-only jobs, so their network-fetched dependencies cannot modify the build
 workspace or execute with publication authority.
 
 CI archive reproducibility, packaged-binary execution, SPDX validation,
-isolated installer tests, and `systemd-analyze security` reports are mechanical
-evidence only. Automation never edits these records or changes `passed`,
+isolated installer tests, bootstrap-assets/NGINX validation, and
+`systemd-analyze security` reports are mechanical evidence only. Automation
+never edits these records or changes `passed`,
 `evidence`, or `approved`. In particular, a systemd exposure score and green CI
 do not substitute for a 24-hour soak, benchmark report, native rollout record,
 or independent review. The initial `0.1.0-beta.1` record intentionally remains
@@ -67,5 +68,8 @@ automation never reuses the v0.1 record. In addition to this human evidence,
 unless the dashboard exists and its lint, typecheck, unit, exact-Bun production
 build, checked standalone-launcher smoke, and Playwright scripts all pass.
 Architecture-matched archive validation also starts the packaged JSON launcher
-and probes its preview-cookie guard. Development version `0.2.0-dev` is
-intentionally not treated as a release candidate.
+and probes its preview-cookie guard. The same clean-build gate validates both
+Node-only static-musl archives, the combined bootstrap-assets archive and
+manifest, Node installer isolation, and the packaged NGINX configuration.
+Development version `0.2.0-dev` is intentionally not treated as a release
+candidate.

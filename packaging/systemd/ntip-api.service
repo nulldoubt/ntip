@@ -4,6 +4,7 @@ Documentation=file:/usr/share/doc/ntip-api/README.md
 After=network.target systemd-tmpfiles-setup.service
 Requires=systemd-tmpfiles-setup.service
 ConditionPathExists=/etc/ntip/api.json
+ConditionPathExists=/etc/ntip/bootstrap-assets.json
 ConditionPathIsDirectory=/run/ntip-api
 
 [Service]
@@ -25,7 +26,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
 InaccessiblePaths=/var/lib/ntip /run/ntip
-ReadOnlyPaths=/etc/ntip/api.json /run/ntip-api
+ReadOnlyPaths=/etc/ntip/api.json /etc/ntip/bootstrap-assets.json /run/ntip-api
 
 ProtectSystem=strict
 ProtectHome=yes

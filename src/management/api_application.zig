@@ -10,6 +10,7 @@ const api_response = @import("api_response.zig");
 const http = @import("http.zig");
 const auth = @import("auth.zig");
 const auth_application = @import("auth_application.zig");
+const bootstrap_service = @import("bootstrap_service.zig");
 const enrollment_service = @import("enrollment_service.zig");
 const inventory_service = @import("inventory_service.zig");
 const operations_api = @import("operations_api.zig");
@@ -46,6 +47,7 @@ pub const Application = struct {
     inventory: *inventory_service.Service,
     enrollment: ?*enrollment_service.Service = null,
     read_models: ?*read_models_service.Service = null,
+    public_udp_endpoint: ?[]const u8 = null,
     operations: *operations_service.Service,
     idempotency: idempotency_repository.Repository,
     idempotency_request_hash_key: *const idempotency_repository.RequestHashKey,
@@ -80,6 +82,10 @@ pub const Application = struct {
 
     pub fn setReadModelsService(self: *Application, read_models: *read_models_service.Service) void {
         self.read_models = read_models;
+    }
+
+    pub fn setPublicUdpEndpoint(self: *Application, endpoint: []const u8) void {
+        self.public_udp_endpoint = endpoint;
     }
 
     fn handle(
@@ -260,8 +266,12 @@ pub const Application = struct {
                     .raw_key = raw_key,
                     .request_hash = request_hash,
                     .status = summary.status,
-                    .response_body = summary.replay_payload orelse
-                        return error.IdempotencyResponseNotReplayable,
+                    .response_body = try idempotencyStoredPayload(
+                        request.operation,
+                        summary.status,
+                        true,
+                        summary.replay_payload,
+                    ),
                     .now = now,
                 });
                 reservation_active = false;
@@ -281,10 +291,12 @@ pub const Application = struct {
             return error.InvalidCapturedResponse;
         }
 
-        const stored_payload = if (nonReplayableOperation(request.operation))
-            "{\"oneTimeResponse\":true}"
-        else
-            summary.replay_payload orelse return error.IdempotencyResponseNotReplayable;
+        const stored_payload = try idempotencyStoredPayload(
+            request.operation,
+            summary.status,
+            false,
+            summary.replay_payload,
+        );
         _ = try self.idempotency.commit(.{
             .actor_id = actor_id,
             .raw_key = raw_key,
@@ -382,7 +394,7 @@ pub const Application = struct {
             return api_response.finishJson(response, allocator, 200, .{
                 .status = "ready",
                 .ntsrv = "ready",
-                .databaseSchemaVersion = @as(u32, 1),
+                .databaseSchemaVersion = sqlite.current_schema_version,
             }, .{});
         }
         if (std.mem.eql(u8, request.operation, "auth.login")) {
@@ -512,7 +524,44 @@ pub const Application = struct {
         response: *service_server.ResponseSink,
     ) !void {
         const service = self.enrollment orelse return error.OperationUnavailable;
+
+        if (std.mem.eql(u8, request.operation, "enrollment.bootstrap.redeem")) {
+            try requireTarget(forwarded, .POST, "/enrollment/v1/redeem");
+            if (forwarded.session_token != null or forwarded.origin != null or
+                forwarded.csrf_token != null)
+            {
+                return error.InvalidForwardedRequest;
+            }
+            const Body = struct { bootstrapId: []const u8, secretCode: []const u8 };
+            const body = try api_request.decodeBody(Body, allocator, forwarded.body);
+            defer body.deinit();
+            var redeemed = service.redeemBootstrap(
+                body.value.bootstrapId,
+                body.value.secretCode,
+                now,
+                request_id,
+            ) catch |failure| switch (failure) {
+                error.InvalidBootstrapInvitation => return finishBootstrapUnavailable(
+                    response,
+                    allocator,
+                    request_id,
+                ),
+                else => return failure,
+            };
+            defer redeemed.clear();
+            const endpoint = self.public_udp_endpoint orelse return error.OperationUnavailable;
+            return finishBootstrapRedemption(response, allocator, &redeemed, endpoint);
+        }
+
         const token = forwarded.session_token orelse return error.SessionNotFound;
+        if (std.mem.eql(u8, request.operation, "enrollment.bootstrap.config")) {
+            try requireTarget(forwarded, .GET, "/api/v1/enrollment/bootstrap-config");
+            var authenticated = try self.authentication.authenticate(token, now);
+            defer authenticated.clear();
+            if (authenticated.session.password_change_required) return error.PasswordChangeRequired;
+            return api_response.finishJson(response, allocator, 200, .{ .authorized = true }, .{});
+        }
+
         var authenticated = try self.authentication.authenticateMutation(token, forwarded.csrf_token, now);
         defer authenticated.clear();
         if (authenticated.session.password_change_required) return error.PasswordChangeRequired;
@@ -534,55 +583,58 @@ pub const Application = struct {
             .occurred_at = now,
             .preconditions = request.preconditions,
         };
+        const operations_principal: operations_service.Principal = .{
+            .user_id = authenticated.session.user_id,
+            .session_id = authenticated.session.id,
+            .role = authenticated.session.role,
+        };
+        const settings_state = try self.operations.getSettings(operations_principal);
+        const lifetime = settings_state.effective.values.default_enrollment_lifetime_seconds;
 
-        if (std.mem.eql(u8, request.operation, "enrollment.credential.issue")) {
-            if (forwarded.method != .POST or forwarded.query().len != 0) return error.InvalidTarget;
-            const id_text = try api_request.pathParameter(
-                forwarded.target,
-                "/api/v1/nodes/",
-                "/enrollment-credentials",
-            );
+        if (std.mem.eql(u8, request.operation, "enrollment.bootstrap.create_node")) {
+            try requireTarget(forwarded, .POST, "/api/v1/nodes/actions/bootstrap");
             const Body = struct {
-                expiresInSeconds: u64,
+                name: []const u8,
+                vnrName: []const u8,
+                address: []const u8,
                 confirmation: []const u8,
             };
             const body = try api_request.decodeBody(Body, allocator, forwarded.body);
             defer body.deinit();
-            const node_id = model.NodeId.parse(id_text) catch return error.InvalidIdentifier;
-            var issued = service.issueCredential(
+            var result = try service.createNodeBootstrap(
                 principal,
                 context,
-                node_id,
-                body.value.expiresInSeconds,
-            ) catch |failure| {
-                if (failure != error.PreconditionFailed) return failure;
-                const current = try self.inventory.getNode(inventory_principal, node_id);
-                const current_etag = current.etag();
-                return failPrecondition(response, current_etag.slice());
-            };
-            defer issued.clear();
-            return api_response.finishBody(
-                response,
-                allocator,
-                200,
-                "application/vnd.ntip.enrollment-credential",
-                issued.slice(),
-                .{ .content_disposition = "attachment; filename=\"ntip-enrollment-credential.txt\"" },
+                .{
+                    .name = body.value.name,
+                    .vnr = body.value.vnrName,
+                    .address = model.Ipv4.parse(body.value.address) catch return error.InvalidAddress,
+                },
+                lifetime,
             );
+            defer result.clear();
+            var id_text: [32]u8 = undefined;
+            var location_buffer: [96]u8 = undefined;
+            const location = try std.fmt.bufPrint(
+                &location_buffer,
+                "/api/v1/nodes/{s}",
+                .{result.node.id.write(&id_text)},
+            );
+            return finishNodeBootstrap(response, allocator, 201, &result, .{ .location = location });
         }
 
-        if (std.mem.eql(u8, request.operation, "enrollment.reset")) {
-            if (forwarded.method != .POST or forwarded.query().len != 0) return error.InvalidTarget;
-            const id_text = try api_request.pathParameter(
-                forwarded.target,
-                "/api/v1/nodes/",
-                "/actions/reset-enrollment",
-            );
-            const Body = struct { confirmation: []const u8 };
-            const body = try api_request.decodeBody(Body, allocator, forwarded.body);
-            defer body.deinit();
-            const node_id = model.NodeId.parse(id_text) catch return error.InvalidIdentifier;
-            const record = service.resetEnrollment(
+        const suffix = if (std.mem.eql(u8, request.operation, "enrollment.bootstrap.reset"))
+            "/actions/reset-enrollment"
+        else
+            "/enrollment-bootstrap";
+        const id_text = try api_request.pathParameter(forwarded.target, "/api/v1/nodes/", suffix);
+        const node_id = model.NodeId.parse(id_text) catch return error.InvalidIdentifier;
+        const Body = struct { confirmation: []const u8 };
+        const body = try api_request.decodeBody(Body, allocator, forwarded.body);
+        defer body.deinit();
+
+        if (std.mem.eql(u8, request.operation, "enrollment.bootstrap.revoke")) {
+            if (forwarded.method != .DELETE or forwarded.query().len != 0) return error.InvalidTarget;
+            const record = service.revokeNodeBootstrap(
                 principal,
                 context,
                 node_id,
@@ -592,9 +644,29 @@ pub const Application = struct {
                 const current_etag = current.etag();
                 return failPrecondition(response, current_etag.slice());
             };
-            return self.finishNodeDetail(response, allocator, inventory_principal, record, now);
+            return finishNode(response, allocator, 200, record, .{});
         }
-        return error.OperationUnavailable;
+
+        const reset = std.mem.eql(u8, request.operation, "enrollment.bootstrap.reset");
+        if ((!reset and !std.mem.eql(u8, request.operation, "enrollment.bootstrap.replace")) or
+            forwarded.method != .POST or forwarded.query().len != 0)
+        {
+            return error.InvalidTarget;
+        }
+        var result = service.issueNodeBootstrap(
+            principal,
+            context,
+            node_id,
+            lifetime,
+            reset,
+        ) catch |failure| {
+            if (failure != error.PreconditionFailed) return failure;
+            const current = try self.inventory.getNode(inventory_principal, node_id);
+            const current_etag = current.etag();
+            return failPrecondition(response, current_etag.slice());
+        };
+        defer result.clear();
+        return finishNodeBootstrap(response, allocator, 200, &result, .{});
     }
 
     fn operationsOperation(
@@ -1616,10 +1688,35 @@ fn idempotencyActor(
 
 fn nonReplayableOperation(operation: []const u8) bool {
     return std.mem.eql(u8, operation, "auth.login") or
-        std.mem.eql(u8, operation, "enrollment.credential.issue") or
+        std.mem.eql(u8, operation, "enrollment.bootstrap.create_node") or
+        std.mem.eql(u8, operation, "enrollment.bootstrap.replace") or
+        std.mem.eql(u8, operation, "enrollment.bootstrap.reset") or
         std.mem.eql(u8, operation, "operations.audit.export") or
         std.mem.eql(u8, operation, "security.user.create") or
         std.mem.eql(u8, operation, "security.user.password_reset");
+}
+
+const one_time_response_marker = "{\"oneTimeResponse\":true}";
+
+fn idempotencyStoredPayload(
+    operation: []const u8,
+    status: u16,
+    failed: bool,
+    replay_payload: ?[]const u8,
+) ![]const u8 {
+    const bootstrap_issuance = std.mem.eql(u8, operation, "enrollment.bootstrap.create_node") or
+        std.mem.eql(u8, operation, "enrollment.bootstrap.replace") or
+        std.mem.eql(u8, operation, "enrollment.bootstrap.reset");
+    // Expected pre-commit authentication/user errors remain exactly
+    // replayable. Once an invitation has committed—or any one-time operation
+    // committed and only response construction failed—the durable result is
+    // consumed and no secret-bearing response can be reconstructed.
+    if (nonReplayableOperation(operation) and
+        (!failed or bootstrap_issuance or status >= 500))
+    {
+        return one_time_response_marker;
+    }
+    return replay_payload orelse error.IdempotencyResponseNotReplayable;
 }
 
 fn controlOperationKind(operation: []const u8) ?operations_service.ControlKind {
@@ -1736,6 +1833,11 @@ fn finishIdempotencyReplay(
     operation: []const u8,
     replay: idempotency_repository.Replay,
 ) !void {
+    if (nonReplayableOperation(operation) and
+        std.mem.eql(u8, replay.body, one_time_response_marker))
+    {
+        return error.OneTimeResponseAlreadyIssued;
+    }
     if (replay.status >= 400) {
         const parsed_failure = std.json.parseFromSlice(
             service_ipc.ErrorBody,
@@ -1811,7 +1913,11 @@ fn publicErrorForRequest(
     message_buffer: []u8,
 ) PublicError {
     var result = publicError(failure);
-    if (!std.mem.startsWith(u8, request.operation, "inventory.")) return result;
+    if (!std.mem.startsWith(u8, request.operation, "inventory.") and
+        !std.mem.eql(u8, request.operation, "enrollment.bootstrap.create_node"))
+    {
+        return result;
+    }
     result.violation = inventoryViolation(live, request, failure, message_buffer);
     return result;
 }
@@ -2030,7 +2136,9 @@ fn requestedNodeState(live: *const model.Store, request: service_ipc.Request) ?R
     const body = forwarded.body orelse return null;
     const address_text = bodyString(body, "address");
     const vnr_text = bodyString(body, "vnrName");
-    if (std.mem.eql(u8, request.operation, "inventory.node.create")) {
+    if (std.mem.eql(u8, request.operation, "inventory.node.create") or
+        std.mem.eql(u8, request.operation, "enrollment.bootstrap.create_node"))
+    {
         const address = model.Ipv4.parse(address_text orelse return null) catch return null;
         const vnr = live.findVnr(vnr_text orelse return null) orelse return null;
         return .{ .id = null, .vnr = vnr, .address = address };
@@ -2110,7 +2218,8 @@ fn formatMessage(
 
 fn isNodeMutation(operation: []const u8) bool {
     return std.mem.eql(u8, operation, "inventory.node.create") or
-        std.mem.eql(u8, operation, "inventory.node.update");
+        std.mem.eql(u8, operation, "inventory.node.update") or
+        std.mem.eql(u8, operation, "enrollment.bootstrap.create_node");
 }
 
 fn isVnrMutation(operation: []const u8) bool {
@@ -2206,6 +2315,7 @@ fn publicError(failure: anyerror) PublicError {
         error.VnrNotFound,
         error.NodeNotFound,
         error.RouteNotFound,
+        error.BootstrapNotFound,
         => .{
             .code = .not_found,
             .message = "resource was not found",
@@ -2287,6 +2397,7 @@ fn publicError(failure: anyerror) PublicError {
         error.IdempotencyRace,
         error.ProjectionMismatch,
         error.ProjectionChanged,
+        error.BootstrapStateChanged,
         => .{
             .code = .service_unavailable,
             .message = "authoritative service is temporarily unavailable",
@@ -2895,6 +3006,98 @@ fn finishNode(
     try api_response.finishBody(response, allocator, status, api_response.json_content_type, output.written(), completed);
 }
 
+fn finishNodeBootstrap(
+    response: *service_server.ResponseSink,
+    allocator: std.mem.Allocator,
+    status: u16,
+    result: *const enrollment_service.BootstrapResult,
+    metadata: api_response.Metadata,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, output.written());
+        output.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    var expires: [api_response.timestamp_text_len]u8 = undefined;
+    try json.beginObject();
+    try json.objectField("node");
+    try writeNode(&json, result.node);
+    try json.objectField("bootstrap");
+    try json.beginObject();
+    try json.objectField("bootstrapId");
+    try json.write(result.bootstrap.bootstrap_id[0..]);
+    try json.objectField("secretCode");
+    try json.write(result.bootstrap.secret_code[0..]);
+    try json.objectField("expiresAt");
+    try json.write(try api_response.formatTimestamp(result.bootstrap.expires_at, &expires));
+    try json.endObject();
+    try json.endObject();
+    const etag = result.node.etag();
+    var completed = metadata;
+    completed.etag = etag.slice();
+    try api_response.finishBody(
+        response,
+        allocator,
+        status,
+        api_response.json_content_type,
+        output.written(),
+        completed,
+    );
+}
+
+fn finishBootstrapRedemption(
+    response: *service_server.ResponseSink,
+    allocator: std.mem.Allocator,
+    redeemed: *const bootstrap_service.RedeemedCredential,
+    public_udp_endpoint: []const u8,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, output.written());
+        output.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    var expires: [api_response.timestamp_text_len]u8 = undefined;
+    try json.beginObject();
+    try json.objectField("schemaVersion");
+    try json.write(1);
+    try json.objectField("bootstrapId");
+    try json.write(redeemed.bootstrap_id[0..]);
+    try json.objectField("nodeName");
+    try json.write(redeemed.node_name.slice());
+    try json.objectField("masterEndpoint");
+    try json.write(public_udp_endpoint);
+    try json.objectField("expiresAt");
+    try json.write(try api_response.formatTimestamp(redeemed.expires_at, &expires));
+    try json.objectField("enrollmentCredential");
+    try json.write(redeemed.credential[0..]);
+    try json.endObject();
+    try api_response.finishBody(
+        response,
+        allocator,
+        200,
+        api_response.json_content_type,
+        output.written(),
+        .{},
+    );
+}
+
+fn finishBootstrapUnavailable(
+    response: *service_server.ResponseSink,
+    allocator: std.mem.Allocator,
+    request_id: [16]u8,
+) !void {
+    var request_text: [32]u8 = undefined;
+    return api_response.finishJson(response, allocator, 404, .{
+        .@"error" = .{
+            .code = "bootstrap_unavailable",
+            .message = "Bootstrap invitation is unavailable.",
+        },
+        .requestId = api_response.encodeId(request_id, &request_text),
+    }, .{});
+}
+
 fn finishRoute(
     response: *service_server.ResponseSink,
     allocator: std.mem.Allocator,
@@ -3328,6 +3531,72 @@ test "captured and replayed service failures preserve field violations" {
         "address_in_use",
         frame.value.@"error".?.violations.?[0].code,
     );
+}
+
+test "committed one-time operations store only a consumed marker" {
+    const captured_failure = "{\"code\":\"internal_error\",\"message\":\"internal service error\"}";
+    try std.testing.expectEqualStrings(
+        one_time_response_marker,
+        try idempotencyStoredPayload("enrollment.bootstrap.create_node", 500, true, captured_failure),
+    );
+    try std.testing.expectEqualStrings(
+        one_time_response_marker,
+        try idempotencyStoredPayload("enrollment.bootstrap.replace", 409, true, captured_failure),
+    );
+    try std.testing.expectEqualStrings(
+        captured_failure,
+        try idempotencyStoredPayload("inventory.node.create", 500, true, captured_failure),
+    );
+    try std.testing.expectEqualStrings(
+        captured_failure,
+        try idempotencyStoredPayload("auth.login", 401, true, captured_failure),
+    );
+    try std.testing.expectEqualStrings(
+        one_time_response_marker,
+        try idempotencyStoredPayload("auth.login", 500, true, captured_failure),
+    );
+    try std.testing.expectError(
+        error.IdempotencyResponseNotReplayable,
+        idempotencyStoredPayload("inventory.node.create", 500, true, null),
+    );
+
+    var marker_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer marker_output.deinit();
+    var marker_sink = try service_server.ResponseSink.init(
+        std.testing.allocator,
+        &marker_output.writer,
+        "0123456789abcdef0123456789abcdef",
+    );
+    const stored_marker = try std.testing.allocator.dupe(u8, one_time_response_marker);
+    defer std.testing.allocator.free(stored_marker);
+    try std.testing.expectError(
+        error.OneTimeResponseAlreadyIssued,
+        finishIdempotencyReplay(
+            &marker_sink,
+            std.testing.allocator,
+            "enrollment.bootstrap.create_node",
+            .{ .status = 500, .body = stored_marker, .created_at = 1, .expires_at = 2 },
+        ),
+    );
+
+    const failed_login_text =
+        "{\"code\":\"invalid_credentials\",\"message\":\"invalid credentials\",\"retryable\":false}";
+    const failed_login = try std.testing.allocator.dupe(u8, failed_login_text);
+    defer std.testing.allocator.free(failed_login);
+    var login_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer login_output.deinit();
+    var login_sink = try service_server.ResponseSink.init(
+        std.testing.allocator,
+        &login_output.writer,
+        "fedcba9876543210fedcba9876543210",
+    );
+    try finishIdempotencyReplay(
+        &login_sink,
+        std.testing.allocator,
+        "auth.login",
+        .{ .status = 401, .body = failed_login, .created_at = 1, .expires_at = 2 },
+    );
+    try std.testing.expect(login_sink.terminal);
 }
 
 test "access resource ETags are strong exact preconditions" {

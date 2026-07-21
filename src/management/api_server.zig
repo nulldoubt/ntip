@@ -9,10 +9,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const api_config = @import("api_config.zig");
+const bootstrap_assets = @import("bootstrap_assets.zig");
 const api_error = @import("error.zig");
 const auth = @import("auth.zig");
 const http = @import("http.zig");
 const service_ipc = @import("service_ipc.zig");
+const bootstrap_installer_template = @embedFile("node-bootstrap-installer.sh.in");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -20,6 +22,8 @@ const Io = std.Io;
 pub const maximum_requests_per_connection: u32 = 100;
 pub const request_timeout_ms: i64 = 10_000;
 pub const service_timeout_ms: i64 = 5_000;
+pub const maximum_bootstrap_redeem_body_bytes: usize = 128;
+pub const maximum_anonymous_redemptions: u32 = 2;
 pub const maximum_service_response_frames: u32 = 1024;
 pub const maximum_streamed_audit_body_bytes: usize =
     http.maximum_streaming_response_chunk_bytes * @as(usize, maximum_service_response_frames - 1);
@@ -519,6 +523,9 @@ pub const UnixBackend = struct {
 
 pub const Handler = struct {
     public_https_origin: []const u8,
+    bootstrap_spki_pin: []const u8 = "",
+    bootstrap_manifest: ?bootstrap_assets.Manifest = null,
+    anonymous_redemptions: ?*std.atomic.Value(u32) = null,
     openapi: OpenApiProvider,
     backend: Backend,
 
@@ -529,6 +536,12 @@ pub const Handler = struct {
         request: *const http.Request,
         request_id: []const u8,
     ) !OwnedHttpResponse {
+        if (publicBootstrapRoute(request)) |public_route| {
+            return switch (public_route) {
+                .installer => |bootstrap_id| self.renderBootstrapInstaller(allocator, request, bootstrap_id),
+                .redeem => self.forwardBootstrapRedemption(allocator, io, request, request_id),
+            };
+        }
         const resolution = try router.resolve(request.method, request.target);
         switch (resolution) {
             .not_found => return error.RouteNotFound,
@@ -549,9 +562,108 @@ pub const Handler = struct {
                     }
                     return OwnedHttpResponse.fromStatic(allocator, .ok, document, "application/json; charset=utf-8");
                 }
-                return self.forward(allocator, io, request, request_id, match.route.operation);
+                var result = try self.forward(allocator, io, request, request_id, match.route.operation);
+                errdefer result.deinit();
+                if (std.mem.eql(u8, match.route.operation, "enrollment.bootstrap.config") and
+                    result.status == .ok)
+                {
+                    try self.replaceBootstrapConfigBody(allocator, &result);
+                }
+                return result;
             },
         }
+    }
+
+    fn renderBootstrapInstaller(
+        self: Handler,
+        allocator: Allocator,
+        request: *const http.Request,
+        bootstrap_id: []const u8,
+    ) !OwnedHttpResponse {
+        if (request.method != .GET) return error.MethodNotAllowed;
+        if (request.body.len != 0) return error.UnexpectedRequestBody;
+        if (request.header("Origin") != null) return error.InvalidBootstrapRequest;
+        const manifest = self.bootstrap_manifest orelse return error.ServiceUnavailable;
+        const body = try renderInstallerScript(
+            allocator,
+            bootstrap_id,
+            self.public_https_origin,
+            self.bootstrap_spki_pin,
+            manifest,
+        );
+        errdefer allocator.free(body);
+        return .{
+            .allocator = allocator,
+            .status = .ok,
+            .body = body,
+            .content_type = try allocator.dupe(u8, "text/x-shellscript; charset=utf-8"),
+        };
+    }
+
+    fn forwardBootstrapRedemption(
+        self: Handler,
+        allocator: Allocator,
+        io: Io,
+        request: *const http.Request,
+        request_id: []const u8,
+    ) !OwnedHttpResponse {
+        if (request.method != .POST) return error.MethodNotAllowed;
+        if (request.header("Origin") != null) return error.InvalidBootstrapRequest;
+        if (request.body.len == 0 or request.body.len > maximum_bootstrap_redeem_body_bytes) {
+            return error.InvalidBootstrapRequest;
+        }
+        const content_type = request.header("Content-Type") orelse return error.UnsupportedMediaType;
+        if (!std.ascii.eqlIgnoreCase(content_type, "application/json")) {
+            return error.UnsupportedMediaType;
+        }
+        const admission = self.anonymous_redemptions;
+        if (admission) |active| {
+            if (!tryAcquireConnection(active, maximum_anonymous_redemptions)) {
+                return error.BootstrapRedemptionBusy;
+            }
+        }
+        defer if (admission) |active| releaseConnection(active);
+
+        var prepared = try prepareBootstrapRedemption(allocator, io, request, request_id);
+        defer prepared.deinit();
+        var result = try self.backend.exchange(allocator, io, prepared.request);
+        errdefer result.deinit();
+        if (result.status == .ok) {
+            if (result.etag != null or result.location != null or result.content_disposition != null or
+                result.audit_export_id != null or result.retry_after_seconds != null or
+                result.set_cookie != null or result.allow != null or
+                !isJsonContentType(result.content_type))
+            {
+                return error.InvalidServiceResponse;
+            }
+            const manifest = self.bootstrap_manifest orelse return error.ServiceUnavailable;
+            try attachBootstrapArchives(allocator, &result, manifest);
+        } else {
+            try replaceBootstrapPublicFailure(allocator, request_id, &result);
+        }
+        return result;
+    }
+
+    fn replaceBootstrapConfigBody(
+        self: Handler,
+        allocator: Allocator,
+        response: *OwnedHttpResponse,
+    ) !void {
+        var parsed = std.json.parseFromSlice(
+            struct { authorized: bool },
+            allocator,
+            response.body,
+            .{ .duplicate_field_behavior = .@"error", .ignore_unknown_fields = false },
+        ) catch return error.InvalidServiceResponse;
+        defer parsed.deinit();
+        if (!parsed.value.authorized) return error.InvalidServiceResponse;
+        const replacement = try std.json.Stringify.valueAlloc(allocator, .{
+            .installerOrigin = self.public_https_origin,
+            .spkiPin = self.bootstrap_spki_pin,
+        }, .{});
+        std.crypto.secureZero(u8, response.body);
+        allocator.free(response.body);
+        response.body = replacement;
     }
 
     fn forward(
@@ -685,6 +797,286 @@ const PreparedForward = struct {
         self.* = undefined;
     }
 };
+
+fn prepareBootstrapRedemption(
+    allocator: Allocator,
+    io: Io,
+    request: *const http.Request,
+    request_id: []const u8,
+) !PreparedForward {
+    var body_parsed = std.json.parseFromSlice(std.json.Value, allocator, request.body, .{
+        .duplicate_field_behavior = .@"error",
+        .allocate = .alloc_always,
+    }) catch return error.InvalidBootstrapRequest;
+    errdefer {
+        wipeJsonValue(&body_parsed.value);
+        body_parsed.deinit();
+    }
+    if (body_parsed.value != .object or body_parsed.value.object.count() != 2) {
+        return error.InvalidBootstrapRequest;
+    }
+    const bootstrap_id = body_parsed.value.object.get("bootstrapId") orelse
+        return error.InvalidBootstrapRequest;
+    const secret_code = body_parsed.value.object.get("secretCode") orelse
+        return error.InvalidBootstrapRequest;
+    if (bootstrap_id != .string or !isBootstrapId(bootstrap_id.string) or
+        secret_code != .string or !isBootstrapSecretCode(secret_code.string))
+    {
+        return error.InvalidBootstrapRequest;
+    }
+    const user_agent = request.header("User-Agent");
+    if (user_agent) |value| if (value.len > service_ipc.maximum_user_agent_bytes) {
+        return error.InvalidBootstrapRequest;
+    };
+
+    var payload_object: std.json.ObjectMap = .{};
+    errdefer payload_object.deinit(allocator);
+    try payload_object.put(allocator, "method", .{ .string = request.method.text() });
+    try payload_object.put(allocator, "target", .{ .string = request.target });
+    try payload_object.put(allocator, "proxyPeer", .{ .string = "loopback" });
+    try payload_object.put(allocator, "body", body_parsed.value);
+    if (user_agent) |value| try payload_object.put(allocator, "userAgent", .{ .string = value });
+
+    const now_ms = Io.Clock.real.now(io).toMilliseconds();
+    const deadline_ms = std.math.add(i64, now_ms, service_timeout_ms) catch std.math.maxInt(i64);
+    const service_request: service_ipc.Request = .{
+        .version = service_ipc.protocol_version,
+        .request_id = request_id,
+        .deadline_unix_ms = deadline_ms,
+        .operation = "enrollment.bootstrap.redeem",
+        .actor = .{ .kind = .service, .user_agent = user_agent },
+        .preconditions = .{},
+        .payload = .{ .object = payload_object },
+    };
+    service_ipc.validateRequest(service_request) catch return error.InvalidBootstrapRequest;
+    return .{
+        .allocator = allocator,
+        .body_parsed = body_parsed,
+        .payload_object = payload_object,
+        .request = service_request,
+    };
+}
+
+const PartialBootstrapRedemption = struct {
+    schemaVersion: u16,
+    bootstrapId: []const u8,
+    nodeName: []const u8,
+    masterEndpoint: []const u8,
+    expiresAt: []const u8,
+    enrollmentCredential: []const u8,
+};
+
+fn attachBootstrapArchives(
+    allocator: Allocator,
+    response: *OwnedHttpResponse,
+    manifest: bootstrap_assets.Manifest,
+) !void {
+    var wiping_allocator: WipingAllocator = .{ .child = allocator };
+    const secret_allocator = wiping_allocator.allocator();
+    var parsed = std.json.parseFromSlice(PartialBootstrapRedemption, secret_allocator, response.body, .{
+        .duplicate_field_behavior = .@"error",
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidServiceResponse;
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value.schemaVersion != 1 or !isBootstrapId(value.bootstrapId) or
+        value.nodeName.len == 0 or value.nodeName.len > 63 or
+        value.masterEndpoint.len == 0 or value.masterEndpoint.len > 272 or
+        value.expiresAt.len != 20 or value.enrollmentCredential.len != 122 or
+        !std.mem.startsWith(u8, value.enrollmentCredential, "ntip-enroll-v1."))
+    {
+        return error.InvalidServiceResponse;
+    }
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, output.written());
+        output.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("schemaVersion");
+    try json.write(value.schemaVersion);
+    try json.objectField("bootstrapId");
+    try json.write(value.bootstrapId);
+    try json.objectField("nodeName");
+    try json.write(value.nodeName);
+    try json.objectField("masterEndpoint");
+    try json.write(value.masterEndpoint);
+    try json.objectField("expiresAt");
+    try json.write(value.expiresAt);
+    try json.objectField("enrollmentCredential");
+    try json.write(value.enrollmentCredential);
+    try json.objectField("archives");
+    try json.beginArray();
+    for (manifest.archives) |archive| {
+        var path_storage: [224]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_storage, "/enrollment/assets/{s}", .{archive.file});
+        try json.beginObject();
+        try json.objectField("version");
+        try json.write(manifest.version);
+        try json.objectField("target");
+        try json.write(archive.target);
+        try json.objectField("path");
+        try json.write(path);
+        try json.objectField("sha256");
+        try json.write(archive.sha256);
+        try json.objectField("sizeBytes");
+        try json.write(archive.size_bytes);
+        try json.endObject();
+    }
+    try json.endArray();
+    try json.endObject();
+    if (output.written().len > http.maximum_buffered_response_body_bytes) {
+        return error.InvalidServiceResponse;
+    }
+    const replacement = try output.toOwnedSlice();
+    std.crypto.secureZero(u8, response.body);
+    allocator.free(response.body);
+    response.body = replacement;
+}
+
+fn replaceBootstrapPublicFailure(
+    allocator: Allocator,
+    request_id: []const u8,
+    response: *OwnedHttpResponse,
+) !void {
+    const details: struct { []const u8, []const u8, http.Status } = switch (response.status) {
+        .bad_request, .payload_too_large, .unsupported_media_type => .{ "invalid_request", "Bootstrap request is invalid.", response.status },
+        .not_found => .{ "bootstrap_unavailable", "Bootstrap invitation is unavailable.", .not_found },
+        .too_many_requests => .{ "rate_limited", "Bootstrap redemption is temporarily rate limited.", .too_many_requests },
+        else => .{ "service_unavailable", "Bootstrap service is unavailable.", .service_unavailable },
+    };
+    const replacement = try encodeBootstrapError(allocator, request_id, details[0], details[1]);
+    errdefer allocator.free(replacement);
+    const content_type = try allocator.dupe(u8, "application/json; charset=utf-8");
+    std.crypto.secureZero(u8, response.body);
+    allocator.free(response.body);
+    response.body = replacement;
+    allocator.free(response.content_type);
+    response.content_type = content_type;
+    clearBootstrapResponseMetadata(response);
+    response.status = details[2];
+    response.retry_after_seconds = switch (response.status) {
+        .too_many_requests, .service_unavailable => 1,
+        else => null,
+    };
+}
+
+fn clearBootstrapResponseMetadata(response: *OwnedHttpResponse) void {
+    if (response.etag) |value| response.allocator.free(value);
+    response.etag = null;
+    if (response.location) |value| response.allocator.free(value);
+    response.location = null;
+    if (response.content_disposition) |value| response.allocator.free(value);
+    response.content_disposition = null;
+    if (response.audit_export_id) |value| response.allocator.free(value);
+    response.audit_export_id = null;
+    if (response.set_cookie) |value| {
+        std.crypto.secureZero(u8, value);
+        response.allocator.free(value);
+    }
+    response.set_cookie = null;
+    if (response.allow) |value| response.allocator.free(value);
+    response.allow = null;
+}
+
+fn encodeBootstrapError(
+    allocator: Allocator,
+    request_id: []const u8,
+    code: []const u8,
+    message: []const u8,
+) ![]u8 {
+    if (!api_error.isIdentifier(request_id)) return error.InvalidRequestId;
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .@"error" = .{ .code = code, .message = message },
+        .requestId = request_id,
+    }, .{});
+}
+
+fn renderInstallerScript(
+    allocator: Allocator,
+    bootstrap_id: []const u8,
+    public_origin: []const u8,
+    spki_pin: []const u8,
+    manifest: bootstrap_assets.Manifest,
+) ![]u8 {
+    const x86 = bootstrap_assets.archiveFor(manifest, .x86_64_linux_musl);
+    const arm = bootstrap_assets.archiveFor(manifest, .aarch64_linux_musl);
+    var x86_path_storage: [224]u8 = undefined;
+    var arm_path_storage: [224]u8 = undefined;
+    var x86_size_storage: [32]u8 = undefined;
+    var arm_size_storage: [32]u8 = undefined;
+    const x86_path = try std.fmt.bufPrint(&x86_path_storage, "/enrollment/assets/{s}", .{x86.file});
+    const arm_path = try std.fmt.bufPrint(&arm_path_storage, "/enrollment/assets/{s}", .{arm.file});
+    const x86_size = try std.fmt.bufPrint(&x86_size_storage, "{d}", .{x86.size_bytes});
+    const arm_size = try std.fmt.bufPrint(&arm_size_storage, "{d}", .{arm.size_bytes});
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var cursor: usize = 0;
+    var replacements: usize = 0;
+    while (std.mem.indexOf(u8, bootstrap_installer_template[cursor..], "@NTIP_")) |relative_start| {
+        const start = cursor + relative_start;
+        try output.writer.writeAll(bootstrap_installer_template[cursor..start]);
+        const marker_tail = bootstrap_installer_template[start + 1 ..];
+        const relative_end = std.mem.indexOfScalar(u8, marker_tail, '@') orelse
+            return error.InvalidBootstrapManifest;
+        const end = start + 1 + relative_end + 1;
+        const marker = bootstrap_installer_template[start..end];
+        const replacement = installerTemplateValue(
+            marker,
+            bootstrap_id,
+            public_origin,
+            spki_pin,
+            manifest.version,
+            x86_path,
+            x86.sha256,
+            x86_size,
+            arm_path,
+            arm.sha256,
+            arm_size,
+        ) orelse return error.InvalidBootstrapManifest;
+        try output.writer.writeAll(replacement);
+        replacements += 1;
+        cursor = end;
+    }
+    try output.writer.writeAll(bootstrap_installer_template[cursor..]);
+    if (replacements != 10 or output.written().len == 0 or output.written().len > 65_536 or
+        std.mem.indexOf(u8, output.written(), "@NTIP_") != null or
+        !std.mem.endsWith(u8, output.written(), "\nmain \"$@\"\n"))
+    {
+        return error.InvalidBootstrapManifest;
+    }
+    return output.toOwnedSlice();
+}
+
+fn installerTemplateValue(
+    marker: []const u8,
+    bootstrap_id: []const u8,
+    public_origin: []const u8,
+    spki_pin: []const u8,
+    version: []const u8,
+    x86_path: []const u8,
+    x86_sha256: []const u8,
+    x86_size: []const u8,
+    arm_path: []const u8,
+    arm_sha256: []const u8,
+    arm_size: []const u8,
+) ?[]const u8 {
+    if (std.mem.eql(u8, marker, "@NTIP_BOOTSTRAP_ID@")) return bootstrap_id;
+    if (std.mem.eql(u8, marker, "@NTIP_PUBLIC_HTTPS_ORIGIN@")) return public_origin;
+    if (std.mem.eql(u8, marker, "@NTIP_BOOTSTRAP_SPKI_PIN@")) return spki_pin;
+    if (std.mem.eql(u8, marker, "@NTIP_NODE_VERSION@")) return version;
+    if (std.mem.eql(u8, marker, "@NTIP_X86_64_ARCHIVE_PATH@")) return x86_path;
+    if (std.mem.eql(u8, marker, "@NTIP_X86_64_ARCHIVE_SHA256@")) return x86_sha256;
+    if (std.mem.eql(u8, marker, "@NTIP_X86_64_ARCHIVE_SIZE@")) return x86_size;
+    if (std.mem.eql(u8, marker, "@NTIP_AARCH64_ARCHIVE_PATH@")) return arm_path;
+    if (std.mem.eql(u8, marker, "@NTIP_AARCH64_ARCHIVE_SHA256@")) return arm_sha256;
+    if (std.mem.eql(u8, marker, "@NTIP_AARCH64_ARCHIVE_SIZE@")) return arm_size;
+    return null;
+}
 
 /// `alloc_always` gives the HTTP edge an independent strict JSON tree, but it
 /// may contain passwords and one-time credentials. Wipe every owned string
@@ -861,6 +1253,7 @@ const route_definitions = [_]RouteDefinition{
     .{ .route = .{ .method = .DELETE, .pattern = "/api/v1/vnrs/{name}", .operation = "inventory.vnr.delete" }, .policy = unsafe_etag },
     .{ .route = .{ .method = .GET, .pattern = "/api/v1/nodes", .operation = "inventory.nodes.list" } },
     .{ .route = .{ .method = .POST, .pattern = "/api/v1/nodes", .operation = "inventory.node.create" }, .policy = unsafe_post },
+    .{ .route = .{ .method = .POST, .pattern = "/api/v1/nodes/actions/bootstrap", .operation = "enrollment.bootstrap.create_node" }, .policy = unsafe_post },
     .{ .route = .{ .method = .GET, .pattern = "/api/v1/nodes/{id}", .operation = "inventory.node.read" } },
     .{ .route = .{ .method = .PATCH, .pattern = "/api/v1/nodes/{id}", .operation = "inventory.node.update" }, .policy = unsafe_etag },
     .{ .route = .{ .method = .DELETE, .pattern = "/api/v1/nodes/{id}", .operation = "inventory.node.delete" }, .policy = unsafe_etag },
@@ -869,8 +1262,10 @@ const route_definitions = [_]RouteDefinition{
     .{ .route = .{ .method = .GET, .pattern = "/api/v1/routes/{id}", .operation = "inventory.route.read" } },
     .{ .route = .{ .method = .PATCH, .pattern = "/api/v1/routes/{id}", .operation = "inventory.route.update" }, .policy = unsafe_etag },
     .{ .route = .{ .method = .DELETE, .pattern = "/api/v1/routes/{id}", .operation = "inventory.route.delete" }, .policy = unsafe_etag },
-    .{ .route = .{ .method = .POST, .pattern = "/api/v1/nodes/{id}/enrollment-credentials", .operation = "enrollment.credential.issue" }, .policy = unsafe_post_etag },
-    .{ .route = .{ .method = .POST, .pattern = "/api/v1/nodes/{id}/actions/reset-enrollment", .operation = "enrollment.reset" }, .policy = unsafe_post_etag },
+    .{ .route = .{ .method = .GET, .pattern = "/api/v1/enrollment/bootstrap-config", .operation = "enrollment.bootstrap.config" } },
+    .{ .route = .{ .method = .POST, .pattern = "/api/v1/nodes/{id}/enrollment-bootstrap", .operation = "enrollment.bootstrap.replace" }, .policy = unsafe_post_etag },
+    .{ .route = .{ .method = .DELETE, .pattern = "/api/v1/nodes/{id}/enrollment-bootstrap", .operation = "enrollment.bootstrap.revoke" }, .policy = unsafe_etag },
+    .{ .route = .{ .method = .POST, .pattern = "/api/v1/nodes/{id}/actions/reset-enrollment", .operation = "enrollment.bootstrap.reset" }, .policy = unsafe_post_etag },
     .{ .route = .{ .method = .GET, .pattern = "/api/v1/connectivity-checks", .operation = "diagnostics.checks.list" } },
     .{ .route = .{ .method = .POST, .pattern = "/api/v1/connectivity-checks", .operation = "diagnostics.check.create" }, .policy = unsafe_post },
     .{ .route = .{ .method = .GET, .pattern = "/api/v1/connectivity-checks/{id}", .operation = "diagnostics.check.read" } },
@@ -904,6 +1299,39 @@ fn routeArray() [route_definitions.len]http.Route {
     var result: [route_definitions.len]http.Route = undefined;
     for (route_definitions, 0..) |definition, index| result[index] = definition.route;
     return result;
+}
+
+const PublicBootstrapRoute = union(enum) {
+    installer: []const u8,
+    redeem,
+};
+
+fn publicBootstrapRoute(request: *const http.Request) ?PublicBootstrapRoute {
+    if (std.mem.eql(u8, request.target, "/enrollment/v1/redeem")) return .redeem;
+    const prefix = "/enrollment/";
+    if (!std.mem.startsWith(u8, request.target, prefix)) return null;
+    const bootstrap_id = request.target[prefix.len..];
+    if (!isBootstrapId(bootstrap_id)) return null;
+    return .{ .installer = bootstrap_id };
+}
+
+fn isBootstrapId(value: []const u8) bool {
+    if (value.len != 8) return false;
+    for (value) |byte| if (std.mem.indexOfScalar(u8, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789", byte) == null) {
+        return false;
+    };
+    return true;
+}
+
+fn isBootstrapSecretCode(value: []const u8) bool {
+    if (value.len != 11 or value[3] != '-' or value[7] != '-') return false;
+    for (value, 0..) |byte, index| {
+        if (index == 3 or index == 7) continue;
+        if (std.mem.indexOfScalar(u8, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789", byte) == null) {
+            return false;
+        }
+    }
+    return true;
 }
 
 pub fn policyFor(operation: []const u8) ?RoutePolicy {
@@ -1166,13 +1594,26 @@ pub fn serve(
     openapi: OpenApiProvider,
 ) !void {
     try api_config.validate(config);
+    const manifest_bytes = try api_config.readManifestFile(
+        allocator,
+        io,
+        config.bootstrap_manifest_path,
+        bootstrap_assets.maximum_manifest_bytes,
+    );
+    defer allocator.free(manifest_bytes);
+    const parsed_manifest = try bootstrap_assets.decode(allocator, manifest_bytes);
+    defer parsed_manifest.deinit();
     var address = try Io.net.IpAddress.parse(config.bind_address, config.port);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
     var unix_backend: UnixBackend = .{ .socket_path = config.service_socket };
+    var anonymous_redemptions = std.atomic.Value(u32).init(0);
     const handler: Handler = .{
         .public_https_origin = config.public_https_origin,
+        .bootstrap_spki_pin = config.bootstrap_spki_pin,
+        .bootstrap_manifest = parsed_manifest.value,
+        .anonymous_redemptions = &anonymous_redemptions,
         .openapi = openapi,
         .backend = unix_backend.backend(),
     };
@@ -1456,6 +1897,9 @@ fn responseForDispatchFailure(
     request_id: []const u8,
     failure: anyerror,
 ) !OwnedHttpResponse {
+    if (std.mem.startsWith(u8, request.target, "/enrollment/")) {
+        return bootstrapResponseForDispatchFailure(allocator, request_id, failure);
+    }
     var allowed_storage: [128]u8 = undefined;
     const details: struct { api_error.Code, []const u8, http.Status } = switch (failure) {
         error.RouteNotFound => .{ .not_found, "API route not found", .not_found },
@@ -1490,6 +1934,43 @@ fn responseForDispatchFailure(
         if (resolution == .method_not_allowed) allow = resolution.method_not_allowed.format(&allowed_storage);
     }
     return makeErrorResponse(allocator, request_id, details[0], details[1], details[2], allow);
+}
+
+fn bootstrapResponseForDispatchFailure(
+    allocator: Allocator,
+    request_id: []const u8,
+    failure: anyerror,
+) !OwnedHttpResponse {
+    const details: struct { []const u8, []const u8, http.Status } = switch (failure) {
+        error.BootstrapRedemptionBusy => .{ "rate_limited", "Bootstrap redemption is temporarily rate limited.", .too_many_requests },
+        error.ServiceUnavailable,
+        error.ServiceDeadlineExceeded,
+        error.ServiceResponseTooLarge,
+        error.TooManyServiceFrames,
+        error.InvalidServiceResponse,
+        error.InvalidBootstrapManifest,
+        => .{ "service_unavailable", "Bootstrap service is unavailable.", .service_unavailable },
+        error.RouteNotFound => .{ "bootstrap_unavailable", "Bootstrap invitation is unavailable.", .not_found },
+        error.UnsupportedMediaType => .{ "invalid_request", "application/json is required.", .unsupported_media_type },
+        error.MethodNotAllowed => .{ "invalid_request", "Method is not allowed.", .method_not_allowed },
+        error.InvalidBootstrapRequest,
+        error.UnexpectedRequestBody,
+        => .{ "invalid_request", "Bootstrap request is invalid.", .bad_request },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => .{ "service_unavailable", "Bootstrap service is unavailable.", .service_unavailable },
+    };
+    const body = try encodeBootstrapError(allocator, request_id, details[0], details[1]);
+    errdefer allocator.free(body);
+    return .{
+        .allocator = allocator,
+        .status = details[2],
+        .body = body,
+        .content_type = try allocator.dupe(u8, "application/json; charset=utf-8"),
+        .retry_after_seconds = switch (details[2]) {
+            .too_many_requests, .service_unavailable => 1,
+            else => null,
+        },
+    };
 }
 
 fn makeErrorResponse(
@@ -1561,14 +2042,69 @@ const FakeBackend = struct {
     }
 };
 
-test "canonical API route table has all 49 contract operations" {
-    try std.testing.expectEqual(@as(usize, 49), canonicalRoutes().len);
+const test_bootstrap_archives = [_]bootstrap_assets.Archive{
+    .{
+        .target = "x86_64-linux-musl",
+        .file = "ntip-node-v0.2.0-x86_64-linux-musl.tar.gz",
+        .sha256 = "a" ** 64,
+        .size_bytes = 1_024,
+    },
+    .{
+        .target = "aarch64-linux-musl",
+        .file = "ntip-node-v0.2.0-aarch64-linux-musl.tar.gz",
+        .sha256 = "b" ** 64,
+        .size_bytes = 2_048,
+    },
+};
+
+const test_bootstrap_manifest: bootstrap_assets.Manifest = .{
+    .schema_version = 1,
+    .version = "0.2.0",
+    .archives = &test_bootstrap_archives,
+};
+
+const BootstrapFakeBackend = struct {
+    called: bool = false,
+
+    fn asBackend(self: *BootstrapFakeBackend) Backend {
+        return .{ .context = self, .exchangeFn = exchange };
+    }
+
+    fn exchange(
+        context: *anyopaque,
+        allocator: Allocator,
+        _: Io,
+        request: service_ipc.Request,
+    ) !OwnedHttpResponse {
+        const self: *BootstrapFakeBackend = @ptrCast(@alignCast(context));
+        self.called = true;
+        try std.testing.expectEqualStrings("enrollment.bootstrap.redeem", request.operation);
+        try std.testing.expect(request.payload.object.get("sessionToken") == null);
+        try std.testing.expect(request.payload.object.get("origin") == null);
+        const body = request.payload.object.get("body") orelse return error.InvalidBody;
+        try std.testing.expectEqualStrings("ABCDEFGH", body.object.get("bootstrapId").?.string);
+        try std.testing.expectEqualStrings("ABC-DEF-GHJ", body.object.get("secretCode").?.string);
+        return OwnedHttpResponse.fromStatic(
+            allocator,
+            .ok,
+            "{\"schemaVersion\":1,\"bootstrapId\":\"ABCDEFGH\",\"nodeName\":\"node-a\",\"masterEndpoint\":\"192.0.2.1:49152\",\"expiresAt\":\"2026-07-22T19:00:00Z\",\"enrollmentCredential\":\"ntip-enroll-v1." ++ ("A" ** 107) ++ "\"}",
+            "application/json; charset=utf-8",
+        );
+    }
+};
+
+test "canonical API route table has all 52 contract operations" {
+    try std.testing.expectEqual(@as(usize, 52), canonicalRoutes().len);
     const initialized = try http.Router.init(canonicalRoutes());
     const enrollment = try initialized.resolve(
         .POST,
-        "/api/v1/nodes/11111111111111111111111111111111/enrollment-credentials",
+        "/api/v1/nodes/11111111111111111111111111111111/enrollment-bootstrap",
     );
-    try std.testing.expectEqualStrings("enrollment.credential.issue", enrollment.matched.route.operation);
+    try std.testing.expectEqualStrings("enrollment.bootstrap.replace", enrollment.matched.route.operation);
+    const create = try initialized.resolve(.POST, "/api/v1/nodes/actions/bootstrap");
+    try std.testing.expectEqualStrings("enrollment.bootstrap.create_node", create.matched.route.operation);
+    try std.testing.expect(!policyFor("enrollment.bootstrap.create_node").?.if_match);
+    try std.testing.expect(policyFor("enrollment.bootstrap.replace").?.if_match);
     const delete_vnr = try initialized.resolve(.DELETE, "/api/v1/vnrs/office");
     try std.testing.expectEqualStrings("inventory.vnr.delete", delete_vnr.matched.route.operation);
     try std.testing.expect(policyFor("operations.audit.prune").?.if_match);
@@ -1755,6 +2291,8 @@ test "production listener and Unix backend entry points typecheck" {
             .schema_version = api_config.schema_version,
             .bind_address = "192.0.2.1",
             .public_https_origin = "https://ntip.example.test",
+            .bootstrap_spki_pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            .bootstrap_manifest_path = "/etc/ntip/bootstrap-assets.json",
         },
         OpenApiProvider.fromFixedDocument(&document),
     ));
@@ -1913,6 +2451,128 @@ test "buffered and streaming bridges preserve service field violations" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"violations\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"code\":\"address_in_use\"") != null);
+}
+
+test "public installer is locator specific pinned complete and mutation last" {
+    var fake: FakeBackend = .{};
+    const document = FixedDocument{ .bytes = "{}" };
+    const handler: Handler = .{
+        .public_https_origin = "https://192.0.2.1",
+        .bootstrap_spki_pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        .bootstrap_manifest = test_bootstrap_manifest,
+        .openapi = OpenApiProvider.fromFixedDocument(&document),
+        .backend = fake.asBackend(),
+    };
+    const parsed = try http.parseRequest(
+        "GET /enrollment/ABCDEFGH HTTP/1.1\r\nHost: 192.0.2.1\r\nCookie: ignored=yes\r\n\r\n",
+    );
+    var response = try handler.dispatch(
+        std.testing.allocator,
+        std.testing.io,
+        &parsed.request,
+        "0123456789abcdef0123456789abcdef",
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expectEqualStrings("text/x-shellscript; charset=utf-8", response.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "readonly bootstrap_id='ABCDEFGH'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "readonly spki_pin='sha256//AAAAAAAA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, test_bootstrap_archives[0].sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "@NTIP_") == null);
+    try std.testing.expect(std.mem.endsWith(u8, response.body, "\nmain \"$@\"\n"));
+    try std.testing.expect(!fake.called);
+
+    const with_origin = try http.parseRequest(
+        "GET /enrollment/ABCDEFGH HTTP/1.1\r\nHost: 192.0.2.1\r\nOrigin: https://192.0.2.1\r\n\r\n",
+    );
+    try std.testing.expectError(error.InvalidBootstrapRequest, handler.dispatch(
+        std.testing.allocator,
+        std.testing.io,
+        &with_origin.request,
+        "0123456789abcdef0123456789abcdef",
+    ));
+}
+
+test "public redemption is strict anonymous bounded and receives immutable archives" {
+    var fake: BootstrapFakeBackend = .{};
+    var active = std.atomic.Value(u32).init(0);
+    const document = FixedDocument{ .bytes = "{}" };
+    const handler: Handler = .{
+        .public_https_origin = "https://192.0.2.1",
+        .bootstrap_spki_pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        .bootstrap_manifest = test_bootstrap_manifest,
+        .anonymous_redemptions = &active,
+        .openapi = OpenApiProvider.fromFixedDocument(&document),
+        .backend = fake.asBackend(),
+    };
+    const body = "{\"bootstrapId\":\"ABCDEFGH\",\"secretCode\":\"ABC-DEF-GHJ\"}";
+    const request_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /enrollment/v1/redeem HTTP/1.1\r\nHost: 192.0.2.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer std.testing.allocator.free(request_bytes);
+    const parsed = try http.parseRequest(request_bytes);
+    var response = try handler.dispatch(
+        std.testing.allocator,
+        std.testing.io,
+        &parsed.request,
+        "0123456789abcdef0123456789abcdef",
+    );
+    defer response.deinit();
+    try std.testing.expect(fake.called);
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expectEqual(@as(u32, 0), active.load(.seq_cst));
+    var bundle = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer bundle.deinit();
+    try std.testing.expectEqual(@as(usize, 2), bundle.value.object.get("archives").?.array.items.len);
+    try std.testing.expectEqualStrings(
+        "/enrollment/assets/ntip-node-v0.2.0-x86_64-linux-musl.tar.gz",
+        bundle.value.object.get("archives").?.array.items[0].object.get("path").?.string,
+    );
+    try std.testing.expectEqualStrings("ABCDEFGH", bundle.value.object.get("bootstrapId").?.string);
+
+    const unknown_body = "{\"bootstrapId\":\"ABCDEFGH\",\"secretCode\":\"ABC-DEF-GHJ\",\"extra\":true}";
+    const unknown_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /enrollment/v1/redeem HTTP/1.1\r\nHost: 192.0.2.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ unknown_body.len, unknown_body },
+    );
+    defer std.testing.allocator.free(unknown_bytes);
+    const unknown = try http.parseRequest(unknown_bytes);
+    try std.testing.expectError(error.InvalidBootstrapRequest, handler.dispatch(
+        std.testing.allocator,
+        std.testing.io,
+        &unknown.request,
+        "0123456789abcdef0123456789abcdef",
+    ));
+
+    active.store(maximum_anonymous_redemptions, .seq_cst);
+    try std.testing.expectError(error.BootstrapRedemptionBusy, handler.dispatch(
+        std.testing.allocator,
+        std.testing.io,
+        &parsed.request,
+        "0123456789abcdef0123456789abcdef",
+    ));
+}
+
+test "public bootstrap errors keep the separate stable envelope" {
+    const parsed = try http.parseRequest(
+        "POST /enrollment/v1/redeem HTTP/1.1\r\nHost: ntip.test\r\nContent-Length: 0\r\n\r\n",
+    );
+    var response = try responseForDispatchFailure(
+        std.testing.allocator,
+        &parsed.request,
+        "0123456789abcdef0123456789abcdef",
+        error.BootstrapRedemptionBusy,
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(http.Status.too_many_requests, response.status);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"rate_limited\",\"message\":\"Bootstrap redemption is temporarily rate limited.\"},\"requestId\":\"0123456789abcdef0123456789abcdef\"}",
+        response.body,
+    );
+    try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
 }
 
 fn expectSecurelyZeroed(bytes: []const u8) !void {

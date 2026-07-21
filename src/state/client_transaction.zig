@@ -9,16 +9,19 @@
 const std = @import("std");
 const atomic = @import("atomic_file.zig");
 const client = @import("client.zig");
+const client_bootstrap = @import("client_bootstrap.zig");
 const config = @import("config.zig");
 const secret_store = @import("secret_store.zig");
 const credential = @import("../protocol/credential.zig");
 
 const magic = "NTIPCTXN";
-const format_version: u8 = 1;
+const legacy_format_version: u8 = 1;
+const bootstrap_format_version: u8 = 2;
 const header_len: usize = 16;
 const digest_len: usize = 32;
 pub const intent_file = "reconfigure.pending";
-pub const maximum_intent_bytes = header_len + config.max_config_bytes + credential.text_len + digest_len;
+pub const maximum_intent_bytes = header_len + config.max_config_bytes + credential.text_len +
+    client_bootstrap.bootstrap_id_len + digest_len;
 
 pub const FaultPoint = enum {
     none,
@@ -27,6 +30,7 @@ pub const FaultPoint = enum {
     after_config,
     after_identity_delete,
     after_state,
+    after_bootstrap_marker,
 };
 
 pub fn commit(
@@ -37,7 +41,7 @@ pub fn commit(
     config_bytes: []const u8,
     credential_text: []const u8,
 ) !void {
-    return commitFaultInjected(allocator, io, dir, config_path, config_bytes, credential_text, .none);
+    return commitInternal(allocator, io, dir, config_path, config_bytes, credential_text, null, .none);
 }
 
 pub fn commitFaultInjected(
@@ -49,8 +53,69 @@ pub fn commitFaultInjected(
     credential_text: []const u8,
     fault: FaultPoint,
 ) !void {
+    return commitInternal(allocator, io, dir, config_path, config_bytes, credential_text, null, fault);
+}
+
+/// Atomically imports one management-issued bootstrap ticket. The ticket ID
+/// is deliberately non-secret, but it participates in the same checksummed
+/// intent as the configuration and enrollment credential so interrupted
+/// imports can only recover to one coherent local state.
+pub fn commitBootstrap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    config_path: []const u8,
+    config_bytes: []const u8,
+    credential_text: []const u8,
+    bootstrap_id: [client_bootstrap.bootstrap_id_len]u8,
+) !void {
+    return commitInternal(
+        allocator,
+        io,
+        dir,
+        config_path,
+        config_bytes,
+        credential_text,
+        bootstrap_id,
+        .none,
+    );
+}
+
+pub fn commitBootstrapFaultInjected(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    config_path: []const u8,
+    config_bytes: []const u8,
+    credential_text: []const u8,
+    bootstrap_id: [client_bootstrap.bootstrap_id_len]u8,
+    fault: FaultPoint,
+) !void {
+    return commitInternal(
+        allocator,
+        io,
+        dir,
+        config_path,
+        config_bytes,
+        credential_text,
+        bootstrap_id,
+        fault,
+    );
+}
+
+fn commitInternal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    config_path: []const u8,
+    config_bytes: []const u8,
+    credential_text: []const u8,
+    bootstrap_id: ?[client_bootstrap.bootstrap_id_len]u8,
+    fault: FaultPoint,
+) !void {
     try validatePayload(allocator, config_bytes, credential_text);
-    const intent = try encodeIntent(allocator, config_bytes, credential_text);
+    if (bootstrap_id) |id| _ = try client_bootstrap.parseId(&id);
+    const intent = try encodeIntent(allocator, config_bytes, credential_text, bootstrap_id);
     defer {
         std.crypto.secureZero(u8, intent);
         allocator.free(intent);
@@ -108,6 +173,13 @@ pub fn recoverFaultInjected(
     try (client.File{ .dir = dir }).save(allocator, io, .{});
     if (fault == .after_state) return error.InjectedFailure;
 
+    if (decoded.bootstrap_id) |bootstrap_id| {
+        try client_bootstrap.saveMarker(dir, io, bootstrap_id.*);
+    } else {
+        try client_bootstrap.deleteMarker(dir, io);
+    }
+    if (fault == .after_bootstrap_marker) return error.InjectedFailure;
+
     try atomic.deleteDurable(dir, io, intent_file);
     return true;
 }
@@ -115,9 +187,15 @@ pub fn recoverFaultInjected(
 const Intent = struct {
     config: []const u8,
     credential: []const u8,
+    bootstrap_id: ?*const [client_bootstrap.bootstrap_id_len]u8,
 };
 
-fn encodeIntent(allocator: std.mem.Allocator, config_bytes: []const u8, credential_text: []const u8) ![]u8 {
+fn encodeIntent(
+    allocator: std.mem.Allocator,
+    config_bytes: []const u8,
+    credential_text: []const u8,
+    bootstrap_id: ?[client_bootstrap.bootstrap_id_len]u8,
+) ![]u8 {
     if (config_bytes.len == 0 or config_bytes.len > config.max_config_bytes or
         credential_text.len != credential.text_len)
     {
@@ -125,17 +203,24 @@ fn encodeIntent(allocator: std.mem.Allocator, config_bytes: []const u8, credenti
     }
     const payload_end = std.math.add(usize, header_len, config_bytes.len) catch return error.ClientTransactionPayloadTooLarge;
     const credential_end = std.math.add(usize, payload_end, credential_text.len) catch return error.ClientTransactionPayloadTooLarge;
-    const total = std.math.add(usize, credential_end, digest_len) catch return error.ClientTransactionPayloadTooLarge;
+    const marker_end = std.math.add(
+        usize,
+        credential_end,
+        if (bootstrap_id == null) 0 else client_bootstrap.bootstrap_id_len,
+    ) catch return error.ClientTransactionPayloadTooLarge;
+    const total = std.math.add(usize, marker_end, digest_len) catch return error.ClientTransactionPayloadTooLarge;
     if (total > maximum_intent_bytes) return error.ClientTransactionPayloadTooLarge;
 
     const bytes = try allocator.alloc(u8, total);
     @memcpy(bytes[0..8], magic);
-    bytes[8] = format_version;
-    @memset(bytes[9..12], 0);
+    bytes[8] = if (bootstrap_id == null) legacy_format_version else bootstrap_format_version;
+    bytes[9] = if (bootstrap_id == null) 0 else client_bootstrap.bootstrap_id_len;
+    @memset(bytes[10..12], 0);
     std.mem.writeInt(u32, bytes[12..16], @intCast(config_bytes.len), .big);
     @memcpy(bytes[header_len..payload_end], config_bytes);
     @memcpy(bytes[payload_end..credential_end], credential_text);
-    std.crypto.hash.blake2.Blake2s256.hash(bytes[0..credential_end], bytes[credential_end..][0..digest_len], .{});
+    if (bootstrap_id) |id| @memcpy(bytes[credential_end..marker_end], &id);
+    std.crypto.hash.blake2.Blake2s256.hash(bytes[0..marker_end], bytes[marker_end..][0..digest_len], .{});
     return bytes;
 }
 
@@ -144,23 +229,45 @@ fn decodeIntent(bytes: []const u8) !Intent {
         return error.InvalidClientTransaction;
     }
     if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidClientTransaction;
-    if (bytes[8] != format_version) return error.UnsupportedClientTransactionVersion;
-    if (!std.mem.eql(u8, bytes[9..12], &([_]u8{0} ** 3))) return error.InvalidClientTransaction;
+    const marker_len: usize = switch (bytes[8]) {
+        legacy_format_version => blk: {
+            if (!std.mem.eql(u8, bytes[9..12], &([_]u8{0} ** 3))) return error.InvalidClientTransaction;
+            break :blk 0;
+        },
+        bootstrap_format_version => blk: {
+            if (bytes[9] != client_bootstrap.bootstrap_id_len or
+                !std.mem.eql(u8, bytes[10..12], &([_]u8{0} ** 2)))
+            {
+                return error.InvalidClientTransaction;
+            }
+            break :blk client_bootstrap.bootstrap_id_len;
+        },
+        else => return error.UnsupportedClientTransactionVersion,
+    };
     const config_len: usize = std.mem.readInt(u32, bytes[12..16], .big);
     if (config_len == 0 or config_len > config.max_config_bytes) return error.InvalidClientTransaction;
     const config_end = std.math.add(usize, header_len, config_len) catch return error.InvalidClientTransaction;
     const credential_end = std.math.add(usize, config_end, credential.text_len) catch return error.InvalidClientTransaction;
-    if (credential_end + digest_len != bytes.len) return error.InvalidClientTransaction;
+    const marker_end = std.math.add(usize, credential_end, marker_len) catch return error.InvalidClientTransaction;
+    if (marker_end + digest_len != bytes.len) return error.InvalidClientTransaction;
 
     var expected: [digest_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &expected);
-    std.crypto.hash.blake2.Blake2s256.hash(bytes[0..credential_end], &expected, .{});
-    if (!std.crypto.timing_safe.eql([digest_len]u8, expected, bytes[credential_end..][0..digest_len].*)) {
+    std.crypto.hash.blake2.Blake2s256.hash(bytes[0..marker_end], &expected, .{});
+    if (!std.crypto.timing_safe.eql([digest_len]u8, expected, bytes[marker_end..][0..digest_len].*)) {
         return error.InvalidClientTransactionDigest;
     }
+    const bootstrap_id = if (marker_len == 0)
+        null
+    else blk: {
+        const id: *const [client_bootstrap.bootstrap_id_len]u8 = @ptrCast(bytes[credential_end..marker_end].ptr);
+        _ = client_bootstrap.parseId(id) catch return error.InvalidClientTransaction;
+        break :blk id;
+    };
     return .{
         .config = bytes[header_len..config_end],
         .credential = bytes[config_end..credential_end],
+        .bootstrap_id = bootstrap_id,
     };
 }
 
@@ -283,6 +390,108 @@ test "crashes at every Node reconfiguration boundary recover one complete replac
     }
 }
 
+test "bootstrap import recovers config credential empty state and ticket marker together" {
+    inline for (.{
+        FaultPoint.after_intent,
+        .after_token,
+        .after_config,
+        .after_identity_delete,
+        .after_state,
+        .after_bootstrap_marker,
+    }) |fault| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer std.testing.allocator.free(root);
+        const config_path = try std.fs.path.join(std.testing.allocator, &.{ root, "client.json" });
+        defer std.testing.allocator.free(config_path);
+
+        const old_key = [_]u8{0x77} ** 32;
+        const secrets: secret_store.FileSecretStore = .{ .dir = tmp.dir };
+        try secrets.write(std.testing.allocator, std.testing.io, "identity.key", .identity_key, &old_key);
+        try (client.File{ .dir = tmp.dir }).save(std.testing.allocator, std.testing.io, .{
+            .generation = 9,
+            .enrollment_state = .enrolled,
+            .node_id = .{ .bytes = .{0x22} ** 16 },
+            .assigned_address = try @import("../domain/model.zig").Ipv4.parse("10.1.0.2"),
+            .vnr_range = try @import("../domain/model.zig").Cidr.parse("10.1.0.0/24"),
+        });
+
+        const master_public = [_]u8{0x33} ** 32;
+        const new_config = try config.encodeClient(std.testing.allocator, "master.example:49152", "node01", master_public);
+        defer std.testing.allocator.free(new_config);
+        var enrollment = credential.Credential{
+            .handle = .{0x11} ** 16,
+            .secret = .{0x22} ** 32,
+            .master_public = master_public,
+        };
+        defer enrollment.deinit();
+        var credential_buffer: [credential.text_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &credential_buffer);
+        const credential_text = enrollment.encode(&credential_buffer);
+        const bootstrap_id = try client_bootstrap.parseId("ABC23456");
+
+        try std.testing.expectError(error.InjectedFailure, commitBootstrapFaultInjected(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            config_path,
+            new_config,
+            credential_text,
+            bootstrap_id,
+            fault,
+        ));
+        try std.testing.expect(try recover(std.testing.allocator, std.testing.io, tmp.dir, config_path));
+        try std.testing.expect(!(try recover(std.testing.allocator, std.testing.io, tmp.dir, config_path)));
+
+        const persisted_id = (try client_bootstrap.loadMarker(std.testing.allocator, tmp.dir, std.testing.io)).?;
+        try std.testing.expectEqualSlices(u8, &bootstrap_id, &persisted_id);
+        const marker_stat = try tmp.dir.statFile(std.testing.io, client_bootstrap.marker_file, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), marker_stat.permissions.toMode() & 0o777);
+        const stored = try secrets.load(std.testing.allocator, std.testing.io, "enrollment.token", .enrollment_token);
+        defer {
+            std.crypto.secureZero(u8, stored);
+            std.testing.allocator.free(stored);
+        }
+        try std.testing.expectEqualStrings(credential_text, stored);
+        const persisted_state = try (client.File{ .dir = tmp.dir }).loadOrEmpty(std.testing.allocator, std.testing.io);
+        try std.testing.expectEqual(@as(u64, 0), persisted_state.generation);
+        try std.testing.expect(persisted_state.node_id == null);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "identity.key", .{ .follow_symlinks = false }));
+    }
+}
+
+test "ordinary Node reconfiguration revokes a prior bootstrap ticket marker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ root, "client.json" });
+    defer std.testing.allocator.free(config_path);
+    try client_bootstrap.saveMarker(tmp.dir, std.testing.io, try client_bootstrap.parseId("ABC23456"));
+
+    const master_public = [_]u8{0x33} ** 32;
+    const config_bytes = try config.encodeClient(std.testing.allocator, "master.example:49152", "node01", master_public);
+    defer std.testing.allocator.free(config_bytes);
+    var enrollment = credential.Credential{
+        .handle = .{0x11} ** 16,
+        .secret = .{0x22} ** 32,
+        .master_public = master_public,
+    };
+    defer enrollment.deinit();
+    var credential_buffer: [credential.text_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &credential_buffer);
+    try commit(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        config_path,
+        config_bytes,
+        enrollment.encode(&credential_buffer),
+    );
+    try std.testing.expect((try client_bootstrap.loadMarker(std.testing.allocator, tmp.dir, std.testing.io)) == null);
+}
+
 test "malformed or newer Node reconfiguration intent fails closed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -321,7 +530,7 @@ test "malformed or newer Node reconfiguration intent fails closed" {
         std.crypto.secureZero(u8, intent);
         std.testing.allocator.free(intent);
     }
-    intent[8] = format_version + 1;
+    intent[8] = bootstrap_format_version + 1;
     try atomic.replace(tmp.dir, std.testing.io, intent_file, intent, atomic.private_file_permissions);
     try std.testing.expectError(
         error.UnsupportedClientTransactionVersion,

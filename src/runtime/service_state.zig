@@ -10,6 +10,7 @@
 const std = @import("std");
 const model = @import("../domain/model.zig");
 const credential_protocol = @import("../protocol/credential.zig");
+const client_bootstrap = @import("../state/client_bootstrap.zig");
 const client_state = @import("../state/client.zig");
 const enrollments = @import("../state/enrollments.zig");
 const atomic = @import("../state/atomic_file.zig");
@@ -21,8 +22,8 @@ const handshake = @import("handshake_coordinator.zig");
 pub const enrollment_token_file = "enrollment.token";
 
 /// Normal startup invokes this after loading a durably enrolled assignment so
-/// a crash between the enrolled-state sync and one-time-token deletion cannot
-/// preserve a consumed bearer credential indefinitely.
+/// a crash between the enrolled-state sync and one-time-material deletion
+/// cannot preserve a consumed bearer credential or a resumable ticket marker.
 pub fn cleanupConsumedEnrollmentToken(
     io: std.Io,
     dir: std.Io.Dir,
@@ -33,6 +34,7 @@ pub fn cleanupConsumedEnrollmentToken(
         error.FileNotFound => {},
         else => return err,
     };
+    try client_bootstrap.deleteMarker(dir, io);
 }
 
 /// Injectable only so expiry boundaries can be tested deterministically.  A
@@ -677,6 +679,7 @@ test "Node persistence stages strictly and completes lost acknowledgement idempo
         .enrollment_token,
         credential.encode(&text),
     );
+    try client_bootstrap.saveMarker(tmp.dir, std.testing.io, try client_bootstrap.parseId("ABC23456"));
     var state: client_state.PersistentState = .{};
     var adapter = try NodePersistenceAdapter.init(std.testing.allocator, std.testing.io, tmp.dir, &state, master_public);
     const assignment: handshake.EnrollmentAssignment = .{
@@ -716,6 +719,7 @@ test "Node persistence stages strictly and completes lost acknowledgement idempo
             .enrollment_token,
         ),
     );
+    try std.testing.expect((try client_bootstrap.loadMarker(std.testing.allocator, tmp.dir, std.testing.io)) == null);
     try restarted.interface().completeEnrollment(assignment.node_uuid);
 }
 

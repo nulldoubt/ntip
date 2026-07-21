@@ -144,7 +144,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils file jq python3-venv
+          sudo apt-get install -y binutils file jq nginx openssl python3-venv
       - run: zig build cross
       - name: Two clean reproducible release builds and archives
         run: |
@@ -157,6 +157,10 @@ jobs:
             | tee artifacts/installer-isolation.txt
           python3 scripts/check-secret-exposure.py --archives dist/*.tar.gz \
             | tee artifacts/secret-exposure.txt
+          ./scripts/check-bootstrap-assets-install.sh \
+            | tee artifacts/bootstrap-assets-install.txt
+          ./scripts/check-nginx-bootstrap-config.sh \
+            | tee artifacts/nginx-bootstrap-config.txt
       - name: Validate SPDX with the official SPDX Python tools
         run: |
           python3 -m venv "$RUNNER_TEMP/spdx-tools"
@@ -229,6 +233,9 @@ jobs:
           export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           version=$(./scripts/check-version.sh)
           ./scripts/package-release.sh "$version" x86_64-linux-musl
+          ./scripts/package-node-release.sh "$version" x86_64-linux-musl
+          ./scripts/package-node-release.sh "$version" aarch64-linux-musl
+          ./scripts/package-bootstrap-assets.sh "$version"
           mkdir -p artifacts
           python3 scripts/check-release-archive.py \
             "$version" x86_64-linux-musl \
@@ -240,6 +247,11 @@ jobs:
             "dist/ntip-api-v$version-x86_64-linux-musl.tar.gz" \
             --require-native-execution \
             | tee artifacts/native-api-package-x86_64.txt
+          python3 scripts/check-release-archive.py \
+            "$version" x86_64-linux-musl \
+            "dist/ntip-node-v$version-x86_64-linux-musl.tar.gz" \
+            --require-native-execution \
+            | tee artifacts/native-node-package-x86_64.txt
           bun install --frozen-lockfile
           bun run dashboard:build
           ./scripts/package-dashboard-release.sh "$version" x86_64-linux
@@ -252,6 +264,10 @@ jobs:
         run: |
           sudo ./scripts/install.sh
           sudo ./scripts/install-api.sh
+          bootstrap_extract="$RUNNER_TEMP/ntip-bootstrap-assets-package"
+          mkdir -p "$bootstrap_extract"
+          tar -xzf dist/ntip-bootstrap-assets-v*.tar.gz -C "$bootstrap_extract"
+          sudo "$bootstrap_extract"/ntip-bootstrap-assets-v*/scripts/install-bootstrap-assets.sh
           dashboard_extract="$RUNNER_TEMP/ntip-dashboard-package"
           mkdir -p "$dashboard_extract"
           tar -xzf dist/ntip-dashboard-v*-x86_64-linux.tar.gz -C "$dashboard_extract"
@@ -345,6 +361,9 @@ jobs:
           export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           version=$(./scripts/check-version.sh)
           ./scripts/package-release.sh "$version" aarch64-linux-musl
+          ./scripts/package-node-release.sh "$version" x86_64-linux-musl
+          ./scripts/package-node-release.sh "$version" aarch64-linux-musl
+          ./scripts/package-bootstrap-assets.sh "$version"
           mkdir -p artifacts
           python3 scripts/check-release-archive.py \
             "$version" aarch64-linux-musl \
@@ -356,6 +375,11 @@ jobs:
             "dist/ntip-api-v$version-aarch64-linux-musl.tar.gz" \
             --require-native-execution \
             | tee artifacts/native-api-package-aarch64.txt
+          python3 scripts/check-release-archive.py \
+            "$version" aarch64-linux-musl \
+            "dist/ntip-node-v$version-aarch64-linux-musl.tar.gz" \
+            --require-native-execution \
+            | tee artifacts/native-node-package-aarch64.txt
           bun install --frozen-lockfile
           bun run dashboard:build
           ./scripts/package-dashboard-release.sh "$version" aarch64-linux
@@ -368,6 +392,10 @@ jobs:
         run: |
           sudo ./scripts/install.sh
           sudo ./scripts/install-api.sh
+          bootstrap_extract="$RUNNER_TEMP/ntip-bootstrap-assets-package"
+          mkdir -p "$bootstrap_extract"
+          tar -xzf dist/ntip-bootstrap-assets-v*.tar.gz -C "$bootstrap_extract"
+          sudo "$bootstrap_extract"/ntip-bootstrap-assets-v*/scripts/install-bootstrap-assets.sh
           dashboard_extract="$RUNNER_TEMP/ntip-dashboard-package"
           mkdir -p "$dashboard_extract"
           tar -xzf dist/ntip-dashboard-v*-aarch64-linux.tar.gz -C "$dashboard_extract"

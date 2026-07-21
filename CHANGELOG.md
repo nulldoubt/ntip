@@ -27,6 +27,10 @@ Development version: `0.2.0-dev`.
   fallback. Zig core/API artifacts remain static-musl.
 - Cross-root dashboard reproducibility checks plus a direct standalone Bun
   launcher for local, browser-test, and packaged production startup.
+- One-command Node bootstrap with short-lived locator/code invitations, pinned
+  HTTPS redemption, crash-recoverable `ntcl bootstrap-import`, Node-only
+  static-musl archives, and a Master bootstrap-assets package for both Linux
+  architectures.
 - Initial `ntsrv` and `ntcl` project structure for Zig 0.16.0.
 - Versioned NTIP wire and local IPC contracts.
 - VNR, Node, routed-prefix, enrollment, and persistent-state model.
@@ -53,6 +57,10 @@ Development version: `0.2.0-dev`.
   rejected preview compatibility cookies before routing. Draft Mode and Server
   Actions remain forbidden and are covered by source, generated-artifact,
   browser, and packaged-launcher gates.
+- Removed operator-facing issuance and download of the 122-character internal
+  enrollment credential. Bootstrap codes are never stored, invitation
+  redemption is throttled and indistinguishable on public failure, and every
+  installer transfer is authenticated by the configured HTTPS SPKI pin.
 - Made idempotent mutation, immutable audit, and consumed-marker persistence
   one SQLite commit; revoked or expired sessions can no longer retrieve cached
   mutation responses.

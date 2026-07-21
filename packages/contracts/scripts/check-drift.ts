@@ -1,6 +1,10 @@
-import { renderGeneratedArtifacts, validateContract } from "./contract.ts";
+import {
+  renderGeneratedArtifacts,
+  validateBootstrapContract,
+  validateContract,
+} from "./contract.ts";
 
-await validateContract();
+await Promise.all([validateContract(), validateBootstrapContract()]);
 
 const drifted: string[] = [];
 for (const artifact of await renderGeneratedArtifacts()) {
@@ -15,4 +19,4 @@ if (drifted.length > 0) {
   process.exit(1);
 }
 
-console.log("Generated NTIP contract artifacts match openapi/ntip-v1.yaml.");
+console.log("Generated NTIP contract artifacts match both canonical OpenAPI documents.");

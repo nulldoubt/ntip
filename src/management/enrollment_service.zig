@@ -13,6 +13,7 @@ const credential_mod = @import("../protocol/credential.zig");
 const management_repository = @import("../state/management_repository.zig");
 const sqlite = @import("../state/sqlite.zig");
 const auth = @import("auth.zig");
+const bootstrap_service = @import("bootstrap_service.zig");
 const settings = @import("settings.zig");
 const inventory_service = @import("inventory_service.zig");
 const security_policy = @import("security_policy.zig");
@@ -32,6 +33,15 @@ const enrollment_projection_sql =
 pub const NodeRecord = inventory_service.NodeRecord;
 pub const ResourceEtag = inventory_service.ResourceEtag;
 pub const Callbacks = inventory_service.Callbacks;
+
+pub const BootstrapResult = struct {
+    node: NodeRecord,
+    bootstrap: bootstrap_service.IssuedBootstrap,
+
+    pub fn clear(self: *BootstrapResult) void {
+        self.bootstrap.clear();
+    }
+};
 
 pub const Principal = struct {
     user_id: [16]u8,
@@ -94,7 +104,9 @@ pub const Service = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     master_public: [32]u8,
+    bootstrap: ?*bootstrap_service.Service = null,
     callbacks: Callbacks = .{},
+    maximum_nodes_source: ?*const u32 = null,
 
     pub fn init(
         repository: *management_repository.Repository,
@@ -116,6 +128,188 @@ pub const Service = struct {
             .master_public = master_public,
             .callbacks = callbacks,
         };
+    }
+
+    pub fn setBootstrapService(self: *Service, bootstrap: *bootstrap_service.Service) void {
+        self.bootstrap = bootstrap;
+    }
+
+    pub fn setMaximumNodesSource(self: *Service, source: *const u32) void {
+        self.maximum_nodes_source = source;
+    }
+
+    /// Creates inventory and its bootstrap invitation in one SQLite commit.
+    /// Create-time dangerous validation deliberately omits an ETag because the
+    /// resource does not exist yet; current inventory invariants remain the
+    /// authoritative transaction precondition.
+    pub fn createNodeBootstrap(
+        self: *Service,
+        principal: Principal,
+        context: RequestContext,
+        input: inventory_service.CreateNodeInput,
+        configured_lifetime_seconds: u64,
+    ) !BootstrapResult {
+        try validateMutation(principal, context);
+        _ = try context.requireIdempotency();
+        try validateCreateDangerous(principal, context, input.name);
+        const bootstrap = self.bootstrap orelse return error.OperationUnavailable;
+        const maximum_nodes = if (self.maximum_nodes_source) |source|
+            source.*
+        else
+            (settings.OperationalSettings{}).maximum_nodes;
+        const admission_capacity = @min(maximum_nodes, try self.repository.nodeAdmissionCapacity());
+        if (self.live.nodes.items.len >= admission_capacity) return error.MaximumNodesExceeded;
+
+        var id = model.NodeId.generate(self.io);
+        while (self.live.findNodeById(id) != null) id = model.NodeId.generate(self.io);
+        var candidate = try cloneStore(self.allocator, self.live);
+        defer candidate.deinit();
+        try candidate.createNode(id, input.name, input.vnr, input.address);
+        const node: NodeRecord = .{
+            .id = id,
+            .name = model.Name.parse(input.name) catch unreachable,
+            .vnr = model.Name.parse(input.vnr) catch unreachable,
+            .address = input.address,
+            .enrollment_state = .credential_issued,
+            .revision = 1,
+            .created_at = context.occurred_at,
+            .updated_at = context.occurred_at,
+        };
+        const audit_details = try encodeAuditDetails(self.allocator, principal);
+        defer self.allocator.free(audit_details);
+        var resource_id: [32]u8 = undefined;
+        var issued = try bootstrap.createWithInventory(
+            &candidate,
+            id,
+            configured_lifetime_seconds,
+            context.occurred_at,
+            self.live.generation,
+            .{
+                .id = model.NodeId.generate(self.io).bytes,
+                .occurred_at = context.occurred_at,
+                .actor_kind = .web,
+                .actor_id = principal.user_id,
+                .action = "enrollment.bootstrap.issue",
+                .resource_type = "node",
+                .resource_id = id.write(&resource_id),
+                .request_id = context.request_id,
+                .details_json = audit_details,
+            },
+        );
+        errdefer issued.clear();
+        self.installCommitted(&candidate, &.{});
+        return .{ .node = node, .bootstrap = issued };
+    }
+
+    pub fn issueNodeBootstrap(
+        self: *Service,
+        principal: Principal,
+        context: RequestContext,
+        node_id: model.NodeId,
+        configured_lifetime_seconds: u64,
+        reset_active_association: bool,
+    ) !BootstrapResult {
+        try validateMutation(principal, context);
+        _ = try context.requireIdempotency();
+        const bootstrap = self.bootstrap orelse return error.OperationUnavailable;
+        const current = try self.readNode(node_id, context.occurred_at);
+        try validateDangerous(principal, context, current);
+        if (current.enrollment_state == .enrolled and !reset_active_association) {
+            return error.NodeAlreadyEnrolled;
+        }
+
+        var candidate = try cloneStore(self.allocator, self.live);
+        defer candidate.deinit();
+        const was_enrolled = current.enrollment_state == .enrolled;
+        if (was_enrolled) {
+            try candidate.resetNodeEnrollment(current.name.slice());
+        } else {
+            try advanceGeneration(&candidate);
+        }
+        var node = current;
+        node.enrollment_state = .credential_issued;
+        node.revision = try nextRevision(current.revision);
+        node.updated_at = context.occurred_at;
+        const audit_details = try encodeAuditDetails(self.allocator, principal);
+        defer self.allocator.free(audit_details);
+        var resource_id: [32]u8 = undefined;
+        var issued = try bootstrap.issueForNode(
+            node_id,
+            configured_lifetime_seconds,
+            context.occurred_at,
+            self.live.generation,
+            reset_active_association,
+            .{
+                .id = model.NodeId.generate(self.io).bytes,
+                .occurred_at = context.occurred_at,
+                .actor_kind = .web,
+                .actor_id = principal.user_id,
+                .action = if (reset_active_association)
+                    "enrollment.bootstrap.reset"
+                else
+                    "enrollment.bootstrap.replace",
+                .resource_type = "node",
+                .resource_id = node_id.write(&resource_id),
+                .request_id = context.request_id,
+                .details_json = audit_details,
+            },
+        );
+        errdefer issued.clear();
+        const retire_ids = [_]model.NodeId{node_id};
+        self.installCommitted(&candidate, if (was_enrolled) &retire_ids else &.{});
+        return .{ .node = node, .bootstrap = issued };
+    }
+
+    pub fn revokeNodeBootstrap(
+        self: *Service,
+        principal: Principal,
+        context: RequestContext,
+        node_id: model.NodeId,
+    ) !NodeRecord {
+        try validateMutation(principal, context);
+        const bootstrap = self.bootstrap orelse return error.OperationUnavailable;
+        const current = try self.readNode(node_id, context.occurred_at);
+        try validateDangerous(principal, context, current);
+        if (current.enrollment_state == .enrolled) return error.NodeAlreadyEnrolled;
+        var candidate = try cloneStore(self.allocator, self.live);
+        defer candidate.deinit();
+        try advanceGeneration(&candidate);
+        const audit_details = try encodeAuditDetails(self.allocator, principal);
+        defer self.allocator.free(audit_details);
+        var resource_id: [32]u8 = undefined;
+        _ = try bootstrap.revokeForNode(
+            node_id,
+            context.occurred_at,
+            self.live.generation,
+            .{
+                .id = model.NodeId.generate(self.io).bytes,
+                .occurred_at = context.occurred_at,
+                .actor_kind = .web,
+                .actor_id = principal.user_id,
+                .action = "enrollment.bootstrap.revoke",
+                .resource_type = "node",
+                .resource_id = node_id.write(&resource_id),
+                .request_id = context.request_id,
+                .details_json = audit_details,
+            },
+        );
+        self.installCommitted(&candidate, &.{});
+        var result = current;
+        result.enrollment_state = .unenrolled;
+        result.revision = try nextRevision(current.revision);
+        result.updated_at = context.occurred_at;
+        return result;
+    }
+
+    pub fn redeemBootstrap(
+        self: *Service,
+        locator: []const u8,
+        code: []const u8,
+        attempted_at: i64,
+        request_id: [16]u8,
+    ) !bootstrap_service.RedeemedCredential {
+        const bootstrap = self.bootstrap orelse return error.OperationUnavailable;
+        return bootstrap.redeem(locator, code, attempted_at, request_id);
     }
 
     /// Issues or replaces the unused credential for an unenrolled Node. Only
@@ -353,6 +547,29 @@ fn validateDangerous(principal: Principal, context: RequestContext, current: Nod
         .supplied_confirmation = context.preconditions.confirmation,
         .required_confirmation = current.name.slice(),
     });
+}
+
+fn validateCreateDangerous(
+    principal: Principal,
+    context: RequestContext,
+    required_confirmation: []const u8,
+) !void {
+    if (principal.role != .superuser) return error.Forbidden;
+    const reauthenticated_at = principal.reauthenticated_at orelse
+        return error.ReauthenticationRequired;
+    if (reauthenticated_at < 0 or context.occurred_at < reauthenticated_at) {
+        return error.InvalidTimestamp;
+    }
+    if (!auth.recentlyReauthenticated(
+        @intCast(reauthenticated_at),
+        @intCast(context.occurred_at),
+    )) return error.ReauthenticationRequired;
+    const confirmation = context.preconditions.confirmation orelse
+        return error.ConfirmationRequired;
+    if (!std.mem.eql(u8, confirmation, required_confirmation)) {
+        return error.ConfirmationFailed;
+    }
+    if (context.preconditions.etag != null) return error.InvalidPrecondition;
 }
 
 fn validateAuditText(value: ?[]const u8, maximum: usize) !void {

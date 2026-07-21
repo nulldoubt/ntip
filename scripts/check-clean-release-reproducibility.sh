@@ -73,13 +73,19 @@ for pass in 1 2; do
         for target in x86_64-linux-musl aarch64-linux-musl; do
             NTIP_RELEASE_DIR="$prefix/release" \
                 ./scripts/package-release.sh "$version" "$target"
+            NTIP_RELEASE_DIR="$prefix/release" \
+                ./scripts/package-node-release.sh "$version" "$target"
             python3 scripts/check-release-archive.py \
                 "$version" "$target" \
                 "dist/ntip-v$version-$target.tar.gz"
             python3 scripts/check-release-archive.py \
                 "$version" "$target" \
                 "dist/ntip-api-v$version-$target.tar.gz"
+            python3 scripts/check-release-archive.py \
+                "$version" "$target" \
+                "dist/ntip-node-v$version-$target.tar.gz"
         done
+        ./scripts/package-bootstrap-assets.sh "$version"
     )
     echo "clean_release_build=completed pass=$pass"
 done
@@ -99,7 +105,8 @@ for target in x86_64-linux-musl aarch64-linux-musl; do
         fi
     done
     api_base=ntip-api-v$version-$target
-    for artifact_base in "$base" "$api_base"; do
+    node_base=ntip-node-v$version-$target
+    for artifact_base in "$base" "$api_base" "$node_base"; do
         for suffix in tar.gz spdx.json tar.gz.sha256; do
             if ! cmp "$first_dist/$artifact_base.$suffix" "$second_dist/$artifact_base.$suffix"; then
                 echo "clean release artifact mismatch: $artifact_base.$suffix" >&2
@@ -123,7 +130,32 @@ for target in x86_64-linux-musl aarch64-linux-musl; do
         "$first_dist/$base.tar.gz" \
         "$first_dist/$base.spdx.json" \
         "$first_dist/$api_base.tar.gz" \
-        "$first_dist/$api_base.spdx.json"
+        "$first_dist/$api_base.spdx.json" \
+        "$first_dist/$node_base.tar.gz" \
+        "$first_dist/$node_base.spdx.json"
 done
+
+first_dist=$work/pass-1/source/dist
+second_dist=$work/pass-2/source/dist
+bootstrap_base=ntip-bootstrap-assets-v$version
+for suffix in tar.gz tar.gz.sha256; do
+    if ! cmp "$first_dist/$bootstrap_base.$suffix" "$second_dist/$bootstrap_base.$suffix"; then
+        echo "clean release artifact mismatch: $bootstrap_base.$suffix" >&2
+        exit 1
+    fi
+    install -m 0644 "$first_dist/$bootstrap_base.$suffix" \
+        "$repo_root/dist/$bootstrap_base.$suffix"
+done
+for manifest in bootstrap-assets.json bootstrap-assets.json.sha256; do
+    if ! cmp "$first_dist/$manifest" "$second_dist/$manifest"; then
+        echo "clean release artifact mismatch: $manifest" >&2
+        exit 1
+    fi
+    install -m 0644 "$first_dist/$manifest" "$repo_root/dist/$manifest"
+done
+echo "clean_release_reproducibility=passed component=bootstrap-assets commit=$commit"
+sha256sum \
+    "$first_dist/$bootstrap_base.tar.gz" \
+    "$first_dist/bootstrap-assets.json"
 
 echo "clean_release_reproducibility=passed builds=2 isolated_source_roots=2 isolated_local_caches=2 isolated_global_caches=2"

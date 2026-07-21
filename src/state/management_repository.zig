@@ -47,6 +47,54 @@ pub const PendingEnrollment = struct {
     expires_at: i64,
 };
 
+pub const bootstrap_locator_len: usize = 8;
+pub const bootstrap_derivation_version: u8 = 1;
+pub const bootstrap_maximum_lifetime_seconds: i64 = 24 * 60 * 60;
+pub const bootstrap_failure_limit: u8 = 10;
+pub const bootstrap_failure_window_seconds: i64 = 15 * 60;
+pub const bootstrap_cooldown_seconds: i64 = 15 * 60;
+
+pub const BootstrapLocator = [bootstrap_locator_len]u8;
+
+/// Durable bootstrap material. `derived_psk` is the same verifier already
+/// used by `enrollment_credentials`; neither the short code nor the
+/// credential secret is representable by this type.
+pub const PendingBootstrap = struct {
+    locator: BootstrapLocator,
+    node_id: model.NodeId,
+    handle: [16]u8,
+    derived_psk: [32]u8,
+    derivation_version: u8 = bootstrap_derivation_version,
+    expires_at: i64,
+};
+
+pub const BootstrapRecord = struct {
+    locator: BootstrapLocator,
+    node_id: model.NodeId,
+    node_name: model.Name,
+    handle: [16]u8,
+    derivation_version: u8,
+    created_at: i64,
+    expires_at: i64,
+    first_redeemed_at: ?i64,
+    failed_attempt_count: u8,
+    locked_until: ?i64,
+};
+
+pub const BootstrapRedemption = struct {
+    node_id: model.NodeId,
+    node_name: model.Name,
+    handle: [16]u8,
+    expires_at: i64,
+    first_redemption: bool,
+};
+
+comptime {
+    std.debug.assert(!@hasField(PendingBootstrap, "code"));
+    std.debug.assert(!@hasField(PendingBootstrap, "credential_secret"));
+    std.debug.assert(!@hasField(PendingBootstrap, "root_key"));
+}
+
 pub const Repository = struct {
     db: *sqlite.Database,
 
@@ -315,6 +363,372 @@ pub const Repository = struct {
         return next_generation;
     }
 
+    /// Commits a newly-created Node, its bootstrap invitation, the existing
+    /// protocol enrollment verifier, the audit row, and one generation as one
+    /// transaction. The locator is retained forever by schema policy; no
+    /// short code or reconstructable credential secret reaches SQLite.
+    pub fn persistInventoryWithBootstrap(
+        self: Repository,
+        candidate: *const model.Store,
+        bootstrap: PendingBootstrap,
+        expected_generation: u64,
+        now: i64,
+        audit: AuditEntry,
+    ) !u64 {
+        try validateProjection(candidate);
+        try validatePendingBootstrap(bootstrap, now);
+        const next_generation = try checkedNextGeneration(expected_generation);
+        if (candidate.generation != next_generation) return error.InvalidCandidateGeneration;
+        const node = candidate.findNodeById(bootstrap.node_id) orelse return error.NodeNotFound;
+        if (node.enrollment_state != .unenrolled or node.public_key != null) {
+            return error.NodeAlreadyEnrolled;
+        }
+
+        var transaction = try self.db.begin(.immediate);
+        errdefer transaction.rollback() catch {};
+        try self.requireGeneration(expected_generation);
+        try self.requireNodeAdmission(candidate.nodes.items.len);
+        try self.requireEnrollmentProjection(candidate);
+        self.reconcileInventory(candidate, now) catch |err| return switch (err) {
+            error.ConstraintViolation => error.InventoryConstraintViolation,
+            else => err,
+        };
+        try self.insertBootstrap(bootstrap, now);
+        self.insertAudit(audit) catch |err| return switch (err) {
+            error.ConstraintViolation => error.InvalidAuditEntry,
+            else => err,
+        };
+        try self.advanceGeneration(expected_generation, next_generation);
+        try transaction.commit();
+        return next_generation;
+    }
+
+    /// Generates or replaces the active invitation for an existing Node.
+    /// Replacement and reset revoke both the old public invitation and its
+    /// underlying protocol verifier before the new pair is inserted.
+    pub fn replaceBootstrap(
+        self: Repository,
+        bootstrap: PendingBootstrap,
+        reset_active_association: bool,
+        created_at: i64,
+        expected_generation: u64,
+        audit: AuditEntry,
+    ) !u64 {
+        try validatePendingBootstrap(bootstrap, created_at);
+        const next_generation = try checkedNextGeneration(expected_generation);
+
+        var transaction = try self.db.begin(.immediate);
+        errdefer transaction.rollback() catch {};
+        try self.requireGeneration(expected_generation);
+        const node_is_enrolled = try self.nodeIsEnrolled(bootstrap.node_id);
+        if (node_is_enrolled and !reset_active_association) return error.NodeAlreadyEnrolled;
+
+        _ = try self.revokeActiveBootstrap(
+            bootstrap.node_id,
+            created_at,
+            if (reset_active_association) "reset" else "replaced",
+        );
+        try self.revokeUnusedCredentialsForNode(bootstrap.node_id, created_at);
+
+        // Invitation state is part of the mutable Node resource. Always bump
+        // its revision so an ETag captured before a replacement cannot
+        // authorize a later dangerous operation.
+        var touch = try self.db.prepare(
+            "UPDATE nodes SET enrollment_state = 'unenrolled', public_key = NULL, " ++
+                "revision = revision + 1, updated_at = ?1 WHERE id = ?2;",
+        );
+        defer touch.deinit();
+        try touch.bindInt64(1, created_at);
+        try touch.bindBlob(2, &bootstrap.node_id.bytes);
+        if (try touch.step() != .done) return error.UnexpectedRow;
+        if (self.db.changes() != 1) return error.NodeNotFound;
+
+        try self.insertBootstrap(bootstrap, created_at);
+        self.insertAudit(audit) catch |err| return switch (err) {
+            error.ConstraintViolation => error.InvalidAuditEntry,
+            else => err,
+        };
+        try self.advanceGeneration(expected_generation, next_generation);
+        try transaction.commit();
+        return next_generation;
+    }
+
+    /// Revokes the current invitation for a Node without removing its
+    /// permanent locator history.
+    pub fn revokeBootstrap(
+        self: Repository,
+        node_id: model.NodeId,
+        revoked_at: i64,
+        expected_generation: u64,
+        audit: AuditEntry,
+    ) !u64 {
+        if (revoked_at < 0) return error.InvalidTimestamp;
+        const next_generation = try checkedNextGeneration(expected_generation);
+        var transaction = try self.db.begin(.immediate);
+        errdefer transaction.rollback() catch {};
+        try self.requireGeneration(expected_generation);
+        if (try self.nodeIsEnrolled(node_id)) return error.NodeAlreadyEnrolled;
+        const revoked = try self.revokeActiveBootstrap(node_id, revoked_at, "explicit_revoke");
+        if (revoked == 0) return error.BootstrapNotFound;
+        try self.revokeUnusedCredentialsForNode(node_id, revoked_at);
+        var touch = try self.db.prepare(
+            "UPDATE nodes SET revision=revision+1,updated_at=?1 WHERE id=?2;",
+        );
+        defer touch.deinit();
+        try touch.bindInt64(1, revoked_at);
+        try touch.bindBlob(2, &node_id.bytes);
+        if (try touch.step() != .done or self.db.changes() != 1) return error.NodeNotFound;
+        self.insertAudit(audit) catch |err| return switch (err) {
+            error.ConstraintViolation => error.InvalidAuditEntry,
+            else => err,
+        };
+        try self.advanceGeneration(expected_generation, next_generation);
+        try transaction.commit();
+        return next_generation;
+    }
+
+    pub fn bootstrapLocatorExists(self: Repository, locator: BootstrapLocator) !bool {
+        var statement = try self.db.prepare(
+            "SELECT 1 FROM enrollment_bootstraps WHERE locator = ?1;",
+        );
+        defer statement.deinit();
+        try statement.bindText(1, &locator);
+        return switch (try statement.step()) {
+            .done => false,
+            .row => blk: {
+                if (try statement.step() != .done) return error.CorruptBootstrap;
+                break :blk true;
+            },
+        };
+    }
+
+    pub fn enrollmentHandleExists(self: Repository, handle: [16]u8) !bool {
+        var statement = try self.db.prepare(
+            "SELECT 1 FROM enrollment_credentials WHERE handle = ?1;",
+        );
+        defer statement.deinit();
+        try statement.bindBlob(1, &handle);
+        return switch (try statement.step()) {
+            .done => false,
+            .row => blk: {
+                if (try statement.step() != .done) return error.CorruptEnrollmentCredential;
+                break :blk true;
+            },
+        };
+    }
+
+    /// Returns only public and derivation metadata needed to recompute a
+    /// candidate verifier. Invitation lifecycle is rechecked atomically by
+    /// `attemptBootstrapRedemption` after derivation.
+    pub fn readBootstrap(self: Repository, locator: BootstrapLocator) !BootstrapRecord {
+        var statement = try self.db.prepare(
+            "SELECT b.node_id,n.name,b.enrollment_handle,b.derivation_version," ++
+                "b.created_at,b.expires_at,b.status,b.first_redeemed_at," ++
+                "b.failed_attempt_count,b.locked_until " ++
+                "FROM enrollment_bootstraps AS b " ++
+                "LEFT JOIN nodes AS n ON n.id=b.node_id WHERE b.locator=?1;",
+        );
+        defer statement.deinit();
+        try statement.bindText(1, &locator);
+        if (try statement.step() != .row) return error.BootstrapNotFound;
+        const node_blob = statement.columnBlob(0) orelse return error.CorruptBootstrap;
+        if (node_blob.len != 16) return error.CorruptBootstrap;
+        var node_id: model.NodeId = undefined;
+        @memcpy(&node_id.bytes, node_blob);
+        const node_name = model.Name.parse(statement.columnText(1) orelse
+            return error.BootstrapUnavailable) catch return error.CorruptBootstrap;
+        const handle_blob = statement.columnBlob(2) orelse return error.CorruptBootstrap;
+        if (handle_blob.len != 16) return error.CorruptBootstrap;
+        const derivation_raw = statement.columnInt64(3);
+        if (derivation_raw != bootstrap_derivation_version) return error.UnsupportedBootstrapDerivation;
+        const created_at = statement.columnInt64(4);
+        const expires_at = statement.columnInt64(5);
+        const status = statement.columnText(6) orelse return error.CorruptBootstrap;
+        if (!std.mem.eql(u8, status, "active")) return error.BootstrapUnavailable;
+        const first_redeemed_at: ?i64 = if (statement.columnIsNull(7)) null else statement.columnInt64(7);
+        const failures_raw = statement.columnInt64(8);
+        if (failures_raw < 0 or failures_raw > bootstrap_failure_limit) return error.CorruptBootstrap;
+        const locked_until: ?i64 = if (statement.columnIsNull(9)) null else statement.columnInt64(9);
+        const result: BootstrapRecord = .{
+            .locator = locator,
+            .node_id = node_id,
+            .node_name = node_name,
+            .handle = handle_blob[0..16].*,
+            .derivation_version = @intCast(derivation_raw),
+            .created_at = created_at,
+            .expires_at = expires_at,
+            .first_redeemed_at = first_redeemed_at,
+            .failed_attempt_count = @intCast(failures_raw),
+            .locked_until = locked_until,
+        };
+        if (try statement.step() != .done) return error.CorruptBootstrap;
+        return result;
+    }
+
+    /// Validates one real-locator redemption and durably applies its bounded
+    /// throttle. A successful invitation remains redeemable until protocol
+    /// consumption, expiry, replacement, reset, or explicit revocation.
+    pub fn attemptBootstrapRedemption(
+        self: Repository,
+        locator: BootstrapLocator,
+        presented_derived_psk: [32]u8,
+        attempted_at: i64,
+        first_success_audit: AuditEntry,
+        lockout_audit: AuditEntry,
+    ) !BootstrapRedemption {
+        if (attempted_at < 0) return error.InvalidTimestamp;
+        var transaction = try self.db.begin(.immediate);
+        errdefer transaction.rollback() catch {};
+
+        var lookup = try self.db.prepare(
+            "SELECT b.node_id,n.name,b.enrollment_handle,b.expires_at,b.status," ++
+                "b.first_redeemed_at,b.failed_attempt_count,b.failure_window_started_at," ++
+                "b.locked_until,c.derived_psk,c.expires_at,c.status " ++
+                "FROM enrollment_bootstraps AS b " ++
+                "LEFT JOIN nodes AS n ON n.id=b.node_id " ++
+                "LEFT JOIN enrollment_credentials AS c ON c.handle=b.enrollment_handle " ++
+                "WHERE b.locator=?1;",
+        );
+        defer lookup.deinit();
+        try lookup.bindText(1, &locator);
+        if (try lookup.step() != .row) return error.BootstrapNotFound;
+        const node_blob = lookup.columnBlob(0) orelse return error.CorruptBootstrap;
+        const name_text = lookup.columnText(1) orelse return error.BootstrapUnavailable;
+        const handle_blob = lookup.columnBlob(2) orelse return error.CorruptBootstrap;
+        if (node_blob.len != 16 or handle_blob.len != 16) return error.CorruptBootstrap;
+        var node_id: model.NodeId = undefined;
+        @memcpy(&node_id.bytes, node_blob);
+        const node_name = model.Name.parse(name_text) catch return error.CorruptBootstrap;
+        const handle = handle_blob[0..16].*;
+        const expires_at = lookup.columnInt64(3);
+        const bootstrap_status = lookup.columnText(4) orelse return error.CorruptBootstrap;
+        const bootstrap_is_active = std.mem.eql(u8, bootstrap_status, "active");
+        const first_redeemed_at: ?i64 = if (lookup.columnIsNull(5)) null else lookup.columnInt64(5);
+        const failures_raw = lookup.columnInt64(6);
+        const window_started_at: ?i64 = if (lookup.columnIsNull(7)) null else lookup.columnInt64(7);
+        const locked_until: ?i64 = if (lookup.columnIsNull(8)) null else lookup.columnInt64(8);
+        const stored_blob = lookup.columnBlob(9);
+        var stored_psk: ?[32]u8 = null;
+        defer if (stored_psk) |*value| std.crypto.secureZero(u8, value);
+        if (stored_blob) |stored| {
+            if (stored.len != 32) return error.CorruptEnrollmentCredential;
+            stored_psk = stored[0..32].*;
+        }
+        const credential_expires_at = lookup.columnInt64(10);
+        const credential_status = lookup.columnText(11) orelse return error.BootstrapUnavailable;
+        const credential_is_unused = std.mem.eql(u8, credential_status, "unused");
+        if (try lookup.step() != .done) return error.CorruptBootstrap;
+
+        if (!bootstrap_is_active or !credential_is_unused) {
+            return error.BootstrapUnavailable;
+        }
+        if (expires_at != credential_expires_at) return error.CorruptBootstrap;
+        if (attempted_at >= expires_at) return error.BootstrapExpired;
+        if (failures_raw < 0 or failures_raw > bootstrap_failure_limit) return error.CorruptBootstrap;
+        if (locked_until) |until| if (attempted_at < until) return error.BootstrapLocked;
+        const stored = stored_psk orelse return error.CorruptEnrollmentCredential;
+
+        if (!timingSafeEql32(&stored, &presented_derived_psk)) {
+            var failures: u8 = @intCast(failures_raw);
+            var window = window_started_at;
+            if (window == null or attempted_at -| window.? >= bootstrap_failure_window_seconds or
+                (locked_until != null and attempted_at >= locked_until.?))
+            {
+                failures = 1;
+                window = attempted_at;
+            } else if (failures < bootstrap_failure_limit) {
+                failures += 1;
+            }
+            const newly_locked = failures >= bootstrap_failure_limit;
+            const new_locked_until: ?i64 = if (newly_locked)
+                std.math.add(i64, attempted_at, bootstrap_cooldown_seconds) catch
+                    return error.InvalidTimestamp
+            else
+                null;
+            var throttle = try self.db.prepare(
+                "UPDATE enrollment_bootstraps SET failed_attempt_count=?1," ++
+                    "failure_window_started_at=?2,locked_until=?3 " ++
+                    "WHERE locator=?4 AND status='active';",
+            );
+            defer throttle.deinit();
+            try throttle.bindInt64(1, failures);
+            try throttle.bindInt64(2, window.?);
+            if (new_locked_until) |until| try throttle.bindInt64(3, until) else try throttle.bindNull(3);
+            try throttle.bindText(4, &locator);
+            if (try throttle.step() != .done or self.db.changes() != 1) {
+                return error.BootstrapStateChanged;
+            }
+            if (newly_locked and (locked_until == null or attempted_at >= locked_until.?)) {
+                self.insertAudit(lockout_audit) catch |err| return switch (err) {
+                    error.ConstraintViolation => error.InvalidAuditEntry,
+                    else => err,
+                };
+            }
+            try transaction.commit();
+            return error.InvalidBootstrapCode;
+        }
+
+        const first_redemption = first_redeemed_at == null;
+        var success = try self.db.prepare(
+            "UPDATE enrollment_bootstraps SET first_redeemed_at=COALESCE(first_redeemed_at,?1)," ++
+                "failed_attempt_count=0,failure_window_started_at=NULL,locked_until=NULL " ++
+                "WHERE locator=?2 AND status='active';",
+        );
+        defer success.deinit();
+        try success.bindInt64(1, attempted_at);
+        try success.bindText(2, &locator);
+        if (try success.step() != .done or self.db.changes() != 1) return error.BootstrapStateChanged;
+        if (first_redemption) self.insertAudit(first_success_audit) catch |err| return switch (err) {
+            error.ConstraintViolation => error.InvalidAuditEntry,
+            else => err,
+        };
+        try transaction.commit();
+        return .{
+            .node_id = node_id,
+            .node_name = node_name,
+            .handle = handle,
+            .expires_at = expires_at,
+            .first_redemption = first_redemption,
+        };
+    }
+
+    /// Restore integration seam. Call this on the restored database before it
+    /// becomes authoritative so rollback can never resurrect a public setup
+    /// code. The enclosing restore flow supplies the immutable audit row.
+    pub fn revokeRestoredBootstrapCredentials(
+        self: Repository,
+        revoked_at: i64,
+        audit: AuditEntry,
+    ) !u64 {
+        if (revoked_at < 0) return error.InvalidTimestamp;
+        var transaction = try self.db.begin(.immediate);
+        errdefer transaction.rollback() catch {};
+        var credentials = try self.db.prepare(
+            "UPDATE enrollment_credentials SET derived_psk=NULL,status='revoked',revoked_at=?1 " ++
+                "WHERE status='unused' AND handle IN (" ++
+                "SELECT enrollment_handle FROM enrollment_bootstraps WHERE status='active');",
+        );
+        defer credentials.deinit();
+        try credentials.bindInt64(1, revoked_at);
+        if (try credentials.step() != .done) return error.UnexpectedRow;
+
+        var bootstraps = try self.db.prepare(
+            "UPDATE enrollment_bootstraps SET status='revoked',invalidated_at=?1," ++
+                "invalidation_reason='restore',failed_attempt_count=0," ++
+                "failure_window_started_at=NULL,locked_until=NULL WHERE status='active';",
+        );
+        defer bootstraps.deinit();
+        try bootstraps.bindInt64(1, revoked_at);
+        if (try bootstraps.step() != .done) return error.UnexpectedRow;
+        const count: u64 = @intCast(self.db.changes());
+        if (count != 0) self.insertAudit(audit) catch |err| return switch (err) {
+            error.ConstraintViolation => error.InvalidAuditEntry,
+            else => err,
+        };
+        try transaction.commit();
+        return count;
+    }
+
     /// Issues or replaces a credential. Only the derived verifier reaches the
     /// database. Any unused predecessor is revoked in the same transaction.
     /// An enrolled Node is rejected unless the separately authorized reset
@@ -338,6 +752,12 @@ pub const Repository = struct {
         try self.requireGeneration(expected_generation);
         const node_is_enrolled = try self.nodeIsEnrolled(node_id);
         if (node_is_enrolled and !reset_active_association) return error.NodeAlreadyEnrolled;
+
+        _ = try self.revokeActiveBootstrap(
+            node_id,
+            created_at,
+            if (reset_active_association) "reset" else "replaced",
+        );
 
         var revoke = try self.db.prepare(
             "UPDATE enrollment_credentials " ++
@@ -408,6 +828,8 @@ pub const Repository = struct {
         errdefer transaction.rollback() catch {};
         try self.requireGeneration(expected_generation);
         const node_is_enrolled = try self.nodeIsEnrolled(node_id);
+
+        _ = try self.revokeActiveBootstrap(node_id, reset_at, "reset");
 
         var revoke = try self.db.prepare(
             "UPDATE enrollment_credentials " ++
@@ -512,6 +934,17 @@ pub const Repository = struct {
         if (try consume.step() != .done) return error.UnexpectedRow;
         if (self.db.changes() != 1) return error.EnrollmentCredentialStateChanged;
 
+        var consume_bootstrap = try self.db.prepare(
+            "UPDATE enrollment_bootstraps SET status='consumed',invalidated_at=?1," ++
+                "invalidation_reason='protocol_consumed',failed_attempt_count=0," ++
+                "failure_window_started_at=NULL,locked_until=NULL " ++
+                "WHERE enrollment_handle=?2 AND status='active';",
+        );
+        defer consume_bootstrap.deinit();
+        try consume_bootstrap.bindInt64(1, consumed_at);
+        try consume_bootstrap.bindBlob(2, &handle);
+        if (try consume_bootstrap.step() != .done) return error.UnexpectedRow;
+
         self.insertAudit(audit) catch |err| return switch (err) {
             error.ConstraintViolation => error.InvalidAuditEntry,
             else => err,
@@ -558,6 +991,17 @@ pub const Repository = struct {
         if (try revoke.step() != .done) return error.UnexpectedRow;
         if (self.db.changes() != 1) return error.EnrollmentCredentialStateChanged;
 
+        var revoke_bootstrap = try self.db.prepare(
+            "UPDATE enrollment_bootstraps SET status='revoked',invalidated_at=?1," ++
+                "invalidation_reason='explicit_revoke',failed_attempt_count=0," ++
+                "failure_window_started_at=NULL,locked_until=NULL " ++
+                "WHERE enrollment_handle=?2 AND status='active';",
+        );
+        defer revoke_bootstrap.deinit();
+        try revoke_bootstrap.bindInt64(1, revoked_at);
+        try revoke_bootstrap.bindBlob(2, &handle);
+        if (try revoke_bootstrap.step() != .done) return error.UnexpectedRow;
+
         self.insertAudit(audit) catch |err| return switch (err) {
             error.ConstraintViolation => error.InvalidAuditEntry,
             else => err,
@@ -565,6 +1009,82 @@ pub const Repository = struct {
         try self.advanceGeneration(expected_generation, next_generation);
         try transaction.commit();
         return next_generation;
+    }
+
+    fn insertBootstrap(self: Repository, bootstrap: PendingBootstrap, created_at: i64) !void {
+        if (!self.db.inTransaction()) return error.BootstrapMutationRequiresTransaction;
+        var credential = try self.db.prepare(
+            "INSERT INTO enrollment_credentials " ++
+                "(handle,node_id,derived_psk,created_at,expires_at,status) " ++
+                "VALUES (?1,?2,?3,?4,?5,'unused');",
+        );
+        defer credential.deinit();
+        try credential.bindBlob(1, &bootstrap.handle);
+        try credential.bindBlob(2, &bootstrap.node_id.bytes);
+        try credential.bindBlob(3, &bootstrap.derived_psk);
+        try credential.bindInt64(4, created_at);
+        try credential.bindInt64(5, bootstrap.expires_at);
+        const credential_step = credential.step() catch |err| return switch (err) {
+            error.ConstraintViolation => error.EnrollmentConstraintViolation,
+            else => err,
+        };
+        if (credential_step != .done) return error.UnexpectedRow;
+
+        var invitation = try self.db.prepare(
+            "INSERT INTO enrollment_bootstraps " ++
+                "(locator,node_id,enrollment_handle,derivation_version,created_at,expires_at,status) " ++
+                "VALUES (?1,?2,?3,?4,?5,?6,'active');",
+        );
+        defer invitation.deinit();
+        try invitation.bindText(1, &bootstrap.locator);
+        try invitation.bindBlob(2, &bootstrap.node_id.bytes);
+        try invitation.bindBlob(3, &bootstrap.handle);
+        try invitation.bindInt64(4, bootstrap.derivation_version);
+        try invitation.bindInt64(5, created_at);
+        try invitation.bindInt64(6, bootstrap.expires_at);
+        const invitation_step = invitation.step() catch |err| return switch (err) {
+            error.ConstraintViolation => error.BootstrapConstraintViolation,
+            else => err,
+        };
+        if (invitation_step != .done) return error.UnexpectedRow;
+    }
+
+    fn revokeActiveBootstrap(
+        self: Repository,
+        node_id: model.NodeId,
+        revoked_at: i64,
+        reason: []const u8,
+    ) !u64 {
+        if (!self.db.inTransaction()) return error.BootstrapMutationRequiresTransaction;
+        var statement = try self.db.prepare(
+            "UPDATE enrollment_bootstraps SET status='revoked',invalidated_at=?1," ++
+                "invalidation_reason=?2,failed_attempt_count=0," ++
+                "failure_window_started_at=NULL,locked_until=NULL " ++
+                "WHERE node_id=?3 AND status='active';",
+        );
+        defer statement.deinit();
+        try statement.bindInt64(1, revoked_at);
+        try statement.bindText(2, reason);
+        try statement.bindBlob(3, &node_id.bytes);
+        if (try statement.step() != .done) return error.UnexpectedRow;
+        return @intCast(self.db.changes());
+    }
+
+    fn revokeUnusedCredentialsForNode(
+        self: Repository,
+        node_id: model.NodeId,
+        revoked_at: i64,
+    ) !void {
+        if (!self.db.inTransaction()) return error.BootstrapMutationRequiresTransaction;
+        var statement = try self.db.prepare(
+            "UPDATE enrollment_credentials " ++
+                "SET derived_psk=NULL,status='revoked',revoked_at=?1 " ++
+                "WHERE node_id=?2 AND status='unused';",
+        );
+        defer statement.deinit();
+        try statement.bindInt64(1, revoked_at);
+        try statement.bindBlob(2, &node_id.bytes);
+        if (try statement.step() != .done) return error.UnexpectedRow;
     }
 
     fn requireGeneration(self: Repository, expected: u64) !void {
@@ -687,6 +1207,13 @@ pub const Repository = struct {
 
         var existing_nodes = try self.db.prepare("SELECT id FROM nodes;");
         defer existing_nodes.deinit();
+        var revoke_deleted_bootstrap = try self.db.prepare(
+            "UPDATE enrollment_bootstraps SET status='revoked',invalidated_at=?1," ++
+                "invalidation_reason='node_deleted',failed_attempt_count=0," ++
+                "failure_window_started_at=NULL,locked_until=NULL " ++
+                "WHERE node_id=?2 AND status='active';",
+        );
+        defer revoke_deleted_bootstrap.deinit();
         var delete_node = try self.db.prepare("DELETE FROM nodes WHERE id = ?1;");
         defer delete_node.deinit();
         while (try existing_nodes.step() == .row) {
@@ -695,6 +1222,11 @@ pub const Repository = struct {
             var id: model.NodeId = undefined;
             @memcpy(&id.bytes, blob);
             if (candidate.findNodeById(id) != null) continue;
+            try revoke_deleted_bootstrap.bindInt64(1, now);
+            try revoke_deleted_bootstrap.bindBlob(2, &id.bytes);
+            if (try revoke_deleted_bootstrap.step() != .done) return error.UnexpectedRow;
+            try revoke_deleted_bootstrap.reset();
+            try revoke_deleted_bootstrap.clearBindings();
             try delete_node.bindBlob(1, &id.bytes);
             if (try delete_node.step() != .done) return error.UnexpectedRow;
             try delete_node.reset();
@@ -844,6 +1376,25 @@ fn validateProjection(candidate: *const model.Store) !void {
     for (candidate.routes.items) |route| try route.prefix.validateRouted();
 }
 
+fn validatePendingBootstrap(bootstrap: PendingBootstrap, created_at: i64) !void {
+    if (created_at < 0 or bootstrap.expires_at <= created_at) {
+        return error.InvalidCredentialLifetime;
+    }
+    const lifetime = bootstrap.expires_at - created_at;
+    if (lifetime > bootstrap_maximum_lifetime_seconds) return error.InvalidCredentialLifetime;
+    if (bootstrap.derivation_version != bootstrap_derivation_version) {
+        return error.UnsupportedBootstrapDerivation;
+    }
+    for (bootstrap.locator) |byte| {
+        if (std.mem.indexOfScalar(u8, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789", byte) == null) {
+            return error.InvalidBootstrapLocator;
+        }
+    }
+    if (allZero(&bootstrap.handle) or allZero(&bootstrap.derived_psk)) {
+        return error.InvalidBootstrapMaterial;
+    }
+}
+
 fn canonicalCidr(value: model.Cidr) bool {
     if (value.prefix > 32) return false;
     return value.network.value & ~model.Cidr.mask(value.prefix) == 0;
@@ -894,6 +1445,12 @@ fn timingSafeEql32(stored: []const u8, presented: *const [32]u8) bool {
     var difference: u8 = 0;
     for (stored, presented) |left, right| difference |= left ^ right;
     return difference == 0;
+}
+
+fn allZero(bytes: []const u8) bool {
+    var combined: u8 = 0;
+    for (bytes) |byte| combined |= byte;
+    return combined == 0;
 }
 
 fn optionalPublicKeysEqual(stored: ?[]const u8, projected: ?[32]u8) bool {
@@ -1479,4 +2036,225 @@ test "durable inventory rejects noncanonical and reserved CIDRs" {
         error.CorruptInventory,
         repository.loadInventory(std.testing.allocator),
     );
+}
+
+test "schema two atomically creates and replaces a bootstrap without storing raw secrets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try testDatabasePath(&tmp, &path_buffer);
+    var db = try sqlite.Database.openInitialized(path);
+    defer db.close();
+    const repository = Repository.init(&db);
+    try std.testing.expectEqual(@as(u32, 2), try db.schemaVersion());
+
+    var candidate = try testInventory(std.testing.allocator);
+    defer candidate.deinit();
+    const node_id: model.NodeId = .{ .bytes = [_]u8{0x11} ** 16 };
+    const first: PendingBootstrap = .{
+        .locator = "ABCDEFGH".*,
+        .node_id = node_id,
+        .handle = [_]u8{0x81} ** 16,
+        .derived_psk = [_]u8{0x91} ** 32,
+        .expires_at = 3_700,
+    };
+    const first_audit = testAudit(0x81, "enrollment.bootstrap.issue", 100);
+    try std.testing.expectEqual(@as(u64, 1), try repository.persistInventoryWithBootstrap(
+        &candidate,
+        first,
+        0,
+        100,
+        first_audit,
+    ));
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM enrollment_bootstraps WHERE status='active';",
+    ));
+    try std.testing.expectEqual(@as(i64, 0), try scalarInt(
+        &db,
+        "SELECT count(*) FROM pragma_table_info('enrollment_bootstraps') " ++
+            "WHERE name IN ('short_code','code','credential_secret','root_key','encoded_credential');",
+    ));
+
+    const second: PendingBootstrap = .{
+        .locator = "JKLMNPQR".*,
+        .node_id = node_id,
+        .handle = [_]u8{0x82} ** 16,
+        .derived_psk = [_]u8{0x92} ** 32,
+        .expires_at = 3_800,
+    };
+    // The duplicate immutable audit ID fails after the proposed revoke and
+    // insert, proving every part of replacement rolls back together.
+    try std.testing.expectError(error.InvalidAuditEntry, repository.replaceBootstrap(
+        second,
+        false,
+        200,
+        1,
+        first_audit,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), try repository.durableGeneration());
+    _ = try repository.readBootstrap(first.locator);
+    try std.testing.expectError(error.BootstrapNotFound, repository.readBootstrap(second.locator));
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM enrollment_credentials WHERE status='unused' AND derived_psk IS NOT NULL;",
+    ));
+
+    try std.testing.expectEqual(@as(u64, 2), try repository.replaceBootstrap(
+        second,
+        false,
+        201,
+        1,
+        testAudit(0x82, "enrollment.bootstrap.replace", 201),
+    ));
+    try std.testing.expectError(error.BootstrapUnavailable, repository.readBootstrap(first.locator));
+    _ = try repository.readBootstrap(second.locator);
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM enrollment_credentials WHERE status='revoked' AND derived_psk IS NULL;",
+    ));
+}
+
+test "bootstrap redemption repeats until consume and real-locator throttle is durable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try testDatabasePath(&tmp, &path_buffer);
+    var db = try sqlite.Database.openInitialized(path);
+    defer db.close();
+    const repository = Repository.init(&db);
+    var candidate = try testInventory(std.testing.allocator);
+    defer candidate.deinit();
+    const node_id: model.NodeId = .{ .bytes = [_]u8{0x11} ** 16 };
+    const pending: PendingBootstrap = .{
+        .locator = "23456789".*,
+        .node_id = node_id,
+        .handle = [_]u8{0xa1} ** 16,
+        .derived_psk = [_]u8{0xb1} ** 32,
+        .expires_at = 4_000,
+    };
+    _ = try repository.persistInventoryWithBootstrap(
+        &candidate,
+        pending,
+        0,
+        100,
+        testAudit(0xa1, "enrollment.bootstrap.issue", 100),
+    );
+
+    const success_audit = testAudit(0xa2, "enrollment.bootstrap.redeem", 101);
+    const lockout_audit = testAudit(0xa3, "enrollment.bootstrap.lockout", 101);
+    const first = try repository.attemptBootstrapRedemption(
+        pending.locator,
+        pending.derived_psk,
+        101,
+        success_audit,
+        lockout_audit,
+    );
+    try std.testing.expect(first.first_redemption);
+    const repeated = try repository.attemptBootstrapRedemption(
+        pending.locator,
+        pending.derived_psk,
+        102,
+        success_audit,
+        lockout_audit,
+    );
+    try std.testing.expect(!repeated.first_redemption);
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM audit_entries WHERE action='enrollment.bootstrap.redeem';",
+    ));
+
+    const wrong = [_]u8{0xff} ** 32;
+    for (0..bootstrap_failure_limit) |index| {
+        try std.testing.expectError(error.InvalidBootstrapCode, repository.attemptBootstrapRedemption(
+            pending.locator,
+            wrong,
+            200 + @as(i64, @intCast(index)),
+            success_audit,
+            lockout_audit,
+        ));
+    }
+    try std.testing.expectError(error.BootstrapLocked, repository.attemptBootstrapRedemption(
+        pending.locator,
+        pending.derived_psk,
+        220,
+        success_audit,
+        lockout_audit,
+    ));
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM audit_entries WHERE action='enrollment.bootstrap.lockout';",
+    ));
+    // Cooldown expiry permits the same correct invitation and clears throttle
+    // state without generating a second first-redemption audit row.
+    _ = try repository.attemptBootstrapRedemption(
+        pending.locator,
+        pending.derived_psk,
+        1_110,
+        success_audit,
+        lockout_audit,
+    );
+    try std.testing.expectEqual(@as(i64, 0), try scalarInt(
+        &db,
+        "SELECT failed_attempt_count FROM enrollment_bootstraps WHERE locator='23456789';",
+    ));
+
+    _ = try repository.consumeEnrollment(
+        pending.handle,
+        pending.derived_psk,
+        [_]u8{0xc1} ** 32,
+        1_111,
+        1,
+        testAudit(0xa4, "enrollment.consume", 1_111),
+    );
+    try std.testing.expectError(error.BootstrapUnavailable, repository.readBootstrap(pending.locator));
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM enrollment_bootstraps " ++
+            "WHERE status='consumed' AND invalidation_reason='protocol_consumed';",
+    ));
+}
+
+test "restore revocation invalidates every unused bootstrap verifier" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try testDatabasePath(&tmp, &path_buffer);
+    var db = try sqlite.Database.openInitialized(path);
+    defer db.close();
+    const repository = Repository.init(&db);
+    var candidate = try testInventory(std.testing.allocator);
+    defer candidate.deinit();
+    const pending: PendingBootstrap = .{
+        .locator = "ZYWX9876".*,
+        .node_id = .{ .bytes = [_]u8{0x11} ** 16 },
+        .handle = [_]u8{0xd1} ** 16,
+        .derived_psk = [_]u8{0xe1} ** 32,
+        .expires_at = 3_700,
+    };
+    _ = try repository.persistInventoryWithBootstrap(
+        &candidate,
+        pending,
+        0,
+        100,
+        testAudit(0xd1, "enrollment.bootstrap.issue", 100),
+    );
+    try std.testing.expectEqual(@as(u64, 1), try repository.revokeRestoredBootstrapCredentials(
+        200,
+        testAudit(0xd2, "enrollment.bootstrap.restore_revoke", 200),
+    ));
+    try std.testing.expectError(error.BootstrapUnavailable, repository.readBootstrap(pending.locator));
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM enrollment_credentials WHERE status='revoked' AND derived_psk IS NULL;",
+    ));
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(
+        &db,
+        "SELECT count(*) FROM enrollment_bootstraps " ++
+            "WHERE status='revoked' AND invalidation_reason='restore';",
+    ));
+    try std.testing.expectEqual(@as(u64, 0), try repository.revokeRestoredBootstrapCredentials(
+        201,
+        testAudit(0xd3, "enrollment.bootstrap.restore_revoke", 201),
+    ));
 }

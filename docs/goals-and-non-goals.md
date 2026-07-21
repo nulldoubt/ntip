@@ -63,6 +63,9 @@ priority over throughput claims or a broad automation surface.
   behavior.
 - Treat the TLS proxy as the sole browser router for `/api/v1`; the dashboard
   never embeds a second browser API destination.
+- Use that same HTTPS edge for pinned one-command Node bootstrap: strict
+  installer/redeem routes reach the API and immutable Node-only archives come
+  from the root-owned bootstrap-assets directory.
 - Support desktop administration at 1024 pixels and wider. Smaller viewports
   receive an explicit unsupported-size state.
 
@@ -73,7 +76,8 @@ priority over throughput claims or a broad automation surface.
   revocation.
 - Reconcile live and restart-required settings through immutable revisions and
   explicit desired/effective state.
-- Package core and API as static-musl Zig artifacts for x86_64 and AArch64;
+- Package core, API, and Node-only static-musl Zig artifacts for x86_64 and
+  AArch64; combine both Node archives in a Master bootstrap-assets package; and
   package the optional dashboard with the matching pinned glibc Bun runtime.
 - Publish checksums, component SPDX SBOMs, provenance, installer isolation,
   reproducibility comparisons, systemd hardening evidence, and secret scans.
@@ -119,9 +123,10 @@ A v0.2 release tag is permitted only when all of the following are true:
    ETag, idempotency, secret-redaction, and unavailable-service tests pass.
 4. Dashboard lint, typecheck, unit tests, production build/start smoke, and
    Playwright pass under exactly Bun 1.3.14 with no Node.js fallback.
-5. Core, API, and optional dashboard artifacts validate on native x86_64 and
-   AArch64 Linux, including checksums, exact SBOM coverage, installer lifecycle,
-   static/dynamic linkage policy, and systemd isolation.
+5. Core, API, optional dashboard, Node-only, and combined bootstrap-assets
+   artifacts validate on native x86_64 and AArch64 Linux, including checksums,
+   exact SBOM coverage, installer lifecycle, static/dynamic linkage policy,
+   NGINX syntax, and systemd isolation.
 6. Two clean source roots produce byte-identical release artifacts for each
    architecture and component.
 7. No unresolved critical or high-severity security finding remains, and the

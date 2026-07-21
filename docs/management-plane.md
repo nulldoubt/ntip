@@ -285,18 +285,22 @@ ntip/
 
 ## Deployment and artifacts
 
-Core static-musl archives contain `ntsrv` and `ntcl`. A separate optional,
+Core static-musl archives contain `ntsrv` and `ntcl`. A separate
 architecture-matched artifact contains only DB-free `ntip-api`, its strict
 sample config, systemd unit, and isolated installer. The API installer requires
-the same installed core version. Its unit has no capabilities or writable
-state path and permits only Unix and loopback IP address families.
+the same installed core version. Its unit has no capabilities or writable state
+path and permits only Unix and loopback IP address families. API plus HTTPS are
+mandatory for provisioning new Nodes.
 
 The core artifact includes reviewed backup service/timer examples under
 documentation, but its installer does not install or enable them as system
 units. Scheduling, destination protection, retention, and off-host movement
 remain operator decisions. Component SBOMs distinguish the SQLite-bearing core
-from the DB-free API and release checks compare both architectures and both
-clean builds byte-for-byte.
+from the DB-free API. Node-only static-musl archives contain `ntcl` and no
+Master/API material. One combined bootstrap-assets package carries both Node
+architectures, their checksums/SBOMs, the strict manifest, installer template,
+and reviewed NGINX example. Release checks compare both architectures,
+bootstrap package, manifest, and both clean builds byte-for-byte.
 
 The dashboard is a third, separately installable architecture-matched artifact:
 `ntip-dashboard-vVERSION-x86_64-linux.tar.gz` or
@@ -307,7 +311,8 @@ Ubuntu/systemd hosts. Core and API artifacts remain static-musl
 Bun 1.3.14 runtime for the target, architecture-neutral Next standalone output
 and static assets, strict sample config, launcher, systemd unit,
 installer/uninstaller, SPDX document, and checksum sidecar. Installation order
-is core, API, then dashboard, and all versions must match exactly.
+is core, API, bootstrap assets, then dashboard, and all versions must match
+exactly.
 
 Next image optimization is disabled for this interface. Packaging strips only
 trace-confirmed optional Sharp/`@img` native dependencies, dereferences valid

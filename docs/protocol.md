@@ -72,7 +72,7 @@ it MUST NOT replace the existing session.
 
 ## 3. Enrollment credential
 
-The human-transferable credential is exactly:
+The internal enrollment credential is exactly:
 
 ```text
 ntip-enroll-v1.<base64url-no-padding(body)>
@@ -88,6 +88,10 @@ The decoded body is exactly 80 bytes:
 
 The unpadded base64url body is therefore exactly 107 characters and the full
 credential exactly 122 characters.
+
+v0.2 bootstrap redemption imports this value directly into `ntcl`; it is not an
+operator-facing management response. The format remains normative so existing
+pending v0.1 credentials and the unchanged XKpsk1 wire flow stay compatible.
 
 Decoders MUST require the fixed prefix, base64url alphabet, omitted padding,
 canonical encoding, and exact decoded length. All-zero handles, secrets, or

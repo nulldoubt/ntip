@@ -33,7 +33,7 @@ The installer creates:
 - `/run/ntip` and the peer-authenticated `/run/ntip-api` seam;
 - hardened `ntsrv.service` and `ntcl.service` systemd units.
 
-The optional, architecture-matched API archive is installed separately after
+The architecture-matched API archive is installed separately after
 the same-version core package:
 
 ```sh
@@ -42,14 +42,34 @@ sudo ./scripts/install-api.sh
 ```
 
 It installs only `ntip-api`, `/etc/ntip/api.json`, and its hardened unit. It
-does not install or access Master state. The core package creates the dedicated
-UID/GID because `ntsrv` must authenticate that exact UID with `SO_PEERCRED`.
+does not install or access Master state. New Node provisioning also requires
+the matching bootstrap-assets package and a configured HTTPS edge; the API
+unit deliberately will not start without its strict manifest. The core package
+creates the dedicated UID/GID because `ntsrv` must authenticate that exact UID
+with `SO_PEERCRED`.
 The `ntip` and `ntip-api` UIDs must be numerically distinct, as must the
 `ntip`, `ntip-api`, and `ntip-admin` GIDs. Both installers fail closed if
 those names alias one another or if any trusted numeric ID has another
 passwd/group alias.
 
-Install the optional dashboard only after the same-version core and API:
+Install the same-version Master bootstrap-assets package next. It contains both
+Node CPU architectures, their checksum and SBOM sidecars, a strict manifest,
+and an NGINX example; it never enables or rewrites NGINX:
+
+```sh
+sha256sum --check ntip-bootstrap-assets-vVERSION.tar.gz.sha256
+tar -xzf ntip-bootstrap-assets-vVERSION.tar.gz
+sudo ntip-bootstrap-assets-vVERSION/scripts/install-bootstrap-assets.sh
+```
+
+The installer places immutable versioned files under
+`/usr/share/ntip/bootstrap-assets`, the API-readable manifest at
+`/etc/ntip/bootstrap-assets.json`, and the proxy example under
+`/usr/share/doc/ntip-bootstrap-assets`. Keep old immutable Node archives while
+an invitation that names them may remain valid.
+
+Install the optional dashboard only after the same-version core, API, and
+bootstrap-assets packages:
 
 ```sh
 sha256sum --check ntip-dashboard-vVERSION-x86_64-linux.tar.gz.sha256
@@ -64,8 +84,9 @@ It is installed but never enabled automatically. Configure the same-origin TLS
 proxy before starting it. Do not substitute either loopback listener for a
 public HTTPS endpoint.
 
-Core and API archives use static-musl `x86_64-linux-musl` or
-`aarch64-linux-musl` targets. Dashboard archives instead use glibc
+Core, API, and Node-only archives use static-musl `x86_64-linux-musl` or
+`aarch64-linux-musl` targets. The bootstrap-assets package contains both
+Node-only targets. Dashboard archives instead use glibc
 `x86_64-linux` or `aarch64-linux`; select the same CPU architecture without the
 `-musl` suffix. Bun's musl assets require a musl loader that is absent on the
 supported Ubuntu/systemd deployment, so they must not be substituted.
@@ -152,7 +173,14 @@ different owner or group.
 /etc/ntip/server.json                       0644 root:root
 /etc/ntip/client.json                       0644 root:root
 /etc/ntip/api.json                          0640 root:ntip-api
+/etc/ntip/bootstrap-assets.json             0640 root:ntip-api
 /etc/ntip/dashboard.json                    0640 root:ntip-dashboard
+
+/usr/share/ntip/bootstrap-assets/           0755 root:root
+  ntip-node-vVERSION-*.tar.gz               0644 root:root
+  *.tar.gz.sha256 / *.spdx.json             0644 root:root
+/usr/share/doc/ntip-bootstrap-assets/
+  ntip-nginx.conf.example                   0644 root:root
 
 /usr/lib/ntip-dashboard/runtime/bun         0755 root:root
 /usr/lib/ntip-dashboard/app/                read-only root:root
@@ -168,6 +196,7 @@ different owner or group.
   identity.key                              0600 ntip:ntip
   state.json                                0600 ntip:ntip
   enrollment.token                          0600 ntip:ntip
+  bootstrap.id                              0600 ntip:ntip (pending, non-secret)
 
 /run/ntip/                                  0770 root:ntip-admin
   ntsrv.sock                                0660 root:ntip-admin
@@ -188,11 +217,14 @@ returns `LegacyMasterStateUnsupported` and leaves every object untouched. Stop
 and preserve that directory; do not rename the file merely to force creation of
 an empty database.
 
-The packaged `client.json` is an inert documentation sample with a placeholder
-Master key. `ntcl config` replaces it using the authenticated key embedded in
-the enrollment credential; do not start `ntcl` from the untouched sample.
-Reconfiguration is a durable identity reset: it revokes the old local private
-key and assignment, and the next `ntcl up` generates a fresh Node identity.
+The packaged `client.json` is an inert, byte-stable sample with a placeholder
+Master key. The one-command installer accepts that exact sample and passes the
+strict redemption bundle directly to `ntcl bootstrap-import --stdin`; do not
+start `ntcl` from the untouched sample. Import durably installs the authenticated
+Master configuration, enrollment token, and non-secret invitation locator as
+one recoverable transition. The locator is removed after authenticated
+enrollment. `ntcl config` remains only for an already-issued pending v0.1 long
+credential; it is not the v0.2 provisioning path.
 
 For tests or nonstandard installations, `ntsrv` and `ntcl` accept global
 `--config`, `--state-dir`, and `--runtime-dir` overrides. Keep secret paths on a
@@ -223,20 +255,26 @@ space is allowed with a warning, but only use address space you control. Default
 loopback, link-local, multicast, non-canonical, and overlapping ranges are
 rejected.
 
-Create a Node with an explicit address and write the one-time credential to a
-protected file:
+The dashboard is the primary Node-creation surface. It atomically creates the
+inventory row and short-lived invitation after superuser reauthentication, so
+you may defer Node creation until the management services in section 6 are
+ready. For local OS-authorized administration, create the same invitation in a
+protected JSON file:
 
 ```sh
 umask 077
 ntsrv node create node01 --vnr vnr0 --addr 10.1.0.2 \
-  --expires 24h --credential-out /root/node01.enrollment
+  --expires 24h --bootstrap-out /root/node01.bootstrap.json
 ```
 
-Transfer that file over a separate authenticated channel. The credential is a
-bearer token until consumed or expired. Do not paste it into chat, tickets,
-logs, or a command line.
+The file contains only the public eight-character locator, secret short code,
+and expiry. It never contains the internal 122-character enrollment
+credential. Treat the short code as a bearer secret, transfer it separately
+from the installer command, and delete the file after handoff. Redemption still
+requires the configured HTTPS service and SPKI pin.
 
-Optional prefixes physically reachable behind a Node are explicit:
+After the Node exists by either path, optional prefixes physically reachable
+behind it are explicit:
 
 ```sh
 ntsrv route add 192.168.178.0/24 node01
@@ -268,37 +306,46 @@ sudo ntsrv user bootstrap admin --password-stdin \
 Delete the protected input file after verifying access. Do not pass the
 password as an argument or retain it in shell history.
 
-## 5. Configure a Node
+## 5. Bootstrap a Node
 
-The `config` command writes configuration and enrollment material only; it does
-not contact the Master:
+Complete the API, bootstrap-assets, HTTPS, and optional dashboard setup in
+section 6 before provisioning a Node. In the dashboard, choose the VNR and
+address, enter the exact Node name confirmation, and reauthenticate. Successful
+creation shows one immutable summary, one pinned installation command, one
+`XXX-XXX-XXX` code, and the server-authored expiry. Save the command and code
+separately before acknowledging the disclosure.
 
-```sh
-ntcl config 203.0.113.10:49152 node01 \
-  --credential-file /root/node01.enrollment
-```
+On a fresh supported Linux Node, paste the command exactly as displayed. It
+runs under `sudo`, downloads only over HTTPS with the configured SPKI pin and
+HTTP/1.1, and prompts silently for the code through `/dev/tty`. The code never
+appears in argv, the environment, or a URL. The installer then:
 
-Endpoints may be IPv4, bracketed IPv6, or DNS with a port:
+1. validates Linux 6.1+, systemd, TUN, and the supported CPU architecture;
+2. downloads the manifest-selected Node-only archive without following a
+   redirect and verifies its embedded SHA-256 digest;
+3. pipes the strict redemption bundle directly to
+   `ntcl bootstrap-import --stdin`;
+4. enables and starts only `ntcl.service`; and
+5. waits boundedly for enrollment, preserving state and printing diagnostic
+   commands if the Node remains pending.
 
-```text
-203.0.113.10:49152
-[2001:db8::10]:49152
-master.example.net:49152
-```
+The authoritative UDP endpoint comes from `/etc/ntip/server.json` through the
+validated redemption bundle. It may be IPv4, bracketed IPv6, or DNS with a
+port. DNS selects an endpoint but does not authenticate the Master; the
+credential inside the bundle embeds the Master public key, and the enrollment
+handshake authenticates it.
 
-DNS selects an endpoint but does not authenticate the Master; the credential's
-embedded Master public key does that. `--credential-stdin` and the hidden TTY
-prompt are also safe ingestion paths. The positional credential form remains
-compatible but prints a warning because shell history and process inspection
-can expose it.
+An interrupted same-invitation import is idempotent. A different invitation,
+an enrolled identity, unrelated local configuration/token, a running Master or
+Node, a mismatched binary, or an occupied `ntip0` is refused rather than
+overwritten. The non-secret `bootstrap.id` marker remains only while enrollment
+is pending and is removed after authenticated completion.
 
-When reconfiguring an existing Node, first run `ntsrv node enrollment reset` on
-the Master and use the newly issued credential. `ntcl config` then durably
-installs that credential and public configuration, deletes the old local
-private identity, and clears the old assignment as one recoverable operation.
-If the host loses power, `ntcl up` completes the pending operation before it
-loads any identity material. The new private identity is generated only on the
-next `up`; the old key is never retained across reconfiguration.
+`ntcl config --credential-file`, `--credential-stdin`, and its hidden TTY input
+remain solely for a long credential already issued by a v0.1 Master. v0.2 never
+prints or downloads a new long credential. A positional legacy credential is
+still parsed for compatibility but warns because argv and shell history can
+expose it.
 
 On first `up`, the Node generates its permanent key locally and performs
 single-use XKpsk1 enrollment. It durably stages the authenticated Node UUID,
@@ -310,7 +357,22 @@ session state.
 
 ## 6. Start, stop, and inspect
 
-Systemd runs foreground mode. On a Master host, enable `ntsrv`:
+Systemd runs foreground mode. Before first Master startup, replace the sample
+UDP endpoint with the one externally reachable endpoint that every Node must
+use. It is deployment authority and is never inferred from HTTP Host,
+forwarded headers, or a provider interface:
+
+```json
+{
+  "schema_version": 2,
+  "listen_port": 49152,
+  "tun_name": "ntip0",
+  "service_socket_path": "/run/ntip-api/ntsrv-api.sock",
+  "public_udp_endpoint": "203.0.113.10:49152"
+}
+```
+
+On the Master host, enable `ntsrv`:
 
 ```sh
 systemctl enable --now ntsrv
@@ -318,26 +380,47 @@ systemctl status ntsrv
 journalctl -u ntsrv
 ```
 
-To enable the optional API, first replace the invalid sample origin with the
-one exact lowercase HTTPS origin users will open. Do not include a path or
-trailing slash. Keep the listener on a canonical loopback address:
+Prepare the public TLS certificate before configuring the API. Derive its SPKI
+pin from the exact certificate/key pair NGINX will serve:
+
+```sh
+openssl x509 -in /etc/nginx/ntip/ntip.crt -pubkey -noout \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256 -binary \
+  | openssl base64 -A
+```
+
+Prefix the resulting Base64 text with `sha256//`. In `/etc/ntip/api.json`,
+replace the invalid sample origin and pin with the exact lowercase HTTPS origin
+users and Nodes will open. Do not include a path or trailing slash. Keep the
+listener on canonical loopback and keep the manifest path absolute:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "bind_address": "127.0.0.1",
   "port": 8787,
   "service_socket": "/run/ntip-api/ntsrv-api.sock",
   "public_https_origin": "https://ntip.example.com",
+  "bootstrap_spki_pin": "sha256//BASE64_SHA256_OF_SPKI",
+  "bootstrap_manifest_path": "/etc/ntip/bootstrap-assets.json",
   "workers": 4,
   "maximum_connections": 256
 }
 ```
 
-Then start the API and verify both local health states:
+Confirm that the matching bootstrap-assets package from section 1 installed a
+strict manifest before starting the API:
 
 ```sh
+test -r /etc/ntip/bootstrap-assets.json
+test -d /usr/share/ntip/bootstrap-assets
 systemctl enable --now ntip-api
+```
+
+Then verify both local health states:
+
+```sh
 curl --fail http://127.0.0.1:8787/api/v1/health/live
 curl --fail http://127.0.0.1:8787/api/v1/health/ready
 journalctl -u ntip-api
@@ -359,17 +442,26 @@ fields, and both the listener and internal API must remain on loopback:
 }
 ```
 
-Terminate public TLS in an operator-managed proxy. Give `/api/v1` routing
-priority and send it directly to `127.0.0.1:8787`; send every page route to
-`127.0.0.1:3000`. The browser-facing scheme, host, and optional port must equal
-the API's `public_https_origin` exactly. Disable CORS, do not expose either
+Terminate public TLS in an operator-managed proxy. Begin with the packaged
+`/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example` and adapt its
+listen address, certificate paths, and public server name. It gives the
+strict installer/redeem/static locations higher priority than the dashboard,
+bounds and rate-limits anonymous redemption, disables its buffering/cache/log,
+and serves only manifest-shaped immutable asset basenames.
+
+Give `/api/v1` priority and send it directly to `127.0.0.1:8787`; send page
+routes to `127.0.0.1:3000`. The browser-facing scheme, host, and optional port
+must equal `public_https_origin` exactly. Disable CORS, do not expose either
 loopback port, and do not use forwarded identity or client-IP headers for
 authorization or audit. The dashboard has no `/api/v1` fallback rewrite; a
 missing or lower-priority proxy route fails visibly at the page service.
 
 ```text
-https://ntip.example.com/api/v1/* -> http://127.0.0.1:8787/api/v1/*
-https://ntip.example.com/*        -> http://127.0.0.1:3000/*
+https://ntip.example.com/enrollment/v1/redeem -> http://127.0.0.1:8787
+https://ntip.example.com/enrollment/LOCATOR   -> http://127.0.0.1:8787
+https://ntip.example.com/enrollment/assets/*  -> /usr/share/ntip/bootstrap-assets
+https://ntip.example.com/api/v1/*              -> http://127.0.0.1:8787/api/v1/*
+https://ntip.example.com/*                     -> http://127.0.0.1:3000/*
 ```
 
 Start the dashboard only after the API is ready and the proxy is configured:
@@ -531,22 +623,29 @@ automation before directing new traffic to it.
 
 ## 9. Enrollment maintenance
 
-Replace an unused credential:
+Replace an unused invitation from the dashboard's Node detail view, or write the
+replacement disclosure to a new protected local file:
 
 ```sh
-ntsrv node enrollment renew node01
+umask 077
+ntsrv node enrollment renew node01 \
+  --bootstrap-out /root/node01-bootstrap-replacement.json
 ```
 
 If the Node private key is lost or suspected compromised, reset the identity:
 
 ```sh
-ntsrv node enrollment reset node01
+umask 077
+ntsrv node enrollment reset node01 \
+  --bootstrap-out /root/node01-bootstrap-reset.json
 ```
 
-Reset revokes the stored public key, active sessions, and unused credentials,
-then creates a new one-time credential. Reconfigure the intended Node using the
-new credential. A malicious old Node cannot reconnect after reset, but existing
-kernel flows may fail and must be retried.
+Both files contain the public locator, secret short code, and expiry only.
+Replacement atomically revokes its unused predecessor. Reset revokes the stored
+public key, active protocol sessions, prior invitation, and unused enrollment
+state, then returns a fresh invitation. Run the newly generated pinned command
+on the intended Node and type its new code. A malicious old Node cannot
+reconnect after reset, but existing kernel flows may fail and must be retried.
 
 ## 10. Web administration security
 
@@ -621,8 +720,10 @@ systemctl start ntip-api
 
 Before replacement, NTIP validates the source and creates a private recoverable
 `ntip-pre-restore-*.sqlite3` beside the live database. It validates again after
-revoking every restored web session, atomically installs the image, and records
-the restore in audit. Every user must log in again. Preserve the recoverable
+revoking every restored web session and unused bootstrap-linked enrollment,
+atomically installs the image, and records the restore in audit. Every user
+must log in again, and every unused restored invitation must be replaced.
+Preserve the recoverable
 copy until the restored Master has passed inventory, enrollment, protocol, and
 backup verification.
 
@@ -636,8 +737,8 @@ If startup reports corrupt or newer state:
    entire NTN and re-enrolling every Node.
 
 Master identity loss cannot be recovered from Nodes. Restore the Master backup
-or rebuild the NTN and distribute new credentials. Node identity loss is
-recovered with server-side enrollment reset.
+or rebuild the NTN and issue fresh bootstrap invitations. Node identity loss is
+recovered with server-side enrollment reset plus a new invitation.
 
 ## 12. Upgrade and rollback
 
@@ -647,8 +748,9 @@ Before an upgrade:
 2. Take an online database backup, then stop `ntip-dashboard`, `ntip-api`,
    `ntsrv`, and `ntcl` as applicable.
 3. Verify the new archive checksum and provenance.
-4. Install the exact-version, architecture-matched core, API, and dashboard
-   archives in that order; start one Master/one Node and inspect status/logs.
+4. Install the exact-version, architecture-matched core, API, bootstrap-assets,
+   and dashboard archives in that order; start one Master/one Node and inspect
+   status/logs.
 5. Expand to two Nodes and roaming, then routed-prefix/NAT, then scale.
 
 Rollback stops the dashboard, API, and Master services, restores the prior
@@ -663,13 +765,17 @@ schema it does not understand.
 
 ```sh
 sudo ./scripts/uninstall-dashboard.sh
+sudo ./scripts/uninstall-bootstrap-assets.sh
 sudo ./scripts/uninstall-api.sh
 sudo ./scripts/uninstall.sh
 ```
 
-The dashboard, API, and core uninstallers stop/disable dependent services and
-remove their own binaries, runtimes, units, documentation, and NTIP-owned
-runtime files. They deliberately preserve `/etc/ntip`, `/var/lib/ntip`,
+The dashboard, bootstrap-assets, API, and core uninstallers stop/disable
+dependent services as needed and remove their own binaries, assets, runtimes,
+units, documentation, and NTIP-owned runtime files. The bootstrap-assets
+uninstaller removes its manifest and immutable archive directory; replacing
+those files while an invitation is live makes that invitation unusable. The
+other uninstallers deliberately preserve `/etc/ntip`, `/var/lib/ntip`,
 `/run/ntip-api`, and all service identities/groups. Review and remove persistent
 state manually only after retaining any required backup:
 

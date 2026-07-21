@@ -7,7 +7,12 @@
     ".": "./src/index.ts",
     "./schema": "./src/generated/schema.ts",
     "./openapi": "./openapi/ntip-v1.yaml",
-    "./openapi.json": "./src/generated/openapi.json"
+    "./openapi.json": "./src/generated/openapi.json",
+    "./bootstrap": "./src/generated/bootstrap-client.ts",
+    "./bootstrap-client": "./src/generated/bootstrap-client.ts",
+    "./bootstrap-schema": "./src/generated/bootstrap-schema.ts",
+    "./bootstrap-openapi": "./openapi/ntip-bootstrap-v1.yaml",
+    "./bootstrap-openapi.json": "./src/generated/bootstrap-openapi.json"
   },
   "files": [
     "openapi",

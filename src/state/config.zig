@@ -16,6 +16,9 @@ pub const ServerBootstrapConfig = struct {
     listen_port: u16 = 49152,
     tun_name: []const u8 = "ntip0",
     service_socket_path: []const u8 = default_service_socket_path,
+    /// Authoritative externally reachable endpoint embedded in bootstrap
+    /// bundles. It is never inferred from the UDP listener or HTTP Host.
+    public_udp_endpoint: []const u8,
 };
 
 pub const TrafficConfig = struct {
@@ -62,6 +65,7 @@ pub fn decodeServerBootstrap(allocator: std.mem.Allocator, bytes: []const u8) !s
     if (parsed.value.listen_port == 0) return error.InvalidConfig;
     try validateTunName(parsed.value.tun_name);
     try validateServiceSocketPath(parsed.value.service_socket_path);
+    cli_common.validateEndpoint(parsed.value.public_udp_endpoint) catch return error.InvalidConfig;
     return parsed;
 }
 
@@ -208,11 +212,12 @@ test "server config defaults pin v0.1 operational thresholds" {
 
 test "v0.2 server bootstrap excludes operational settings and is strict" {
     const bytes =
-        \\{"schema_version":2,"listen_port":49152,"tun_name":"ntip0","service_socket_path":"/run/ntip-api/ntsrv-api.sock"}
+        \\{"schema_version":2,"listen_port":49152,"tun_name":"ntip0","service_socket_path":"/run/ntip-api/ntsrv-api.sock","public_udp_endpoint":"203.0.113.10:49152"}
     ;
     const parsed = try decodeServerBootstrap(std.testing.allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u16, 49152), parsed.value.listen_port);
+    try std.testing.expectEqualStrings("203.0.113.10:49152", parsed.value.public_udp_endpoint);
 
     const operational_shadow =
         \\{"schema_version":2,"inner_mtu":1400}
@@ -220,11 +225,15 @@ test "v0.2 server bootstrap excludes operational settings and is strict" {
     try std.testing.expectError(error.InvalidConfigJson, decodeServerBootstrap(std.testing.allocator, operational_shadow));
     try std.testing.expectError(
         error.InvalidConfig,
-        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"service_socket_path\":\"relative.sock\"}"),
+        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"service_socket_path\":\"relative.sock\",\"public_udp_endpoint\":\"203.0.113.10:49152\"}"),
     );
     try std.testing.expectError(
         error.InvalidConfig,
-        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"service_socket_path\":\"/run/../ntsrv-api.sock\"}"),
+        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"service_socket_path\":\"/run/../ntsrv-api.sock\",\"public_udp_endpoint\":\"203.0.113.10:49152\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        decodeServerBootstrap(std.testing.allocator, "{\"schema_version\":2,\"public_udp_endpoint\":\"203.0.113.10:0\"}"),
     );
 }
 

@@ -114,9 +114,9 @@ an explicit replacement. The removed long-credential management route and UI
 are not compatibility surfaces; the internal credential parser and wire
 exchange remain.
 
-Local human administration writes the same three non-secret/public invitation
-fields to an explicitly requested protected `--bootstrap-out FILE`; it never
-prints a long credential or secret to a terminal transcript.
+Local human administration writes the public locator, secret short code, and
+expiry to an explicitly requested protected `--bootstrap-out FILE`; it never
+prints the long internal credential or the short code to a terminal transcript.
 
 ## Public Bootstrap v1 contract
 
@@ -174,6 +174,31 @@ configuration, Node installer/uninstaller, documentation, checksums, and SBOM.
 They contain no `ntsrv`, Master state, API identity, or server unit. A separate
 Master bootstrap-assets package contains both supported architecture archives
 and a checksummed manifest referenced by strict API configuration.
+
+Install that package on the Master only after the matching core and API
+packages are present:
+
+```sh
+sudo ./scripts/install-bootstrap-assets.sh
+```
+
+The installer validates both architecture archives before mutation, installs
+the strict manifest as `/etc/ntip/bootstrap-assets.json` owned by
+`root:ntip-api` mode `0640`, and installs immutable public payloads under
+`/usr/share/ntip/bootstrap-assets` as `root:root` mode `0644`. It retains older
+versioned payloads during an upgrade so an already-disclosed, still-valid
+command does not lose its immutable download target.
+
+The package also installs
+`/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example`. Copy and adapt
+that example inside NGINX's `http {}` context; the installer deliberately does
+not enable it or guess a TLS certificate, public address, or provider
+interface. The example routes only canonical eight-character installer paths
+and versioned asset basenames, bounds redemption bodies to 128 bytes, accepts
+only fixed-length `application/json` POSTs, strips cookies and forwarded
+identity headers, disables redemption buffering/caching/access logging, and
+applies the socket-peer rate of ten requests per minute with burst five. Its
+existing `/api/v1` and dashboard proxy blocks remain unchanged.
 
 ## Dashboard disclosure lifecycle
 

@@ -10,62 +10,48 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: one-command Node bootstrap architecture and threat model
-  accepted; schema 2, Bootstrap v1, Node-only artifacts, installer/import,
-  dashboard disclosure flow, and live reset are in progress on
-  `feat/node-bootstrap`. The currently deployed vps02 state remains the
-  verified schema-1/OpenAPI-1.0.1 segmented-input build until the complete
-  lockstep artifact set passes staging.
-- SQLite schema version: `1`
+- Current milestone: the one-command Node bootstrap implementation is locally
+  complete and verified on `feat/node-bootstrap`; matched Linux artifact
+  staging, the explicitly authorized fresh vps02 database reset, and live
+  handoff remain. The currently deployed vps02 state is still the verified
+  schema-1/OpenAPI-1.0.1 segmented-input build until that atomic rollout.
+- SQLite schema version: `2`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
   runtime lifecycle wiring implemented
-- OpenAPI revision: `1.0.1` (`packages/contracts/openapi/ntip-v1.yaml`, 81
-  schemas). This revision fixes inventory-error semantics without adding or
-  removing a public path, operation, or schema shape.
-- Target contracts for the active milestone: management OpenAPI `1.1.0` plus
-  a separate cookie-independent Bootstrap v1 contract. Neither target is
-  recorded as implemented until generated drift and Zig conformance pass.
+- OpenAPI revisions: management `1.1.0`
+  (`packages/contracts/openapi/ntip-v1.yaml`, 37 paths, 52 operations, 85
+  schemas) and cookie-independent Bootstrap `1.0.0`
+  (`packages/contracts/openapi/ntip-bootstrap-v1.yaml`, 3 paths, 3 operations,
+  15 schemas). Both generated contract families pass drift and conformance.
 - Dashboard: Direction A implementation present as a pinned Bun 1.3.14 /
-  Next.js 16.2.10 standalone service. The current segmented-input/actionable-
-  error/connection-lifecycle tree passes typecheck, lint, 40/40 unit tests, the
-  12-route production build, exact-Bun runtime smoke, and 19/19 Playwright
-  journeys.
-- Last verified commit: `afaf7357c6c29a96568fe4fad10eb8c215b62c47`
-  (dashboard API worker-starvation fix)
-- Last verified implementation: commit `afaf7357c6c29a96568fe4fad10eb8c215b62c47`;
-  explicit closure of dashboard-owned loopback HTTP/1.1 connections with an
-  exact-Bun on-wire regression, plus selection-only segmented VNR/Node/route
-  inputs, allocation-aware Node completion, actionable bounded inventory
-  violations, private service IPC v2, OpenAPI 1.0.1, shared browser error
-  handling, and the prior
-  live/offline SQLite Master cutover, DB-free
-  `ntip-api`, embedded contract, authenticated auth/inventory/security and
-  operations dispatch, both live admin sockets, encrypted-path connectivity
-  checks, enrollment application service, bounded/yielding backup and locked
-  atomically audited and semantically validated restore, exact immutable-
-  generation publication barriers, atomic mutation/audit/idempotency markers,
-  absolute local-socket phase deadlines, off-thread Argon2 runtime checkpoints,
-  staged service control, transition-only runtime events, revision
-  acknowledgement, contract-aligned percent-decoded management queries,
-  Direction A dashboard pages, and three separately installable deployment
-  packaging paths; deployed and verified on vps02, 2026-07-21
+  Next.js 16.2.10 standalone service. The bootstrap disclosure tree passes
+  typecheck, lint, 46/46 unit tests, the production build, exact-Bun runtime
+  smoke, and 26/26 Playwright journeys.
+- Last verified commit: `79b585383deb8c55e14ae9279bfb22ec98da3397`
+  (accepted one-command bootstrap design). The implementation evidence below
+  is for this feature changeset and must be replaced with its commit identity
+  in the immediate verification follow-up before live rollout is complete.
+- Last verified implementation: current `feat/node-bootstrap` feature changeset;
+  schema-2 invitation persistence/derivation/throttling, atomic inventory and
+  one-time issuance, public redemption and generated pinned installer, strict
+  bootstrap import, Node-only/bootstrap-assets packaging, configuration and
+  NGINX contracts, management/dashboard flows, consumed-marker idempotency,
+  restore/consume invalidation, and unchanged Node wire enrollment.
 - Migration 0001 SHA-256:
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
-- Proof commands: `zig build check --summary all` (429/429 aggregate tests)
-  and `zig build test --summary all` (420/420) pass for the current backend
-  slice; dashboard typecheck, lint, tests (40/40), production build, exact-Bun
-  runtime smoke, and Playwright (19/19) pass. Settled-tree contract validation,
-  typecheck, lint, generated-artifact drift, and 13/13 tests pass. The three
-  x86_64 release archives pass structure and SBOM checks, and the combined
-  source/archive secret scan passes across 3,333 archive members. Prior
-  verified evidence includes
-  `zig build cross-build --summary all` for both static-musl targets (18/18),
-  native build/version smoke, dashboard production build/runtime smoke and
-  14/14 Playwright, different-root dashboard reproducibility,
-  archive/installer and packaging checks, privileged AArch64 systemd/runtime
-  and namespace checks, and exact-v0.1 compatibility execution. Native x86_64
-  core/API/dashboard installation and service execution pass on vps02.
+- Migration 0002 SHA-256:
+  `dad2d0793efbf1ca7e71a566e821ab282ab3a8cafbdf4c608ff36fe0dda8e755`
+- Proof commands: `zig build check --summary all` passes 47/47 steps and
+  452/452 aggregate tests, including both static-musl cross targets;
+  `zig build test --summary all` passes 443/443. Management/Bootstrap contract
+  validation, generated drift, typecheck, and 20/20 tests pass. Dashboard
+  typecheck, lint, 46/46 unit tests, production build, exact-Bun runtime smoke,
+  and 26/26 Playwright journeys pass. Packaging/configuration, source secret
+  scan, installer, bootstrap-assets install, NGINX syntax/contract, workflow
+  YAML, shell syntax, and ShellCheck gates pass. Clean release reproducibility,
+  architecture-matched package execution, and live deployment remain Linux
+  staging evidence, not claims of this local macOS pass.
 
 ## Current State
 
@@ -282,16 +268,59 @@ downloads with generate, replace, and reset-plus-generate actions.
 
 ### In progress
 
-- One-command Node bootstrap architecture, lifecycle, disclosure boundaries,
-  installer state classes, public/management contracts, and threat controls are
-  recorded in `docs/node-bootstrap.md` and the architecture/security documents.
-- Implementation advances in six independently verified commits: design and
-  contracts; schema/domain/CLI; IPC/HTTP/configuration/NGINX; Node import and
-  packaging; dashboard; then release/deployment evidence and the authorized
-  fresh vps02 database reset.
+- Build and validate the matched native x86_64 service/dashboard artifacts and
+  both static-musl Node archives on Linux, then stage every binary,
+  configuration, manifest, asset, and NGINX change before touching live state.
+- Atomically deploy schema 2 on vps02, perform only the explicitly authorized
+  database-file reset, bootstrap the initial administrator, verify empty
+  inventory and the public pinned installer path, and leave vps01/ubuntu110
+  unchanged for the operator-driven invitation test.
 
 ### Implemented
 
+- Schema 2 adds permanently unique public bootstrap locators, random enrollment
+  handles, derivation/lifecycle timestamps, first-redemption state, and bounded
+  real-locator throttle state. The short code, credential secret, bootstrap
+  root key, and encoded internal credential never enter SQLite. Restore
+  transactionally revokes every restored unused bootstrap-linked verifier.
+- A versioned HKDF/HMAC construction rooted in the Master identity recreates
+  the unchanged `ntip-enroll-v1` credential in memory. Atomic create,
+  replacement, reset, explicit revocation, protocol consumption, expiry,
+  durable real-locator cooldowns, and a keyed bounded unknown-locator cooldown
+  are covered. Correct redemption remains repeatable only until invalidation.
+- Management OpenAPI 1.1.0 adds atomic superuser Node bootstrap,
+  generate/replace/revoke/reset operations and non-secret installer
+  configuration while preserving inventory-only Operator creation. Bootstrap
+  v1 separately defines cookie-independent shell delivery, strict anonymous
+  redemption, and immutable NGINX-owned assets. Both generated TypeScript
+  contract families and Zig conformance gates pass.
+- `server.json` schema 2 requires the authoritative public UDP endpoint;
+  `api.json` schema 2 requires the exact HTTPS SPKI pin and root-owned assets
+  manifest. The public HTTP edge rejects Origin, transfer encoding, redirects,
+  non-JSON/oversized/unknown redemption fields, caps anonymous work at two,
+  returns uniform invitation failures, and applies `no-store`.
+- `ntcl bootstrap-import --stdin` validates the entire bounded redemption
+  bundle before mutation, holds the lifetime lock, commits configuration,
+  internal enrollment token and non-secret marker through the recoverable Node
+  transaction, accepts only the same-ticket interrupted state, and removes the
+  marker only after authenticated protocol enrollment completes.
+- Deterministic x86_64/AArch64 Node-only static-musl packages exclude Master/API
+  state and units. A separate bootstrap-assets package supplies both archives
+  and a root-owned checksummed manifest. The generated installer disables
+  inherited tracing/startup hooks, forces pinned HTTPS over HTTP/1.1 with no
+  redirects and fixed timeouts, verifies archive size/digest/shape, prompts
+  only on `/dev/tty`, pipes redemption directly to `ntcl`, preserves pending
+  state, and emits bounded recovery diagnostics.
+- The dashboard now reauthenticates superusers before atomic Node creation,
+  validates exact non-secret configuration and one-time responses at runtime,
+  pins command/code disclosure against accidental dismissal, supports manual
+  copy and explicit revoke-before-discard, recovers uncertain committed
+  creation by exact Node name, and offers contextual generate/replace/reset
+  actions. Operators retain inventory-only creation and a superuser handoff.
+- Invitation issuance idempotency retains only an exact consumed marker after
+  commit, including response-construction failure, while ordinary failed-login
+  4xx replay remains exact. The dashboard never retries a one-time request;
+  stale configuration reads and stale Node action intent are rejected.
 - Living repository brief established.
 - Product register and seed visual design context established.
 - Direction A, "The Calibrated Field Instrument," is the approved dashboard
@@ -803,12 +832,12 @@ downloads with generate, replace, and reset-plus-generate actions.
 - [x] Dashboard loopback worker-starvation fix and pinned-Bun wire regression
 - [x] Dashboard-only redeployment and live Node-detail recovery verification
 - [x] Packaging, systemd, CI, documentation, and release evidence
-- [ ] Bootstrap architecture, threat model, management 1.1.0 and Bootstrap v1
+- [x] Bootstrap architecture, threat model, management 1.1.0 and Bootstrap v1
   contracts
-- [ ] SQLite schema 2, bootstrap derivation/lifecycle, and protected CLI output
-- [ ] IPC v2 bootstrap operations, public HTTP, strict configuration, and NGINX
-- [ ] `ntcl bootstrap-import`, Node-only archives, assets manifest, and installer
-- [ ] Dashboard issuance/disclosure/replacement/reset journeys
+- [x] SQLite schema 2, bootstrap derivation/lifecycle, and protected CLI output
+- [x] IPC v2 bootstrap operations, public HTTP, strict configuration, and NGINX
+- [x] `ntcl bootstrap-import`, Node-only archives, assets manifest, and installer
+- [x] Dashboard issuance/disclosure/replacement/reset journeys
 - [ ] Full release gate, atomic vps02 deployment, authorized fresh-state reset,
   and live handoff
 
@@ -838,9 +867,11 @@ bun test ./apps/dashboard/test/unit/server-api-headers.test.ts
 bun run dashboard:build
 bun run dashboard:runtime-smoke
 bun run dashboard:e2e
-python3 scripts/check-node-bootstrap-contract.py
-python3 scripts/check-node-bootstrap-packaging.py
 scripts/check-node-bootstrap-installer.sh
+python3 scripts/check-bootstrap-assets.py "$(scripts/check-version.sh)" \
+  dist/bootstrap-assets.json dist
+scripts/check-bootstrap-assets-install.sh
+scripts/check-nginx-bootstrap-config.sh
 python3 scripts/check-packaging-contract.py
 python3 scripts/check-vendored-sqlite.py
 python3 scripts/check-secret-exposure.py
@@ -861,23 +892,29 @@ scripts/check-systemd-security.sh --offline packaging/systemd/*.service
 Latest evidence:
 
 - Current working-tree backend slice: `zig build test --summary all` passed
-  420/420 and `zig build check --summary all` passed 429/429, including private
-  IPC v2 field-violation framing, public mapping, bounded forwarding, and
-  contract-conformance coverage.
+  443/443 and `zig build check --summary all` passed 47/47 steps with 452/452
+  aggregate tests. This includes schema-2 migrations, derivation and throttle
+  behavior, atomic lifecycle/rollback, restore/consume invalidation, public
+  HTTP hardening, consumed-marker replay, strict importer/recovery, IPC, fuzz,
+  integration, formatting, version consistency, and both musl cross targets.
 - Current integrated dashboard slice: `bun run dashboard:typecheck`,
   `bun run dashboard:lint`, and `bun run dashboard:test` passed; the unit
-  result is 40/40 and includes 14 segmented-network tests for BigInt
+  result is 46/46 and includes strict bootstrap response/config parsing,
+  pinned-command construction, no automatic one-time retry, manual-copy
+  fallback, plus 14 segmented-network tests for BigInt
   boundaries, `/20` partial prefixes, `/24` allocation holes, `/30`
   exhaustion, `/16` host/broadcast semantics, retained-invalid host bits,
   fixed segments, no parent change callback during render, and three internal
   header tests for explicit close, anonymous reads, and cookie-delimiter
   rejection.
-- Settled-tree contract validation, typecheck/lint, generated-artifact drift,
-  and 13/13 contract tests pass. The 12-route dashboard production build,
-  exact-Bun runtime smoke, and 19/19 Playwright journeys pass on the same tree.
-  The core and API x86_64 static-musl archives and dashboard x86_64 glibc
-  archive pass contract/SBOM checks; source and all 3,333 archive members pass
-  the secret-exposure scan.
+- Management 1.1.0 and Bootstrap 1.0.0 validation, typecheck, generated drift,
+  and 20/20 contract tests pass. The dashboard production build, exact-Bun
+  runtime smoke, and 26/26 Playwright journeys pass on the same tree, including
+  superuser atomic creation, disclosure pinning, collision/lost-response
+  recovery, consumed-marker replay, replacement, revocation, reset, stale
+  intent/config races, operator handoff, accessibility, and existing inventory
+  scenarios. Packaging/configuration, source secret, installer, asset install,
+  NGINX, workflow YAML, shell syntax, and ShellCheck gates pass.
 - The current pinned-Bun production smoke renders Activity through the exact
   standalone launcher, observes the protected layout plus four page reads,
   requires all five raw fixture requests to carry `Connection: close`, and

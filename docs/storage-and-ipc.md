@@ -11,7 +11,9 @@ compatible.
 | --- | --- | --- |
 | Master bootstrap | `/etc/ntip/server.json` | `root:root 0644` |
 | API bootstrap | `/etc/ntip/api.json` | `root:ntip-api 0640` |
+| Bootstrap-assets manifest | `/etc/ntip/bootstrap-assets.json` | `root:ntip-api 0640` |
 | Node bootstrap | `/etc/ntip/client.json` | `root:root 0644` |
+| Immutable Node assets | `/usr/share/ntip/bootstrap-assets` | `root:root 0755`; files `0644` |
 | Master state | `/var/lib/ntip/server` | `ntip:ntip 0700`; managed files `0600` |
 | Node state | `/var/lib/ntip/client` | `ntip:ntip 0700`; managed files `0600` |
 | Human IPC | `/run/ntip` | `root:ntip-admin 0770`; sockets `0660` |
@@ -51,9 +53,12 @@ public UDP endpoint, HTTPS origin, pin, and manifest path are explicit
 deployment authority and are never inferred from Host or forwarded headers.
 
 Node `client.json` remains schema 1 with `master`, `node`,
-`master_public_key`, `tun_name`, and `inner_mtu`. `ntcl config` derives the
-Master key from the enrollment credential and replaces configuration through
-the recoverable Node transaction described below.
+`master_public_key`, `tun_name`, and `inner_mtu`. The primary v0.2 path is
+`ntcl bootstrap-import --stdin`: it validates the strict redemption bundle,
+derives configuration from its internal enrollment credential, and commits the
+configuration, token, and non-secret bootstrap locator through the recoverable
+Node transaction described below. `ntcl config` retains the version-1
+transaction only for an already-issued pending v0.1 credential.
 
 ## Master SQLite ownership
 
@@ -68,7 +73,9 @@ The connection enforces:
 - foreign keys, `secure_delete=ON`, and `trusted_schema=OFF`;
 - prepared statements and strict tables;
 - transactional migrations whose source and stored checksums must match;
-- schema `PRAGMA user_version = 1` for migration `0001_management_plane.sql`.
+- schema `PRAGMA user_version = 2`, with
+  `0001_management_plane.sql` followed transactionally by
+  `0002_enrollment_bootstraps.sql`.
 
 The authoritative database stores inventory and enrollment; users,
 tombstones, hash-only web sessions, and login throttles; immutable settings
@@ -76,10 +83,14 @@ snapshots; runtime transition events and connectivity results; append-only
 audit entries, export receipts, and bounded idempotency records.
 
 Enrollment rows retain a 32-byte derived PSK only while status is `unused`.
-Consumption or revocation nulls it. Browser session and CSRF tokens are stored
-only as hashes. One-time enrollment credentials and temporary passwords are
-returned once, explicitly excluded from logs, and never stored as recoverable
-plaintext.
+Consumption or revocation nulls it. Bootstrap rows retain a public locator,
+random handle, lifecycle timestamps, and bounded throttle state, but never the
+short code, bootstrap root key, derived credential secret, or encoded internal
+credential. A valid redemption deterministically reconstructs the same internal
+credential until protocol consumption, expiry, revocation, or lockout. Browser
+session and CSRF tokens are stored only as hashes. Short codes, redemption
+responses, and temporary passwords are explicitly excluded from logs; the
+management surface discloses a short code only once.
 
 ### Transaction and publication rules
 
@@ -202,22 +213,28 @@ fresh Noise session may install a coherent restored Master generation.
 
 ### Recoverable Node reconfiguration
 
-`ntcl config` holds the Node `state.lock` and syncs a private, checksummed
+`ntcl bootstrap-import --stdin` and the legacy-compatible `ntcl config` both
+hold the Node `state.lock` and sync a private, checksummed
 `reconfigure.pending` containing the complete strict client JSON and exact
-enrollment credential. Recovery rolls it forward idempotently:
+internal enrollment credential. Bootstrap format 2 additionally includes the
+non-secret eight-byte locator; legacy format 1 includes no locator. Recovery
+rolls either fully validated intent forward idempotently:
 
 1. install and sync `enrollment.token`;
 2. install and sync `client.json` and its directory;
 3. durably delete the old `identity.key`;
-4. replace `state.json` with an empty unenrolled assignment; and
-5. durably delete `reconfigure.pending`.
+4. replace `state.json` with an empty unenrolled assignment;
+5. install `bootstrap.id` for format 2, or remove it for legacy format 1; and
+6. durably delete `reconfigure.pending`.
 
 `ntcl up` recovers the intent before reading configuration or identity. A
 malformed, oversized, corrupt, or newer intent fails closed.
 
-The intent header is `NTIPCTXN` (8 bytes), version `1` (1 byte), three zero
-bytes, and a big-endian `u32` config length. At most 1 MiB of JSON is followed
-by the 122-byte credential and a 32-byte BLAKE2s digest.
+The intent header is `NTIPCTXN` (8 bytes), format version (1 byte), marker
+length/reserved bytes (3 bytes), and a big-endian `u32` config length. At most
+1 MiB of JSON is followed by the 122-byte internal credential, an optional
+eight-byte bootstrap locator in format 2, and a 32-byte BLAKE2s digest. Format
+1 remains readable for interrupted v0.1-compatible reconfiguration.
 
 ### Binary secret container
 

@@ -31,6 +31,7 @@ export async function clearFaults(): Promise<void> {
 export async function setFault(options: Readonly<{
   path: `/api/v1/${string}`;
   status?: number;
+  afterRoute?: boolean;
   delayMilliseconds?: number;
   remaining?: number;
 }>): Promise<void> {

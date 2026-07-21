@@ -18,7 +18,9 @@ done
 for path in /usr/bin/ntsrv /usr/bin/ntip-api \
     /usr/lib/systemd/system/ntsrv.service \
     /usr/lib/systemd/system/ntip-api.service \
-    /etc/ntip/server.json /etc/ntip/api.json /var/lib/ntip/server
+    /etc/ntip/server.json /etc/ntip/api.json \
+    /etc/ntip/bootstrap-assets.json /usr/share/ntip/bootstrap-assets \
+    /var/lib/ntip/server
 do
     if [ ! -e "$path" ]; then
         echo "required installed NTIP path not found: $path" >&2
@@ -35,6 +37,16 @@ fi
 if [ -n "$(find /var/lib/ntip/server -mindepth 1 -maxdepth 1 -print -quit)" ]; then
     echo "systemd smoke requires an empty disposable server state directory" >&2
     exit 3
+fi
+if [ "$(stat -c '%U:%G:%a' /etc/ntip/bootstrap-assets.json)" != root:ntip-api:640 ]; then
+    echo "unexpected bootstrap-assets manifest ownership or mode" >&2
+    stat -c '%U:%G:%a %n' /etc/ntip/bootstrap-assets.json >&2
+    exit 1
+fi
+if [ "$(stat -c '%U:%G:%a' /usr/share/ntip/bootstrap-assets)" != root:root:755 ]; then
+    echo "unexpected bootstrap-assets directory ownership or mode" >&2
+    stat -c '%U:%G:%a %n' /usr/share/ntip/bootstrap-assets >&2
+    exit 1
 fi
 
 cleanup() {
@@ -174,14 +186,14 @@ if [ -z "$api_ready" ]; then
     exit 1
 fi
 printf '%s\n' "$api_ready" | jq -e \
-    '.status == "ready" and .ntsrv == "ready" and .databaseSchemaVersion == 1' \
+    '.status == "ready" and .ntsrv == "ready" and .databaseSchemaVersion == 2' \
     >/dev/null
 curl --fail --silent --show-error --max-time 2 \
     http://127.0.0.1:8787/api/v1/health/live \
     | jq -e '.status == "live"' >/dev/null
 curl --fail --silent --show-error --max-time 2 \
     http://127.0.0.1:8787/api/v1/openapi.json \
-    | jq -e '.openapi == "3.1.1" and .info.version == "1.0.0"' >/dev/null
+    | jq -e '.openapi == "3.1.1" and .info.version == "1.1.0"' >/dev/null
 
 api_pid=$(systemctl show -p MainPID --value ntip-api.service)
 case "$api_pid" in

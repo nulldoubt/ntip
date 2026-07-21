@@ -179,6 +179,23 @@ export interface paths {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/enrollment/bootstrap-config": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read non-secret installer origin and TLS pin configuration */
+        readonly get: operations["getEnrollmentBootstrapConfig"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/events": {
         readonly parameters: {
             readonly query?: never;
@@ -280,7 +297,11 @@ export interface paths {
         };
         readonly get?: never;
         readonly put?: never;
-        /** Revoke enrollment state and any unused credential */
+        /**
+         * Reset Node enrollment and issue a new bootstrap invitation
+         * @description Retires the active association, revokes any predecessor, and creates a
+         *     replacement invitation atomically. The short code is disclosed once.
+         */
         readonly post: operations["resetNodeEnrollment"];
         readonly delete?: never;
         readonly options?: never;
@@ -288,7 +309,7 @@ export interface paths {
         readonly patch?: never;
         readonly trace?: never;
     };
-    readonly "/nodes/{id}/enrollment-credentials": {
+    readonly "/nodes/{id}/enrollment-bootstrap": {
         readonly parameters: {
             readonly query?: never;
             readonly header?: never;
@@ -300,10 +321,40 @@ export interface paths {
         readonly get?: never;
         readonly put?: never;
         /**
-         * Issue and download a one-time enrollment credential
-         * @description The credential is returned once and recoverable plaintext is never persisted.
+         * Create or replace a Node bootstrap invitation
+         * @description Creates a new invitation for an unenrolled Node and atomically revokes
+         *     any unused predecessor. The short code is disclosed exactly once and
+         *     is never replayed from the idempotency store.
          */
-        readonly post: operations["issueEnrollmentCredential"];
+        readonly post: operations["createNodeEnrollmentBootstrap"];
+        /**
+         * Revoke a Node bootstrap invitation
+         * @description Revokes any unused invitation and enrollment verifier for the Node.
+         */
+        readonly delete: operations["revokeNodeEnrollmentBootstrap"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/nodes/actions/bootstrap": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Create a Node and one-time bootstrap invitation atomically
+         * @description Creates the inventory record, enrollment verifier, invitation, audit
+         *     entry, and durable generation in one transaction. The short code is
+         *     disclosed exactly once. Idempotent retries never replay the response;
+         *     after a lost response the caller must locate the committed Node by its
+         *     unique name and explicitly replace the invitation.
+         */
+        readonly post: operations["createNodeBootstrap"];
         readonly delete?: never;
         readonly options?: never;
         readonly head?: never;
@@ -698,6 +749,16 @@ export interface components {
             readonly session: components["schemas"]["Session"];
             readonly user: components["schemas"]["User"];
         };
+        /**
+         * @description Public, permanently unique bootstrap locator; it is not an authenticator.
+         * @example ABCDEFGH
+         */
+        readonly BootstrapId: string;
+        /**
+         * @description One-time-displayed 45-bit bootstrap code. It is never persisted or logged.
+         * @example ABC-DEF-GHJ
+         */
+        readonly BootstrapSecretCode: string;
         readonly ChangePasswordRequest: {
             readonly currentPassword: components["schemas"]["Password"];
             readonly newPassword: components["schemas"]["Password"];
@@ -730,16 +791,24 @@ export interface components {
             /** @description Exact resource name or operation word typed by the user. */
             readonly confirmation: string;
         };
-        /** @description Single-use credential text including its version prefix. */
-        readonly EnrollmentCredential: string;
-        readonly EnrollmentCredentialRequest: {
-            /** @description Exact Node name typed by the user. */
-            readonly confirmation: string;
+        readonly EnrollmentBootstrapConfig: {
             /**
-             * Format: int64
-             * @description Credential validity, from one minute through 30 days.
+             * Format: uri
+             * @description Exact HTTPS origin serving the public bootstrap interface.
+             * @example https://43.157.23.67
              */
-            readonly expiresInSeconds: number;
+            readonly installerOrigin: string;
+            /**
+             * @description curl-compatible SHA-256 pin for the configured TLS leaf public key.
+             * @example sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+             */
+            readonly spkiPin: string;
+        };
+        /** @description One-time management disclosure that must not be cached, logged, or replayed. */
+        readonly EnrollmentBootstrapDisclosure: {
+            readonly bootstrapId: components["schemas"]["BootstrapId"];
+            readonly expiresAt: components["schemas"]["Timestamp"];
+            readonly secretCode: components["schemas"]["BootstrapSecretCode"];
         };
         /** @enum {string} */
         readonly EnrollmentState: "unenrolled" | "credential_issued" | "enrolled";
@@ -841,6 +910,18 @@ export interface components {
             readonly name: components["schemas"]["Name"];
             readonly updatedAt: components["schemas"]["Timestamp"];
             readonly vnrName: components["schemas"]["Name"];
+        };
+        readonly NodeBootstrapCreate: {
+            readonly address: components["schemas"]["Ipv4Address"];
+            /** @description Must exactly match `name`. */
+            readonly confirmation: components["schemas"]["Name"];
+            readonly name: components["schemas"]["Name"];
+            readonly vnrName: components["schemas"]["Name"];
+        };
+        /** @description Node state plus a one-time bootstrap invitation disclosure. */
+        readonly NodeBootstrapDisclosure: {
+            readonly bootstrap: components["schemas"]["EnrollmentBootstrapDisclosure"];
+            readonly node: components["schemas"]["Node"];
         };
         readonly NodeCreate: {
             readonly address: components["schemas"]["Ipv4Address"];
@@ -1285,14 +1366,16 @@ export type AuditPage = components['schemas']['AuditPage'];
 export type AuditPruneRequest = components['schemas']['AuditPruneRequest'];
 export type AuditPruneResult = components['schemas']['AuditPruneResult'];
 export type AuthContext = components['schemas']['AuthContext'];
+export type BootstrapId = components['schemas']['BootstrapId'];
+export type BootstrapSecretCode = components['schemas']['BootstrapSecretCode'];
 export type ChangePasswordRequest = components['schemas']['ChangePasswordRequest'];
 export type ConnectivityCheck = components['schemas']['ConnectivityCheck'];
 export type ConnectivityCheckCreate = components['schemas']['ConnectivityCheckCreate'];
 export type ConnectivityCheckPage = components['schemas']['ConnectivityCheckPage'];
 export type ConnectivityCheckStatus = components['schemas']['ConnectivityCheckStatus'];
 export type DangerousConfirmation = components['schemas']['DangerousConfirmation'];
-export type EnrollmentCredential = components['schemas']['EnrollmentCredential'];
-export type EnrollmentCredentialRequest = components['schemas']['EnrollmentCredentialRequest'];
+export type EnrollmentBootstrapConfig = components['schemas']['EnrollmentBootstrapConfig'];
+export type EnrollmentBootstrapDisclosure = components['schemas']['EnrollmentBootstrapDisclosure'];
 export type EnrollmentState = components['schemas']['EnrollmentState'];
 export type EntityTag = components['schemas']['EntityTag'];
 export type ErrorCode = components['schemas']['ErrorCode'];
@@ -1312,6 +1395,8 @@ export type LivenessState = components['schemas']['LivenessState'];
 export type LoginRequest = components['schemas']['LoginRequest'];
 export type Name = components['schemas']['Name'];
 export type Node = components['schemas']['Node'];
+export type NodeBootstrapCreate = components['schemas']['NodeBootstrapCreate'];
+export type NodeBootstrapDisclosure = components['schemas']['NodeBootstrapDisclosure'];
 export type NodeCreate = components['schemas']['NodeCreate'];
 export type NodeDetail = components['schemas']['NodeDetail'];
 export type NodePage = components['schemas']['NodePage'];
@@ -1768,6 +1853,31 @@ export interface operations {
             readonly 404: components["responses"]["NotFound"];
         };
     };
+    readonly getEnrollmentBootstrapConfig: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Public installer endpoint configuration. */
+            readonly 200: {
+                headers: {
+                    readonly "Cache-Control": components["headers"]["NoStore"];
+                    readonly "X-Request-ID": components["headers"]["XRequestId"];
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["EnrollmentBootstrapConfig"];
+                };
+            };
+            readonly 401: components["responses"]["Unauthorized"];
+            readonly 403: components["responses"]["Forbidden"];
+            readonly 503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     readonly listEvents: {
         readonly parameters: {
             readonly query?: {
@@ -2049,7 +2159,7 @@ export interface operations {
             };
         };
         readonly responses: {
-            /** @description Node returned to the unenrolled state. */
+            /** @description Enrollment reset and replacement invitation disclosed once. */
             readonly 200: {
                 headers: {
                     readonly "Cache-Control": components["headers"]["NoStore"];
@@ -2058,7 +2168,7 @@ export interface operations {
                     readonly [name: string]: unknown;
                 };
                 content: {
-                    readonly "application/json": components["schemas"]["NodeDetail"];
+                    readonly "application/json": components["schemas"]["NodeBootstrapDisclosure"];
                 };
             };
             readonly 400: components["responses"]["BadRequest"];
@@ -2068,9 +2178,10 @@ export interface operations {
             readonly 409: components["responses"]["Conflict"];
             readonly 412: components["responses"]["PreconditionFailed"];
             readonly 428: components["responses"]["PreconditionRequired"];
+            readonly 503: components["responses"]["ServiceUnavailable"];
         };
     };
-    readonly issueEnrollmentCredential: {
+    readonly createNodeEnrollmentBootstrap: {
         readonly parameters: {
             readonly query?: never;
             readonly header: {
@@ -2090,20 +2201,20 @@ export interface operations {
         };
         readonly requestBody: {
             readonly content: {
-                readonly "application/json": components["schemas"]["EnrollmentCredentialRequest"];
+                readonly "application/json": components["schemas"]["DangerousConfirmation"];
             };
         };
         readonly responses: {
-            /** @description Single-use enrollment credential download. */
+            /** @description Replacement bootstrap invitation disclosed once. */
             readonly 200: {
                 headers: {
                     readonly "Cache-Control": components["headers"]["NoStore"];
-                    readonly "Content-Disposition": components["headers"]["Attachment"];
+                    readonly ETag: components["headers"]["ETag"];
                     readonly "X-Request-ID": components["headers"]["XRequestId"];
                     readonly [name: string]: unknown;
                 };
                 content: {
-                    readonly "application/vnd.ntip.enrollment-credential": components["schemas"]["EnrollmentCredential"];
+                    readonly "application/json": components["schemas"]["NodeBootstrapDisclosure"];
                 };
             };
             readonly 400: components["responses"]["BadRequest"];
@@ -2113,6 +2224,91 @@ export interface operations {
             readonly 409: components["responses"]["Conflict"];
             readonly 412: components["responses"]["PreconditionFailed"];
             readonly 428: components["responses"]["PreconditionRequired"];
+            readonly 503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    readonly revokeNodeEnrollmentBootstrap: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                /** @description Strong ETag returned by the latest read of the target generation. */
+                readonly "If-Match": components["parameters"]["IfMatch"];
+                /** @description Must exactly match the configured public HTTPS origin. */
+                readonly Origin: components["parameters"]["Origin"];
+                /** @description Session-bound token obtained from `/auth/me`. */
+                readonly "X-CSRF-Token": components["parameters"]["CsrfToken"];
+            };
+            readonly path: {
+                readonly id: components["parameters"]["NodeId"];
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["DangerousConfirmation"];
+            };
+        };
+        readonly responses: {
+            /** @description Invitation revoked and Node returned to the unenrolled state. */
+            readonly 200: {
+                headers: {
+                    readonly "Cache-Control": components["headers"]["NoStore"];
+                    readonly ETag: components["headers"]["ETag"];
+                    readonly "X-Request-ID": components["headers"]["XRequestId"];
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["Node"];
+                };
+            };
+            readonly 400: components["responses"]["BadRequest"];
+            readonly 401: components["responses"]["Unauthorized"];
+            readonly 403: components["responses"]["Forbidden"];
+            readonly 404: components["responses"]["NotFound"];
+            readonly 409: components["responses"]["Conflict"];
+            readonly 412: components["responses"]["PreconditionFailed"];
+            readonly 428: components["responses"]["PreconditionRequired"];
+            readonly 503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    readonly createNodeBootstrap: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                /** @description Caller-generated key scoped to the authenticated principal and operation. */
+                readonly "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Must exactly match the configured public HTTPS origin. */
+                readonly Origin: components["parameters"]["Origin"];
+                /** @description Session-bound token obtained from `/auth/me`. */
+                readonly "X-CSRF-Token": components["parameters"]["CsrfToken"];
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["NodeBootstrapCreate"];
+            };
+        };
+        readonly responses: {
+            /** @description Node created and bootstrap invitation disclosed once. */
+            readonly 201: {
+                headers: {
+                    readonly "Cache-Control": components["headers"]["NoStore"];
+                    readonly ETag: components["headers"]["ETag"];
+                    readonly Location: components["headers"]["Location"];
+                    readonly "X-Request-ID": components["headers"]["XRequestId"];
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["NodeBootstrapDisclosure"];
+                };
+            };
+            readonly 400: components["responses"]["BadRequest"];
+            readonly 401: components["responses"]["Unauthorized"];
+            readonly 403: components["responses"]["Forbidden"];
+            readonly 409: components["responses"]["Conflict"];
+            readonly 503: components["responses"]["ServiceUnavailable"];
         };
     };
     readonly getOpenApiDocument: {

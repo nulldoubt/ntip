@@ -2,5 +2,6 @@
   "schema_version": 2,
   "listen_port": 49152,
   "tun_name": "ntip0",
-  "service_socket_path": "/run/ntip-api/ntsrv-api.sock"
+  "service_socket_path": "/run/ntip-api/ntsrv-api.sock",
+  "public_udp_endpoint": "ntip.example.invalid:49152"
 }

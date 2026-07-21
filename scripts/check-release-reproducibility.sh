@@ -52,9 +52,12 @@ export SOURCE_DATE_EPOCH
 work=$(mktemp -d "${TMPDIR:-/tmp}/ntip-reproducibility.XXXXXX")
 trap 'rm -rf "$work"' EXIT INT TERM HUP
 
+checked_x86_64=0
+checked_aarch64=0
 for target in "$@"; do
     case "$target" in
-        x86_64-linux-musl|aarch64-linux-musl) ;;
+        x86_64-linux-musl) checked_x86_64=1 ;;
+        aarch64-linux-musl) checked_aarch64=1 ;;
         *)
             echo "unsupported release target: $target" >&2
             exit 2
@@ -63,15 +66,18 @@ for target in "$@"; do
 
     core_base="ntip-v$version-$target"
     api_base="ntip-api-v$version-$target"
-    for base in "$core_base" "$api_base"; do
+    node_base="ntip-node-v$version-$target"
+    for base in "$core_base" "$api_base" "$node_base"; do
         archive="$repo_root/dist/$base.tar.gz"
         sbom="$repo_root/dist/$base.spdx.json"
         checksum="$archive.sha256"
         rm -f "$archive" "$sbom" "$checksum"
     done
 
-    (CDPATH='' cd -- "$repo_root" && ./scripts/package-release.sh "$version" "$target")
-    for base in "$core_base" "$api_base"; do
+    (CDPATH='' cd -- "$repo_root" && \
+        ./scripts/package-release.sh "$version" "$target" && \
+        ./scripts/package-node-release.sh "$version" "$target")
+    for base in "$core_base" "$api_base" "$node_base"; do
         archive="$repo_root/dist/$base.tar.gz"
         sbom="$repo_root/dist/$base.spdx.json"
         checksum="$archive.sha256"
@@ -81,8 +87,10 @@ for target in "$@"; do
         cp "$checksum" "$work/$base.first.tar.gz.sha256"
     done
 
-    (CDPATH='' cd -- "$repo_root" && ./scripts/package-release.sh "$version" "$target")
-    for base in "$core_base" "$api_base"; do
+    (CDPATH='' cd -- "$repo_root" && \
+        ./scripts/package-release.sh "$version" "$target" && \
+        ./scripts/package-node-release.sh "$version" "$target")
+    for base in "$core_base" "$api_base" "$node_base"; do
         archive="$repo_root/dist/$base.tar.gz"
         sbom="$repo_root/dist/$base.spdx.json"
         checksum="$archive.sha256"
@@ -95,6 +103,30 @@ for target in "$@"; do
         sha256sum "$archive" "$sbom"
     done
 done
+
+if [ "$checked_x86_64" -eq 1 ] && [ "$checked_aarch64" -eq 1 ]; then
+    bootstrap_base=ntip-bootstrap-assets-v$version
+    rm -f \
+        "$repo_root/dist/$bootstrap_base.tar.gz" \
+        "$repo_root/dist/$bootstrap_base.tar.gz.sha256" \
+        "$repo_root/dist/bootstrap-assets.json" \
+        "$repo_root/dist/bootstrap-assets.json.sha256"
+    (CDPATH='' cd -- "$repo_root" && ./scripts/package-bootstrap-assets.sh "$version")
+    cp "$repo_root/dist/$bootstrap_base.tar.gz" "$work/$bootstrap_base.first.tar.gz"
+    cp "$repo_root/dist/$bootstrap_base.tar.gz.sha256" "$work/$bootstrap_base.first.tar.gz.sha256"
+    cp "$repo_root/dist/bootstrap-assets.json" "$work/bootstrap-assets.first.json"
+    cp "$repo_root/dist/bootstrap-assets.json.sha256" "$work/bootstrap-assets.first.json.sha256"
+
+    (CDPATH='' cd -- "$repo_root" && ./scripts/package-bootstrap-assets.sh "$version")
+    cmp "$work/$bootstrap_base.first.tar.gz" "$repo_root/dist/$bootstrap_base.tar.gz"
+    cmp "$work/$bootstrap_base.first.tar.gz.sha256" "$repo_root/dist/$bootstrap_base.tar.gz.sha256"
+    cmp "$work/bootstrap-assets.first.json" "$repo_root/dist/bootstrap-assets.json"
+    cmp "$work/bootstrap-assets.first.json.sha256" "$repo_root/dist/bootstrap-assets.json.sha256"
+    echo "reproducible_package=$bootstrap_base"
+    sha256sum "$repo_root/dist/$bootstrap_base.tar.gz" "$repo_root/dist/bootstrap-assets.json"
+else
+    echo "bootstrap_assets_reproducibility=skipped reason=both-node-targets-required"
+fi
 
 echo "release_archive_reproducibility=passed"
 echo "note=packaging passes reused the same compiled binaries; compiler output reproducibility is a separate gate"

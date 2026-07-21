@@ -183,9 +183,10 @@ export async function startDashboardHarness(options: DashboardHarnessOptions = {
           return Response.json({ error: "path must name an /api/v1 fixture route" }, { status: 400 });
         }
         const status = "status" in body && typeof body.status === "number" ? body.status : undefined;
+        const afterRoute = "afterRoute" in body && typeof body.afterRoute === "boolean" ? body.afterRoute : undefined;
         const delayMilliseconds = "delayMilliseconds" in body && typeof body.delayMilliseconds === "number" ? body.delayMilliseconds : undefined;
         const remaining = "remaining" in body && typeof body.remaining === "number" ? body.remaining : undefined;
-        fixture.addFault({ path: body.path, ...(status === undefined ? {} : { status }), ...(delayMilliseconds === undefined ? {} : { delayMilliseconds }), ...(remaining === undefined ? {} : { remaining }) });
+        fixture.addFault({ path: body.path, ...(status === undefined ? {} : { status }), ...(afterRoute === undefined ? {} : { afterRoute }), ...(delayMilliseconds === undefined ? {} : { delayMilliseconds }), ...(remaining === undefined ? {} : { remaining }) });
         return new Response(null, { status: 204 });
       }
       if (request.method === "GET" && url.pathname === "/snapshot") return Response.json(fixture.snapshot(), { headers: { "Cache-Control": "no-store" } });

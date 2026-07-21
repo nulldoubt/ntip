@@ -157,6 +157,57 @@ pub fn writePrivatePath(io: std.Io, path: []const u8, bytes: []const u8) !void {
     try atomic.replace(parts.dir, io, parts.basename, bytes, atomic.private_file_permissions);
 }
 
+/// Reserves a new private disclosure path before the caller commits any
+/// authoritative state. The exclusive create rejects existing regular files,
+/// symbolic links, and concurrent writers. A small synced allocation also
+/// catches an unavailable or unwritable target before one-time material is
+/// issued. Call `commit` exactly once after the durable mutation succeeds;
+/// `deinit` removes an uncommitted reservation.
+pub const PrivatePathReservation = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    basename: []const u8,
+    committed: bool = false,
+
+    pub fn commit(self: *PrivatePathReservation, bytes: []const u8) !void {
+        if (self.committed) return error.OutputAlreadyCommitted;
+        try atomic.replace(self.dir, self.io, self.basename, bytes, atomic.private_file_permissions);
+        self.committed = true;
+    }
+
+    pub fn deinit(self: *PrivatePathReservation) void {
+        if (!self.committed) {
+            atomic.deleteDurable(self.dir, self.io, self.basename) catch {};
+        }
+        self.dir.close(self.io);
+        self.* = undefined;
+    }
+};
+
+pub fn reservePrivatePath(io: std.Io, path: []const u8, reserve_bytes: usize) !PrivatePathReservation {
+    if (reserve_bytes == 0 or reserve_bytes > 4096) return error.InvalidReservationSize;
+    const parts = try openParent(io, path, false, atomic.private_dir_permissions);
+    errdefer parts.dir.close(io);
+    var file = try parts.dir.createFile(io, parts.basename, .{
+        .read = true,
+        .exclusive = true,
+        .permissions = atomic.private_file_permissions,
+    });
+    var file_open = true;
+    errdefer {
+        if (file_open) file.close(io);
+        parts.dir.deleteFile(io, parts.basename) catch {};
+    }
+    try file.setPermissions(io, atomic.private_file_permissions);
+    var zeroes: [4096]u8 = [_]u8{0} ** 4096;
+    defer std.crypto.secureZero(u8, &zeroes);
+    try file.writeStreamingAll(io, zeroes[0..reserve_bytes]);
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    return .{ .io = io, .dir = parts.dir, .basename = parts.basename };
+}
+
 pub fn writeConfigPath(io: std.Io, path: []const u8, bytes: []const u8) !void {
     const public_dir_permissions = std.Io.File.Permissions.fromMode(0o755);
     const parts = try openParent(io, path, true, public_dir_permissions);
@@ -474,6 +525,43 @@ test "credential input trims only the transport newline" {
     const credential = try readCredentialInput(std.testing.allocator, &reader, 128);
     defer std.testing.allocator.free(credential);
     try std.testing.expectEqualStrings("ntip-enroll-v1.test", credential);
+}
+
+test "private output reservation is exclusive, no-follow, and mode 0600" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const existing = try std.fs.path.join(std.testing.allocator, &.{ root, "existing.json" });
+    defer std.testing.allocator.free(existing);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "existing.json", .data = "keep" });
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        reservePrivatePath(std.testing.io, existing, 128),
+    );
+
+    try tmp.dir.symLink(std.testing.io, "existing.json", "linked.json", .{});
+    const linked = try std.fs.path.join(std.testing.allocator, &.{ root, "linked.json" });
+    defer std.testing.allocator.free(linked);
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        reservePrivatePath(std.testing.io, linked, 128),
+    );
+
+    const fresh = try std.fs.path.join(std.testing.allocator, &.{ root, "bootstrap.json" });
+    defer std.testing.allocator.free(fresh);
+    var reservation = try reservePrivatePath(std.testing.io, fresh, 128);
+    defer reservation.deinit();
+    const reserved_stat = try std.Io.Dir.cwd().statFile(std.testing.io, fresh, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, reserved_stat.kind);
+    try std.testing.expectEqual(@as(u32, 0o600), reserved_stat.permissions.toMode() & 0o777);
+    try reservation.commit("{\"ok\":true}\n");
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "bootstrap.json", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", bytes);
+    const existing_bytes = try tmp.dir.readFileAlloc(std.testing.io, "existing.json", std.testing.allocator, .limited(16));
+    defer std.testing.allocator.free(existing_bytes);
+    try std.testing.expectEqualStrings("keep", existing_bytes);
 }
 
 test "IPC commands use a bounded canonical namespace" {

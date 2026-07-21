@@ -1,7 +1,7 @@
 openapi: 3.1.1
 info:
   title: NTIP Management API
-  version: 1.0.1
+  version: 1.1.0
   summary: Same-origin management contract for NTIP v0.2.
   description: |
     The versioned operator API exposed by the loopback-only `ntip-api` service.
@@ -573,6 +573,59 @@ paths:
           $ref: '#/components/responses/Conflict'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+  /nodes/actions/bootstrap:
+    post:
+      operationId: createNodeBootstrap
+      summary: Create a Node and one-time bootstrap invitation atomically
+      description: |
+        Creates the inventory record, enrollment verifier, invitation, audit
+        entry, and durable generation in one transaction. The short code is
+        disclosed exactly once. Idempotent retries never replay the response;
+        after a lost response the caller must locate the committed Node by its
+        unique name and explicitly replace the invitation.
+      tags: [Nodes, Enrollment]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      x-ntip-reauthentication: required
+      x-ntip-etag-precondition: false
+      x-ntip-one-time-response: true
+      x-ntip-idempotency-replay: forbidden
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeBootstrapCreate'
+      responses:
+        '201':
+          description: Node created and bootstrap invitation disclosed once.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeBootstrapDisclosure'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /nodes/{id}:
     parameters:
       - $ref: '#/components/parameters/NodeId'
@@ -855,64 +908,46 @@ paths:
           $ref: '#/components/responses/PreconditionFailed'
         '428':
           $ref: '#/components/responses/PreconditionRequired'
-  /nodes/{id}/enrollment-credentials:
-    parameters:
-      - $ref: '#/components/parameters/NodeId'
-    post:
-      operationId: issueEnrollmentCredential
-      summary: Issue and download a one-time enrollment credential
-      description: The credential is returned once and recoverable plaintext is never persisted.
+  /enrollment/bootstrap-config:
+    get:
+      operationId: getEnrollmentBootstrapConfig
+      summary: Read non-secret installer origin and TLS pin configuration
       tags: [Enrollment]
-      x-ntip-roles: [superuser]
-      x-ntip-dangerous: true
-      parameters:
-        - $ref: '#/components/parameters/Origin'
-        - $ref: '#/components/parameters/CsrfToken'
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/IfMatch'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/EnrollmentCredentialRequest'
+      x-ntip-roles: [viewer, operator, superuser]
       responses:
         '200':
-          description: Single-use enrollment credential download.
+          description: Public installer endpoint configuration.
           headers:
             X-Request-ID:
               $ref: '#/components/headers/XRequestId'
             Cache-Control:
               $ref: '#/components/headers/NoStore'
-            Content-Disposition:
-              $ref: '#/components/headers/Attachment'
           content:
-            application/vnd.ntip.enrollment-credential:
+            application/json:
               schema:
-                $ref: '#/components/schemas/EnrollmentCredential'
-        '400':
-          $ref: '#/components/responses/BadRequest'
+                $ref: '#/components/schemas/EnrollmentBootstrapConfig'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
-        '412':
-          $ref: '#/components/responses/PreconditionFailed'
-        '428':
-          $ref: '#/components/responses/PreconditionRequired'
-  /nodes/{id}/actions/reset-enrollment:
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /nodes/{id}/enrollment-bootstrap:
     parameters:
       - $ref: '#/components/parameters/NodeId'
     post:
-      operationId: resetNodeEnrollment
-      summary: Revoke enrollment state and any unused credential
+      operationId: createNodeEnrollmentBootstrap
+      summary: Create or replace a Node bootstrap invitation
+      description: |
+        Creates a new invitation for an unenrolled Node and atomically revokes
+        any unused predecessor. The short code is disclosed exactly once and
+        is never replayed from the idempotency store.
       tags: [Enrollment]
       x-ntip-roles: [superuser]
       x-ntip-dangerous: true
+      x-ntip-reauthentication: required
+      x-ntip-one-time-response: true
+      x-ntip-idempotency-replay: forbidden
       parameters:
         - $ref: '#/components/parameters/Origin'
         - $ref: '#/components/parameters/CsrfToken'
@@ -926,7 +961,7 @@ paths:
               $ref: '#/components/schemas/DangerousConfirmation'
       responses:
         '200':
-          description: Node returned to the unenrolled state.
+          description: Replacement bootstrap invitation disclosed once.
           headers:
             X-Request-ID:
               $ref: '#/components/headers/XRequestId'
@@ -937,7 +972,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/NodeDetail'
+                $ref: '#/components/schemas/NodeBootstrapDisclosure'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -952,6 +987,112 @@ paths:
           $ref: '#/components/responses/PreconditionFailed'
         '428':
           $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      operationId: revokeNodeEnrollmentBootstrap
+      summary: Revoke a Node bootstrap invitation
+      description: Revokes any unused invitation and enrollment verifier for the Node.
+      tags: [Enrollment]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      x-ntip-reauthentication: required
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '200':
+          description: Invitation revoked and Node returned to the unenrolled state.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /nodes/{id}/actions/reset-enrollment:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      operationId: resetNodeEnrollment
+      summary: Reset Node enrollment and issue a new bootstrap invitation
+      description: |
+        Retires the active association, revokes any predecessor, and creates a
+        replacement invitation atomically. The short code is disclosed once.
+      tags: [Enrollment]
+      x-ntip-roles: [superuser]
+      x-ntip-dangerous: true
+      x-ntip-reauthentication: required
+      x-ntip-one-time-response: true
+      x-ntip-idempotency-replay: forbidden
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DangerousConfirmation'
+      responses:
+        '200':
+          description: Enrollment reset and replacement invitation disclosed once.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeBootstrapDisclosure'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /connectivity-checks:
     get:
       operationId: listConnectivityChecks
@@ -2463,6 +2604,21 @@ components:
           $ref: '#/components/schemas/Name'
         address:
           $ref: '#/components/schemas/Ipv4Address'
+    NodeBootstrapCreate:
+      type: object
+      additionalProperties: false
+      required: [name, vnrName, address, confirmation]
+      properties:
+        name:
+          $ref: '#/components/schemas/Name'
+        vnrName:
+          $ref: '#/components/schemas/Name'
+        address:
+          $ref: '#/components/schemas/Ipv4Address'
+        confirmation:
+          allOf:
+            - $ref: '#/components/schemas/Name'
+          description: Must exactly match `name`.
     NodeUpdate:
       type: object
       additionalProperties: false
@@ -2591,29 +2747,65 @@ components:
           minLength: 1
           maxLength: 128
           description: Exact resource name or operation word typed by the user.
-    EnrollmentCredentialRequest:
-      type: object
-      additionalProperties: false
-      required: [expiresInSeconds, confirmation]
-      properties:
-        expiresInSeconds:
-          type: integer
-          format: int64
-          minimum: 60
-          maximum: 2592000
-          description: Credential validity, from one minute through 30 days.
-        confirmation:
-          type: string
-          minLength: 1
-          maxLength: 128
-          description: Exact Node name typed by the user.
-    EnrollmentCredential:
+    BootstrapId:
+      type: string
+      minLength: 8
+      maxLength: 8
+      pattern: '^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$'
+      description: Public, permanently unique bootstrap locator; it is not an authenticator.
+      examples: [ABCDEFGH]
+    BootstrapSecretCode:
       type: string
       readOnly: true
-      minLength: 122
-      maxLength: 122
-      pattern: '^ntip-enroll-v1\.[A-Za-z0-9_-]{107}$'
-      description: Single-use credential text including its version prefix.
+      minLength: 11
+      maxLength: 11
+      pattern: '^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}$'
+      description: One-time-displayed 45-bit bootstrap code. It is never persisted or logged.
+      examples: [ABC-DEF-GHJ]
+    EnrollmentBootstrapDisclosure:
+      type: object
+      additionalProperties: false
+      readOnly: true
+      required: [bootstrapId, secretCode, expiresAt]
+      properties:
+        bootstrapId:
+          $ref: '#/components/schemas/BootstrapId'
+        secretCode:
+          $ref: '#/components/schemas/BootstrapSecretCode'
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+      description: One-time management disclosure that must not be cached, logged, or replayed.
+    NodeBootstrapDisclosure:
+      type: object
+      additionalProperties: false
+      readOnly: true
+      required: [node, bootstrap]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        bootstrap:
+          $ref: '#/components/schemas/EnrollmentBootstrapDisclosure'
+      description: Node state plus a one-time bootstrap invitation disclosure.
+    EnrollmentBootstrapConfig:
+      type: object
+      additionalProperties: false
+      required: [installerOrigin, spkiPin]
+      properties:
+        installerOrigin:
+          type: string
+          format: uri
+          minLength: 9
+          maxLength: 2048
+          pattern: '^https://[^/?#]+(?::[0-9]{1,5})?$'
+          description: Exact HTTPS origin serving the public bootstrap interface.
+          examples: ['https://43.157.23.67']
+        spkiPin:
+          type: string
+          minLength: 52
+          maxLength: 52
+          pattern: '^sha256//[A-Za-z0-9+/]{43}=$'
+          description: curl-compatible SHA-256 pin for the configured TLS leaf public key.
+          examples: ['sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=']
     ConnectivityCheckCreate:
       type: object
       additionalProperties: false

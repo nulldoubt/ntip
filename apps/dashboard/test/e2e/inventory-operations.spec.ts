@@ -1,5 +1,6 @@
+import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type APIResponse, type Page } from "@playwright/test";
-import { fixtureSnapshot, loginAs, resetFixture, setFault, useReducedMotion } from "./support";
+import { clearFaults, credentials, fixtureSnapshot, loginAs, resetFixture, setFault, useReducedMotion } from "./support";
 
 const publicOrigin = "https://127.0.0.1:3443";
 
@@ -26,6 +27,20 @@ function requireResponseHeader(response: APIResponse, name: string): string {
 async function selectSegment(page: Page, label: string, value: number): Promise<void> {
   await page.getByRole("combobox", { name: label, exact: true }).click();
   await page.getByRole("option", { name: String(value), exact: true }).click();
+}
+
+async function reauthenticateFixtureSession(page: Page, idempotencyKey: string): Promise<string> {
+  const auth = await (await page.request.get("/api/v1/auth/me")).json() as { csrfToken: string };
+  const response = await page.request.post("/api/v1/auth/reauth", {
+    data: { password: credentials.superuser.password },
+    headers: {
+      Origin: publicOrigin,
+      "X-CSRF-Token": auth.csrfToken,
+      "Idempotency-Key": idempotencyKey,
+    },
+  });
+  expect(response.status()).toBe(200);
+  return auth.csrfToken;
 }
 
 test.beforeEach(async ({ page }) => {
@@ -92,6 +107,8 @@ test("Node creation selects the lowest free address and recovers from an allocat
   await page.getByRole("button", { name: "Add Node" }).click();
   const dialog = page.getByRole("dialog", { name: "Create Node" });
 
+  await expect(dialog.getByText("Ask a superuser to open the new Node and generate its setup code.", { exact: false })).toBeVisible();
+
   await expect(dialog.getByRole("combobox", { name: "VNR" })).toHaveText(/berlin-edge/);
   await expect(dialog.getByRole("combobox", { name: "Node IPv4 address, octet 1 of 4" })).toBeDisabled();
   await expect(dialog.getByRole("combobox", { name: "Node IPv4 address, octet 2 of 4" })).toBeDisabled();
@@ -135,6 +152,299 @@ test("Node creation selects the lowest free address and recovers from an allocat
     expect.objectContaining({ name: "race-loser", address: "10.42.0.3" }),
     expect.objectContaining({ name: "race-loser", address: "10.42.0.4" }),
   ]);
+});
+
+test("superuser creates, safeguards, replaces, and revokes a one-time Node setup invitation", async ({ page }) => {
+  await loginAs(page, "superuser");
+  await page.getByRole("link", { name: "Nodes", exact: true }).click();
+  await page.getByRole("button", { name: "Add Node" }).click();
+  const createDialog = page.getByRole("dialog", { name: "Create Node" });
+  await expect(createDialog.getByRole("combobox", { name: "VNR" })).toHaveText(/berlin-edge/);
+  await createDialog.getByLabel("Name", { exact: true }).fill("bootstrap-lab");
+  await createDialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await createDialog.getByLabel("Type “bootstrap-lab”").fill("bootstrap-lab");
+  await createDialog.getByRole("button", { name: "Create Node and setup code" }).click();
+
+  await expect(createDialog.getByRole("heading", { name: "Install bootstrap-lab" })).toBeFocused();
+  const command = createDialog.getByLabel("Installation command; select to copy manually");
+  await expect(command).toHaveValue(/--http1\.1/);
+  await expect(command).toHaveValue(/--pinnedpubkey/);
+  await expect(command).toHaveValue(/\/enrollment\//);
+  await expect(command).not.toHaveValue(/ABC-DEF-GHJ/);
+  const secretCode = createDialog.getByLabel("Secret setup code; select to copy manually");
+  await expect(secretCode).toHaveValue("ABC-DEF-GHJ");
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async () => { throw new DOMException("denied", "NotAllowedError"); } },
+    });
+  });
+  await createDialog.getByRole("button", { name: "Copy command" }).click();
+  await expect(createDialog.getByText(
+    "Clipboard access was unavailable. Select the command manually.",
+    { exact: true },
+  )).toBeAttached();
+  await command.focus();
+  expect(await command.evaluate((element) => {
+    if (!(element instanceof HTMLTextAreaElement)) throw new Error("Expected a command textarea");
+    return [element.selectionStart, element.selectionEnd, element.value.length];
+  })).toEqual([0, (await command.inputValue()).length, (await command.inputValue()).length]);
+  await secretCode.focus();
+  expect(await secretCode.evaluate((element) => {
+    if (!(element instanceof HTMLInputElement)) throw new Error("Expected a setup-code input");
+    return [element.selectionStart, element.selectionEnd, element.value.length];
+  })).toEqual([0, 11, 11]);
+  const accessibility = await new AxeBuilder({ page })
+    .include('[role="dialog"]')
+    .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+    .analyze();
+  expect(accessibility.violations).toEqual([]);
+
+  await page.keyboard.press("Escape");
+  await expect(createDialog).toBeVisible();
+  await createDialog.getByLabel("I saved it securely.").check();
+  await createDialog.getByRole("button", { name: "Done" }).click();
+  await page.waitForURL("**/nodes/*");
+  await expect(page.getByRole("heading", { name: "bootstrap-lab" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Generate replacement code" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Generate replacement code" }).click();
+  const replacementDialog = page.getByRole("dialog", { name: "Generate replacement code" });
+  await replacementDialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await replacementDialog.getByLabel("Type “bootstrap-lab”").fill("bootstrap-lab");
+  await replacementDialog.getByRole("button", { name: "Generate replacement code", exact: true }).click();
+  await expect(replacementDialog.getByLabel("Secret setup code; select to copy manually")).toHaveValue("ABC-DEF-GHJ");
+  await setFault({ path: `/api/v1/nodes/${page.url().split("/").at(-1)}/enrollment-bootstrap`, status: 503 });
+  await replacementDialog.getByRole("button", { name: "Discard and revoke" }).click();
+  await expect(replacementDialog).toBeVisible();
+  await expect(replacementDialog.getByRole("alert")).toContainText("dialog remains open");
+  await clearFaults();
+  await replacementDialog.getByRole("button", { name: "Discard and revoke" }).click();
+  await expect(replacementDialog).toBeHidden();
+  await expect(page.getByRole("button", { name: "Generate setup code" })).toBeVisible();
+
+  const snapshot = await fixtureSnapshot();
+  expect(JSON.stringify(snapshot)).not.toContain("ABC-DEF-GHJ");
+  expect(snapshot.requests.some((record) => record.method === "POST" && record.path === "/api/v1/nodes/actions/bootstrap")).toBe(true);
+  expect(snapshot.requests.some((record) => record.method === "DELETE" && record.path.endsWith("/enrollment-bootstrap"))).toBe(true);
+});
+
+test("a lost one-time creation response finds the committed Node without duplicating it", async ({ page }) => {
+  await loginAs(page, "superuser");
+  await page.getByRole("link", { name: "Nodes", exact: true }).click();
+  await page.getByRole("button", { name: "Add Node" }).click();
+  const dialog = page.getByRole("dialog", { name: "Create Node" });
+  await expect(dialog.getByRole("combobox", { name: "VNR" })).toHaveText(/berlin-edge/);
+  await dialog.getByLabel("Name", { exact: true }).fill("lost-response-node");
+  await dialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await dialog.getByLabel("Type “lost-response-node”").fill("lost-response-node");
+  await setFault({ path: "/api/v1/nodes/actions/bootstrap", status: 503, afterRoute: true });
+  await dialog.getByRole("button", { name: "Create Node and setup code" }).click();
+
+  await expect(dialog.getByRole("alert")).toContainText("the one-time setup response did not reach this browser");
+  await expect(dialog.getByText("No duplicate was created.", { exact: false })).toBeVisible();
+  await expect(dialog.getByLabel("Secret setup code; select to copy manually")).toHaveCount(0);
+  const snapshot = await fixtureSnapshot();
+  expect(snapshot.counts.nodes).toBe(4);
+  expect(snapshot.requests.filter((record) => record.method === "POST" && record.path === "/api/v1/nodes/actions/bootstrap")).toHaveLength(1);
+
+  await dialog.getByRole("button", { name: "Open Node" }).click();
+  await page.waitForURL("**/nodes/*");
+  await expect(page.getByRole("heading", { name: "lost-response-node" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Generate replacement code" })).toBeVisible();
+});
+
+test("a pre-dispatch reauthentication failure does not claim that Node creation may have committed", async ({ page }) => {
+  await loginAs(page, "superuser");
+  await page.getByRole("link", { name: "Nodes", exact: true }).click();
+  await page.getByRole("button", { name: "Add Node" }).click();
+  const dialog = page.getByRole("dialog", { name: "Create Node" });
+  await expect(dialog.getByRole("combobox", { name: "VNR" })).toHaveText(/berlin-edge/);
+  await dialog.getByLabel("Name", { exact: true }).fill("reauth-failure-node");
+  await dialog.getByLabel("Current password").fill("definitely-not-valid-2026");
+  await dialog.getByLabel("Type “reauth-failure-node”").fill("reauth-failure-node");
+  await dialog.getByRole("button", { name: "Create Node and setup code" }).click();
+
+  await expect(dialog.getByRole("status").filter({ hasText: "The password was not accepted." })).toBeVisible();
+  await expect(dialog.getByText("one-time setup response did not reach", { exact: false })).toHaveCount(0);
+  const snapshot = await fixtureSnapshot();
+  expect(snapshot.counts.nodes).toBe(3);
+  expect(snapshot.requests.filter((record) =>
+    record.method === "POST" && record.path === "/api/v1/nodes/actions/bootstrap"
+  )).toHaveLength(0);
+});
+
+test("aborted bootstrap-config reads cannot overwrite newer dialog generations", async ({ page }) => {
+  await loginAs(page, "superuser");
+  await page.getByRole("link", { name: "Nodes", exact: true }).click();
+  await setFault({
+    path: "/api/v1/enrollment/bootstrap-config",
+    status: 503,
+    delayMilliseconds: 700,
+    remaining: 1,
+  });
+
+  await page.getByRole("button", { name: "Add Node" }).click();
+  let dialog = page.getByRole("dialog", { name: "Create Node" });
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await page.getByRole("button", { name: "Add Node" }).click();
+  dialog = page.getByRole("dialog", { name: "Create Node" });
+  await expect(dialog.getByRole("combobox", { name: "VNR" })).toHaveText(/berlin-edge/);
+  await dialog.getByLabel("Name", { exact: true }).fill("config-generation-node");
+  await dialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await dialog.getByLabel("Type “config-generation-node”").fill("config-generation-node");
+  const submit = dialog.getByRole("button", { name: "Create Node and setup code" });
+  await expect(submit).toBeEnabled();
+  await page.waitForTimeout(900);
+  await expect(submit).toBeEnabled();
+  await expect(dialog.getByText("Setup invitation creation is disabled", { exact: false })).toHaveCount(0);
+
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await page.getByRole("link", { name: "warehouse-sensor", exact: true }).click();
+  await setFault({
+    path: "/api/v1/enrollment/bootstrap-config",
+    status: 503,
+    delayMilliseconds: 700,
+    remaining: 1,
+  });
+  await page.getByRole("button", { name: "Generate setup code" }).click();
+  let setupDialog = page.getByRole("dialog", { name: "Generate setup code" });
+  await setupDialog.getByRole("button", { name: "Cancel" }).click();
+  await page.getByRole("button", { name: "Generate setup code" }).click();
+  setupDialog = page.getByRole("dialog", { name: "Generate setup code" });
+  await setupDialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await setupDialog.getByLabel("Type “warehouse-sensor”").fill("warehouse-sensor");
+  const generate = setupDialog.getByRole("button", { name: "Generate setup code", exact: true });
+  await expect(generate).toBeEnabled();
+  await page.waitForTimeout(900);
+  await expect(generate).toBeEnabled();
+  await expect(setupDialog.getByText("Installer configuration could not be loaded", { exact: false })).toHaveCount(0);
+});
+
+test("one-time Node bootstrap mutations consume idempotency markers without redisclosing secrets", async ({ page }) => {
+  await loginAs(page, "superuser");
+  const csrfToken = await reauthenticateFixtureSession(page, "bootstrap-idempotency-reauth");
+  const headers = (idempotencyKey: string, ifMatch?: string) => ({
+    Origin: publicOrigin,
+    "X-CSRF-Token": csrfToken,
+    "Idempotency-Key": idempotencyKey,
+    ...(ifMatch === undefined ? {} : { "If-Match": ifMatch }),
+  });
+
+  const createBody = {
+    name: "idempotency-node",
+    address: "10.42.0.3",
+    vnrName: "berlin-edge",
+    confirmation: "idempotency-node",
+  };
+  const createHeaders = headers("bootstrap-idempotency-create");
+  const created = await page.request.post("/api/v1/nodes/actions/bootstrap", { data: createBody, headers: createHeaders });
+  expect(created.status()).toBe(201);
+  const createdDisclosure = await created.json() as { node: { id: string }; bootstrap: { secretCode: string } };
+  expect(createdDisclosure.bootstrap.secretCode).toBe("ABC-DEF-GHJ");
+
+  const createReplay = await page.request.post("/api/v1/nodes/actions/bootstrap", { data: createBody, headers: createHeaders });
+  expect(createReplay.status()).toBe(409);
+  expect((await createReplay.json()).error.code).toBe("conflict");
+  expect(await createReplay.text().catch(() => "")).not.toContain("secretCode");
+  const createChanged = await page.request.post("/api/v1/nodes/actions/bootstrap", {
+    data: { ...createBody, address: "10.42.0.4" },
+    headers: createHeaders,
+  });
+  expect(createChanged.status()).toBe(409);
+  expect((await createChanged.json()).error.code).toBe("idempotency_conflict");
+
+  const nodePath = `/api/v1/nodes/${createdDisclosure.node.id}`;
+  const nodeRead = await page.request.get(nodePath);
+  const replacementHeaders = headers("bootstrap-idempotency-replacement", requireResponseHeader(nodeRead, "ETag"));
+  const confirmation = { confirmation: "idempotency-node" };
+  const replacementPath = `${nodePath}/enrollment-bootstrap`;
+  const replacement = await page.request.post(replacementPath, { data: confirmation, headers: replacementHeaders });
+  expect(replacement.status()).toBe(200);
+  const replacementReplay = await page.request.post(replacementPath, { data: confirmation, headers: replacementHeaders });
+  expect(replacementReplay.status()).toBe(409);
+  expect((await replacementReplay.json()).error.code).toBe("conflict");
+  expect(await replacementReplay.text().catch(() => "")).not.toContain("secretCode");
+  const replacementChanged = await page.request.post(replacementPath, {
+    data: { confirmation: "different-node" },
+    headers: replacementHeaders,
+  });
+  expect(replacementChanged.status()).toBe(409);
+  expect((await replacementChanged.json()).error.code).toBe("idempotency_conflict");
+
+  const enrolledPath = "/api/v1/nodes/01000000000000000000000000000001";
+  const enrolledRead = await page.request.get(enrolledPath);
+  const resetHeaders = headers("bootstrap-idempotency-reset", requireResponseHeader(enrolledRead, "ETag"));
+  const resetPath = `${enrolledPath}/actions/reset-enrollment`;
+  const reset = await page.request.post(resetPath, { data: { confirmation: "berlin-gateway" }, headers: resetHeaders });
+  expect(reset.status()).toBe(200);
+  const resetReplay = await page.request.post(resetPath, { data: { confirmation: "berlin-gateway" }, headers: resetHeaders });
+  expect(resetReplay.status()).toBe(409);
+  expect((await resetReplay.json()).error.code).toBe("conflict");
+  expect(await resetReplay.text().catch(() => "")).not.toContain("secretCode");
+
+  const changedEnrolledRead = await page.request.get(enrolledPath);
+  const invalidSecondReset = await page.request.post(resetPath, {
+    data: { confirmation: "berlin-gateway" },
+    headers: headers("bootstrap-idempotency-reset-again", requireResponseHeader(changedEnrolledRead, "ETag")),
+  });
+  expect(invalidSecondReset.status()).toBe(409);
+  expect((await invalidSecondReset.json()).error.code).toBe("conflict");
+});
+
+test("superuser resets an enrolled Node directly into a new setup invitation", async ({ page }) => {
+  await loginAs(page, "superuser");
+  await page.getByRole("link", { name: "Nodes", exact: true }).click();
+  await page.getByRole("link", { name: "berlin-gateway", exact: true }).click();
+  await page.getByRole("button", { name: "Reset enrollment and generate setup code" }).click();
+  const dialog = page.getByRole("dialog", { name: "Reset enrollment and generate setup code" });
+  await dialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await dialog.getByLabel("Type “berlin-gateway”").fill("berlin-gateway");
+  await dialog.getByRole("button", { name: "Reset enrollment and generate setup code", exact: true }).click();
+  await expect(dialog.getByLabel("Secret setup code; select to copy manually")).toHaveValue("ABC-DEF-GHJ");
+  await dialog.getByLabel("I saved it securely.").check();
+  await dialog.getByRole("button", { name: "Done" }).click();
+  await expect(page.getByRole("button", { name: "Generate replacement code" })).toBeVisible();
+
+  const reset = (await fixtureSnapshot()).requests.find((record) =>
+    record.method === "POST" && record.path.endsWith("/actions/reset-enrollment")
+  );
+  expect(reset?.body).toEqual({ confirmation: "berlin-gateway" });
+});
+
+test("setup confirmation refuses a Node whose enrollment intent changed while the dialog was open", async ({ page }) => {
+  await loginAs(page, "superuser");
+  await page.getByRole("link", { name: "Nodes", exact: true }).click();
+  await page.getByRole("link", { name: "berlin-gateway", exact: true }).click();
+  await page.getByRole("button", { name: "Reset enrollment and generate setup code" }).click();
+  const dialog = page.getByRole("dialog", { name: "Reset enrollment and generate setup code" });
+  await expect(dialog.getByLabel("Current password")).toBeVisible();
+
+  const csrfToken = await reauthenticateFixtureSession(page, "bootstrap-intent-reauth");
+  const nodePath = "/api/v1/nodes/01000000000000000000000000000001";
+  const nodeRead = await page.request.get(nodePath);
+  const directReset = await page.request.post(`${nodePath}/actions/reset-enrollment`, {
+    data: { confirmation: "berlin-gateway" },
+    headers: {
+      Origin: publicOrigin,
+      "X-CSRF-Token": csrfToken,
+      "Idempotency-Key": "bootstrap-intent-direct-reset",
+      "If-Match": requireResponseHeader(nodeRead, "ETag"),
+    },
+  });
+  expect(directReset.status()).toBe(200);
+
+  await dialog.getByLabel("Current password").fill(credentials.superuser.password);
+  await dialog.getByLabel("Type “berlin-gateway”").fill("berlin-gateway");
+  await dialog.getByRole("button", { name: "Reset enrollment and generate setup code", exact: true }).click();
+  await expect(dialog.getByRole("status").filter({
+    hasText: "The Node changed while this confirmation was open",
+  })).toBeVisible();
+  await expect(dialog.getByLabel("Secret setup code; select to copy manually")).toHaveCount(0);
+  expect((await fixtureSnapshot()).requests.filter((record) =>
+    record.method === "POST" && record.path.endsWith("/actions/reset-enrollment")
+  )).toHaveLength(1);
 });
 
 test("Node editing moves VNR membership onto the destination's lowest free address", async ({ page }) => {

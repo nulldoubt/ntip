@@ -21,7 +21,6 @@ const state_repository = @import("../state/repository.zig");
 const atomic = @import("../state/atomic_file.zig");
 const enrollments_mod = @import("../state/enrollments.zig");
 const server_transaction = @import("../state/server_transaction.zig");
-const credential_mod = @import("../protocol/credential.zig");
 const socket = @import("../platform/linux/ipc_socket.zig");
 
 pub const credential_persistence_guarantee = enum {
@@ -134,8 +133,10 @@ pub const ServerAdmin = struct {
             .vnr_create, .vnr_delete, .route_add, .route_delete => try self.storeOnlyMutation(command, stdout, stderr),
             .node_create => |create| try self.createNode(command, create, stdout),
             .node_delete => |name| try self.deleteNode(command, name, stdout),
-            .node_enrollment_renew => |name| try self.renewEnrollment(name, false, stdout),
-            .node_enrollment_reset => |name| try self.renewEnrollment(name, true, stdout),
+            // The JSON-era admin implementation cannot safely derive v0.2
+            // setup invitations. It is retained only for legacy-state tests;
+            // production uses the SQLite-backed server application.
+            .node_enrollment_renew, .node_enrollment_reset => return error.UnsupportedCommand,
             .user_bootstrap, .restore => return error.DaemonRunning,
             .backup => return error.UnsupportedCommand,
         }
@@ -183,27 +184,13 @@ pub const ServerAdmin = struct {
         create: cli_server.NodeCreate,
         stdout: *std.Io.Writer,
     ) !void {
+        if (!create.no_bootstrap or create.bootstrap_out != null) return error.UnsupportedCommand;
         if (self.store.nodes.items.len >= self.maximum_nodes) return error.MaximumNodesExceeded;
         var candidate_store = try cloneStore(self.allocator, self.store);
         errdefer candidate_store.deinit();
         var candidate_enrollments = try cloneRegistry(self.allocator, self.enrollments);
         errdefer candidate_enrollments.deinit();
         _ = try cli_dispatch.applyServerMutation(&candidate_store, self.io, command);
-        var credential = try issueCredential(
-            self.io,
-            &candidate_enrollments,
-            create.name,
-            candidate_store.findNode(create.name).?.id,
-            self.master_public,
-            create.expires_seconds orelse self.default_enrollment_lifetime_seconds,
-        );
-        defer std.crypto.secureZero(u8, &credential.secret);
-
-        // Deliver an explicitly requested credential file before publishing
-        // the durable mutation. A failed write therefore leaves both live and
-        // on-disk administrative state unchanged. If the subsequent commit
-        // fails, the file contains only an unusable, never-issued credential.
-        if (create.credential_out) |path| try writeCredentialFile(credential, path, self.io);
         try server_transaction.commit(self.allocator, self.io, self.repository.dir, &candidate_store, &candidate_enrollments);
         self.installRegistry(&candidate_enrollments);
         self.installStore(&candidate_store);
@@ -214,7 +201,7 @@ pub const ServerAdmin = struct {
             create.vnr,
             try node.address.write(&address_buffer),
         });
-        try reportCredential(credential, create.credential_out, stdout);
+        try stdout.writeAll("Setup invitation: not issued (--no-bootstrap)\n");
     }
 
     fn deleteNode(self: *ServerAdmin, command: cli_server.Command, name: []const u8, stdout: *std.Io.Writer) !void {
@@ -233,45 +220,6 @@ pub const ServerAdmin = struct {
         self.installStore(&candidate_store);
         if (self.association_callback) |callback| callback.retire(node_uuid);
         try stdout.print("Deleted node \"{s}\"\n", .{name});
-    }
-
-    fn renewEnrollment(
-        self: *ServerAdmin,
-        name: []const u8,
-        reset: bool,
-        stdout: *std.Io.Writer,
-    ) !void {
-        var candidate_store = try cloneStore(self.allocator, self.store);
-        var candidate_store_owned = true;
-        defer if (candidate_store_owned) candidate_store.deinit();
-        var candidate_enrollments = try cloneRegistry(self.allocator, self.enrollments);
-        errdefer candidate_enrollments.deinit();
-        const node = candidate_store.findNode(name) orelse return error.NodeNotFound;
-        const node_uuid = node.id.bytes;
-        if (!reset and node.enrollment_state == .enrolled) return error.NodeAlreadyEnrolled;
-        if (reset) try candidate_store.resetNodeEnrollment(name);
-        var credential = try issueCredential(
-            self.io,
-            &candidate_enrollments,
-            name,
-            node.id,
-            self.master_public,
-            self.default_enrollment_lifetime_seconds,
-        );
-        defer std.crypto.secureZero(u8, &credential.secret);
-        if (reset) {
-            try server_transaction.commit(self.allocator, self.io, self.repository.dir, &candidate_store, &candidate_enrollments);
-        } else {
-            try self.enrollment_file.save(self.allocator, self.io, &candidate_enrollments);
-        }
-        self.installRegistry(&candidate_enrollments);
-        if (reset) {
-            self.installStore(&candidate_store);
-            candidate_store_owned = false;
-            if (self.association_callback) |callback| callback.retire(node_uuid);
-        }
-        try stdout.print("Enrollment {s} for node \"{s}\"\n", .{ if (reset) "reset" else "renewed", name });
-        try reportCredential(credential, null, stdout);
     }
 
     fn installStore(self: *ServerAdmin, candidate: *model.Store) void {
@@ -413,59 +361,6 @@ fn cloneRegistry(allocator: std.mem.Allocator, source: *const enrollments_mod.Re
     return result;
 }
 
-fn issueCredential(
-    io: std.Io,
-    registry: *enrollments_mod.Registry,
-    node: []const u8,
-    node_id: model.NodeId,
-    master_public: [32]u8,
-    lifetime_seconds: u64,
-) !credential_mod.Credential {
-    const now = try cli_runner.unixSeconds(io);
-    const expires_at = std.math.add(u64, now, lifetime_seconds) catch return error.InvalidExpiry;
-    while (true) {
-        var credential = credential_mod.Credential{ .handle = undefined, .secret = undefined, .master_public = master_public };
-        io.random(&credential.handle);
-        io.random(&credential.secret);
-        var psk = credential.derivePsk();
-        defer std.crypto.secureZero(u8, &psk);
-        registry.issueWithHandle(node, node_id, credential.handle, psk, now, expires_at) catch |err| switch (err) {
-            error.EnrollmentHandleInUse => continue,
-            else => return err,
-        };
-        return credential;
-    }
-}
-
-fn writeCredentialFile(
-    credential: credential_mod.Credential,
-    output_path: []const u8,
-    io: std.Io,
-) !void {
-    var text_buffer: [credential_mod.text_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &text_buffer);
-    const text = credential.encode(&text_buffer);
-    var with_newline: [credential_mod.text_len + 1]u8 = undefined;
-    defer std.crypto.secureZero(u8, &with_newline);
-    @memcpy(with_newline[0..text.len], text);
-    with_newline[text.len] = '\n';
-    try cli_runner.writePrivatePath(io, output_path, &with_newline);
-}
-
-fn reportCredential(
-    credential: credential_mod.Credential,
-    output_path: ?[]const u8,
-    stdout: *std.Io.Writer,
-) !void {
-    if (output_path) |path| {
-        try stdout.print("Enrollment credential written to {s}\n", .{path});
-        return;
-    }
-    var text_buffer: [credential_mod.text_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &text_buffer);
-    try stdout.print("Enrollment credential (single use):\n{s}\n", .{credential.encode(&text_buffer)});
-}
-
 fn requestFor(allocator: std.mem.Allocator, request_id: u64, argv: []const []const u8) !ipc.Request {
     var array = std.json.Array.init(allocator);
     for (argv) |arg| try array.append(.{ .string = arg });
@@ -590,7 +485,7 @@ test "live credential output failure does not issue or disclose credential" {
     });
     const response = admin.handle(request, arena.allocator());
     try std.testing.expect(!response.ok);
-    try std.testing.expectEqual(@as(u8, 1), response.exit_code);
+    try std.testing.expectEqual(@as(u8, 2), response.exit_code);
     try std.testing.expect(response.result == null);
     try std.testing.expectEqual(@as(usize, 0), store.nodes.items.len);
     try std.testing.expectEqual(@as(usize, 0), enrollments.records.items.len);
@@ -608,7 +503,7 @@ test "live credential output failure does not issue or disclose credential" {
     try std.testing.expectEqual(@as(usize, 0), disk_enrollments.records.items.len);
 }
 
-test "server enrollment reset retires the association before returning success" {
+test "legacy JSON admin cannot issue v0.2 enrollment bootstrap material" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var lock = try atomic.LifetimeLock.acquire(tmp.dir, std.testing.io, "state.lock", true);
@@ -646,12 +541,12 @@ test "server enrollment reset retires the association before returning success" 
     defer arena.deinit();
     const request = try requestFor(arena.allocator(), 9, &.{ "node", "enrollment", "reset", "node01" });
     const response = admin.handle(request, arena.allocator());
-    try std.testing.expect(response.ok);
-    try std.testing.expectEqualSlices(u8, &node_id.bytes, &seen.retired.?);
-    try std.testing.expectEqual(model.EnrollmentState.unenrolled, store.findNode("node01").?.enrollment_state);
-    try std.testing.expect(store.findNode("node01").?.public_key == null);
-    try std.testing.expectEqual(@as(usize, 1), enrollments.records.items.len);
-    try std.testing.expect(enrollments.records.items[0].node_id.eql(node_id));
+    try std.testing.expect(!response.ok);
+    try std.testing.expectEqual(@as(u8, 2), response.exit_code);
+    try std.testing.expect(seen.retired == null);
+    try std.testing.expectEqual(model.EnrollmentState.enrolled, store.findNode("node01").?.enrollment_state);
+    try std.testing.expect(store.findNode("node01").?.public_key != null);
+    try std.testing.expectEqual(@as(usize, 0), enrollments.records.items.len);
 }
 
 test "client admin status and down are explicit" {

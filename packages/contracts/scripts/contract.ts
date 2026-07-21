@@ -5,9 +5,16 @@ import { parse } from "yaml";
 
 export const packageRoot = new URL("../", import.meta.url);
 export const openApiUrl = new URL("openapi/ntip-v1.yaml", packageRoot);
+export const bootstrapOpenApiUrl = new URL("openapi/ntip-bootstrap-v1.yaml", packageRoot);
 export const generatedSchemaUrl = new URL("src/generated/schema.ts", packageRoot);
 export const generatedClientUrl = new URL("src/generated/client.ts", packageRoot);
 export const generatedOpenApiJsonUrl = new URL("src/generated/openapi.json", packageRoot);
+export const generatedBootstrapSchemaUrl = new URL("src/generated/bootstrap-schema.ts", packageRoot);
+export const generatedBootstrapClientUrl = new URL("src/generated/bootstrap-client.ts", packageRoot);
+export const generatedBootstrapOpenApiJsonUrl = new URL(
+  "src/generated/bootstrap-openapi.json",
+  packageRoot,
+);
 
 export const expectedPaths = [
   "/audit",
@@ -20,13 +27,15 @@ export const expectedPaths = [
   "/auth/reauth",
   "/connectivity-checks",
   "/connectivity-checks/{id}",
+  "/enrollment/bootstrap-config",
   "/events",
   "/health/live",
   "/health/ready",
   "/nodes",
+  "/nodes/actions/bootstrap",
   "/nodes/{id}",
   "/nodes/{id}/actions/reset-enrollment",
-  "/nodes/{id}/enrollment-credentials",
+  "/nodes/{id}/enrollment-bootstrap",
   "/openapi.json",
   "/operations/restart",
   "/operations/shutdown",
@@ -49,6 +58,7 @@ export const expectedPaths = [
 
 export const expectedOperations = [
   "DELETE /nodes/{id} deleteNode",
+  "DELETE /nodes/{id}/enrollment-bootstrap revokeNodeEnrollmentBootstrap",
   "DELETE /routes/{id} deleteRoute",
   "DELETE /sessions/{id} revokeSession",
   "DELETE /users/{id} tombstoneUser",
@@ -57,6 +67,7 @@ export const expectedOperations = [
   "GET /auth/me getAuthContext",
   "GET /connectivity-checks listConnectivityChecks",
   "GET /connectivity-checks/{id} getConnectivityCheck",
+  "GET /enrollment/bootstrap-config getEnrollmentBootstrapConfig",
   "GET /events listEvents",
   "GET /health/live getLiveness",
   "GET /health/ready getReadiness",
@@ -88,8 +99,9 @@ export const expectedOperations = [
   "POST /auth/reauth reauthenticate",
   "POST /connectivity-checks createConnectivityCheck",
   "POST /nodes createNode",
+  "POST /nodes/actions/bootstrap createNodeBootstrap",
   "POST /nodes/{id}/actions/reset-enrollment resetNodeEnrollment",
-  "POST /nodes/{id}/enrollment-credentials issueEnrollmentCredential",
+  "POST /nodes/{id}/enrollment-bootstrap createNodeEnrollmentBootstrap",
   "POST /operations/restart restartService",
   "POST /operations/shutdown shutdownService",
   "POST /routes createRoute",
@@ -97,6 +109,18 @@ export const expectedOperations = [
   "POST /users createUser",
   "POST /users/{id}/password-reset resetUserPassword",
   "POST /vnrs createVnr",
+] as const;
+
+export const expectedBootstrapPaths = [
+  "/enrollment/assets/{versioned-file}",
+  "/enrollment/v1/redeem",
+  "/enrollment/{bootstrapId}",
+] as const;
+
+export const expectedBootstrapOperations = [
+  "GET /enrollment/assets/{versioned-file} getBootstrapAsset",
+  "GET /enrollment/{bootstrapId} getBootstrapInstaller",
+  "POST /enrollment/v1/redeem redeemBootstrapInvitation",
 ] as const;
 
 export const stableErrorCodes = [
@@ -180,6 +204,12 @@ export async function loadContract(): Promise<JsonObject> {
   return objectAt(value, "document");
 }
 
+export async function loadBootstrapContract(): Promise<JsonObject> {
+  const source = await Bun.file(bootstrapOpenApiUrl).text();
+  const value: unknown = parse(source);
+  return objectAt(value, "bootstrap document");
+}
+
 export async function validateContract(): Promise<ContractSummary> {
   const validation = await validateOpenApi(fileURLToPath(openApiUrl));
   if (!validation.valid) {
@@ -192,7 +222,7 @@ export async function validateContract(): Promise<ContractSummary> {
   const document = await loadContract();
   const paths = objectAt(document.paths, "paths");
   assertEqual(document.openapi, "3.1.1", "OpenAPI version");
-  assertEqual(objectAt(document.info, "info").version, "1.0.1", "contract version");
+  assertEqual(objectAt(document.info, "info").version, "1.1.0", "contract version");
 
   const actualPaths = Object.keys(paths).sort();
   assertArrayEqual(actualPaths, [...expectedPaths], "canonical path set");
@@ -231,7 +261,11 @@ export async function validateContract(): Promise<ContractSummary> {
       if (operation["x-ntip-dangerous"] === true) {
         const roles = arrayAt(operation["x-ntip-roles"], `${operationId}.x-ntip-roles`);
         assertArrayEqual(roles, ["superuser"], `${operationId} dangerous role set`);
-        requireHeader(parameters, "If-Match", operationId);
+        if (operation["x-ntip-etag-precondition"] !== false) {
+          requireHeader(parameters, "If-Match", operationId);
+        } else if (operationId !== "createNodeBootstrap") {
+          throw new Error(`${operationId} cannot waive the dangerous-operation ETag precondition`);
+        }
         const requestBody = objectAt(operation.requestBody, `${operationId}.requestBody`);
         const content = objectAt(requestBody.content, `${operationId}.requestBody.content`);
         const jsonBody = objectAt(content["application/json"], `${operationId}.application/json`);
@@ -244,6 +278,21 @@ export async function validateContract(): Promise<ContractSummary> {
         if (!required.includes("confirmation")) {
           throw new Error(`${operationId} dangerous request must require typed confirmation`);
         }
+      }
+
+      if (operation["x-ntip-one-time-response"] === true) {
+        assertEqual(
+          operation["x-ntip-reauthentication"],
+          "required",
+          `${operationId} reauthentication policy`,
+        );
+        assertEqual(
+          operation["x-ntip-idempotency-replay"],
+          "forbidden",
+          `${operationId} idempotency replay policy`,
+        );
+        if (method !== "post") throw new Error(`${operationId} one-time disclosure must use POST`);
+        requireHeader(parameters, "Idempotency-Key", operationId);
       }
 
       const responses = objectAt(operation.responses, `${operationId}.responses`);
@@ -309,8 +358,8 @@ export async function validateContract(): Promise<ContractSummary> {
     "ChangePasswordRequest",
     "ConnectivityCheckCreate",
     "DangerousConfirmation",
-    "EnrollmentCredentialRequest",
     "LoginRequest",
+    "NodeBootstrapCreate",
     "NodeCreate",
     "NodeUpdate",
     "ReauthenticateRequest",
@@ -342,8 +391,134 @@ export async function validateContract(): Promise<ContractSummary> {
   };
 }
 
+export async function validateBootstrapContract(): Promise<ContractSummary> {
+  const validation = await validateOpenApi(fileURLToPath(bootstrapOpenApiUrl));
+  if (!validation.valid) throw new Error(compileErrors(validation));
+  if (validation.warnings.length > 0) {
+    throw new Error(`Bootstrap OpenAPI validation emitted warnings:\n${compileErrors(validation)}`);
+  }
+
+  const document = await loadBootstrapContract();
+  const paths = objectAt(document.paths, "bootstrap paths");
+  assertEqual(document.openapi, "3.1.1", "bootstrap OpenAPI version");
+  assertEqual(objectAt(document.info, "bootstrap info").version, "1.0.0", "bootstrap contract version");
+  assertEqual(
+    objectAt(arrayAt(document.servers, "bootstrap servers")[0], "bootstrap server").url,
+    "/",
+    "bootstrap base path",
+  );
+  assertArrayEqual(arrayAt(document.security, "bootstrap security"), [], "bootstrap global security");
+
+  const actualPaths = Object.keys(paths).sort();
+  assertArrayEqual(actualPaths, [...expectedBootstrapPaths], "bootstrap canonical path set");
+
+  const operationIds = new Set<string>();
+  const actualOperations: string[] = [];
+  let operationCount = 0;
+  for (const [path, pathValue] of Object.entries(paths)) {
+    const pathItem = objectAt(pathValue, `bootstrap paths.${path}`);
+    for (const [method, operationValue] of Object.entries(pathItem)) {
+      if (!methods.has(method)) continue;
+      operationCount += 1;
+      const operation = objectAt(operationValue, `bootstrap ${method.toUpperCase()} ${path}`);
+      const operationId = stringAt(operation.operationId, `${method.toUpperCase()} ${path}.operationId`);
+      actualOperations.push(`${method.toUpperCase()} ${path} ${operationId}`);
+      if (operationIds.has(operationId)) throw new Error(`Duplicate bootstrap operationId: ${operationId}`);
+      operationIds.add(operationId);
+      assertEqual(operation["x-ntip-cookie-independent"], true, `${operationId} cookie policy`);
+      assertEqual(operation["x-ntip-cors"], "disabled", `${operationId} CORS policy`);
+      assertEqual(operation["x-ntip-redirects"], "forbidden", `${operationId} redirect policy`);
+      if (Object.keys(objectAt(operation.responses, `${operationId}.responses`)).length === 0) {
+        throw new Error(`${operationId} has no responses`);
+      }
+    }
+  }
+  assertArrayEqual(actualOperations.sort(), [...expectedBootstrapOperations], "bootstrap canonical operation set");
+
+  const components = objectAt(document.components, "bootstrap components");
+  if (components.securitySchemes !== undefined) {
+    throw new Error("Bootstrap contract must not define authentication schemes");
+  }
+  const schemas = objectAt(components.schemas, "bootstrap components.schemas");
+  const bootstrapId = objectAt(schemas.BootstrapId, "BootstrapId");
+  assertEqual(bootstrapId.pattern, "^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$", "BootstrapId pattern");
+  const secretCode = objectAt(schemas.BootstrapSecretCode, "BootstrapSecretCode");
+  assertEqual(
+    secretCode.pattern,
+    "^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{3}$",
+    "BootstrapSecretCode pattern",
+  );
+  assertEqual(secretCode.writeOnly, true, "BootstrapSecretCode.writeOnly");
+
+  const redeem = objectAt(objectAt(paths["/enrollment/v1/redeem"], "redeem path").post, "redeem operation");
+  assertEqual(redeem["x-ntip-reject-origin"], true, "redeem Origin rejection");
+  assertEqual(redeem["x-ntip-reject-transfer-encoding"], true, "redeem transfer-encoding rejection");
+  assertEqual(redeem["x-ntip-max-request-body-bytes"], 128, "redeem body limit");
+  const redeemBody = objectAt(redeem.requestBody, "redeem requestBody");
+  const redeemContent = objectAt(redeemBody.content, "redeem request content");
+  assertArrayEqual(Object.keys(redeemContent), ["application/json"], "redeem media type set");
+  const redeemMedia = objectAt(redeemContent["application/json"], "redeem JSON media type");
+  const redeemSchema = resolveObjectRef(document, objectAt(redeemMedia.schema, "redeem schema"));
+  assertEqual(redeemSchema.additionalProperties, false, "BootstrapRedeemRequest.additionalProperties");
+  assertArrayEqual(
+    Object.keys(objectAt(redeemSchema.properties, "BootstrapRedeemRequest.properties")),
+    ["bootstrapId", "secretCode"],
+    "bootstrap redeem field set",
+  );
+  assertArrayEqual(
+    arrayAt(redeemSchema.required, "BootstrapRedeemRequest.required"),
+    ["bootstrapId", "secretCode"],
+    "bootstrap redeem required fields",
+  );
+
+  const bundle = objectAt(schemas.BootstrapRedemptionBundle, "BootstrapRedemptionBundle");
+  assertEqual(bundle.additionalProperties, false, "BootstrapRedemptionBundle.additionalProperties");
+  assertArrayEqual(
+    Object.keys(objectAt(bundle.properties, "BootstrapRedemptionBundle.properties")),
+    [
+      "schemaVersion",
+      "bootstrapId",
+      "nodeName",
+      "masterEndpoint",
+      "expiresAt",
+      "enrollmentCredential",
+      "archives",
+    ],
+    "bootstrap redemption bundle field set",
+  );
+  const credential = objectAt(schemas.InternalEnrollmentCredential, "InternalEnrollmentCredential");
+  assertEqual(credential.readOnly, true, "InternalEnrollmentCredential.readOnly");
+  assertEqual(credential.pattern, "^ntip-enroll-v1\\.[A-Za-z0-9_-]{107}$", "internal credential pattern");
+
+  const unavailable = objectAt(schemas.BootstrapUnavailableError, "BootstrapUnavailableError");
+  const unavailableProperties = objectAt(unavailable.properties, "BootstrapUnavailableError.properties");
+  assertEqual(
+    objectAt(unavailableProperties.code, "BootstrapUnavailableError.code").const,
+    "bootstrap_unavailable",
+    "generic unavailable code",
+  );
+  assertEqual(
+    objectAt(unavailableProperties.message, "BootstrapUnavailableError.message").const,
+    "Bootstrap invitation is unavailable.",
+    "generic unavailable message",
+  );
+
+  const asset = objectAt(
+    objectAt(paths["/enrollment/assets/{versioned-file}"], "asset path").get,
+    "asset operation",
+  );
+  assertEqual(asset["x-ntip-owner"], "nginx", "bootstrap asset owner");
+
+  return {
+    pathCount: actualPaths.length,
+    operationCount,
+    schemaCount: Object.keys(schemas).length,
+  };
+}
+
 export async function renderGeneratedArtifacts(): Promise<readonly GeneratedArtifact[]> {
   const document = await loadContract();
+  const bootstrapDocument = await loadBootstrapContract();
   const ast = await openapiTS(openApiUrl, {
     alphabetize: true,
     immutable: true,
@@ -352,6 +527,14 @@ export async function renderGeneratedArtifacts(): Promise<readonly GeneratedArti
     silent: true,
   });
   const schemaSource = `${COMMENT_HEADER}// Source: openapi/ntip-v1.yaml\n\n${astToString(ast)}`;
+  const bootstrapAst = await openapiTS(bootstrapOpenApiUrl, {
+    alphabetize: true,
+    immutable: true,
+    rootTypes: true,
+    rootTypesNoSchemaPrefix: true,
+    silent: true,
+  });
+  const bootstrapSchemaSource = `${COMMENT_HEADER}// Source: openapi/ntip-bootstrap-v1.yaml\n\n${astToString(bootstrapAst)}`;
   const clientSource = `/**
  * This file is generated from openapi/ntip-v1.yaml.
  * Do not make direct changes to the file.
@@ -371,10 +554,36 @@ export function createNtipApiClient(options: ClientOptions = {}): NtipApiClient 
   });
 }
 `;
+  const bootstrapClientSource = `/**
+ * This file is generated from openapi/ntip-bootstrap-v1.yaml.
+ * Do not make direct changes to the file.
+ */
+
+import createClient from "openapi-fetch";
+import type { Client, ClientOptions } from "openapi-fetch";
+import type { paths } from "./bootstrap-schema";
+
+export type NtipBootstrapClient = Client<paths>;
+
+export function createNtipBootstrapClient(options: ClientOptions = {}): NtipBootstrapClient {
+  return createClient<paths>({
+    baseUrl: "",
+    credentials: "omit",
+    redirect: "error",
+    ...options,
+  });
+}
+`;
   return [
     { url: generatedSchemaUrl, source: ensureFinalNewline(schemaSource) },
     { url: generatedClientUrl, source: ensureFinalNewline(clientSource) },
     { url: generatedOpenApiJsonUrl, source: `${JSON.stringify(document, null, 2)}\n` },
+    { url: generatedBootstrapSchemaUrl, source: ensureFinalNewline(bootstrapSchemaSource) },
+    { url: generatedBootstrapClientUrl, source: ensureFinalNewline(bootstrapClientSource) },
+    {
+      url: generatedBootstrapOpenApiJsonUrl,
+      source: `${JSON.stringify(bootstrapDocument, null, 2)}\n`,
+    },
   ];
 }
 

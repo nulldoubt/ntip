@@ -12,9 +12,10 @@ const usage =
     \\commands:
     \\  up [-d] | down | status [--json]
     \\  vnr create NAME CIDR | vnr delete NAME | vnr list [--json] | vnr show NAME [--json]
-    \\  node create NAME --vnr VNR --addr IPV4 [--expires DURATION] [--credential-out FILE]
+    \\  node create NAME --vnr VNR --addr IPV4 [--expires DURATION] (--bootstrap-out FILE | --no-bootstrap)
     \\  node delete NAME | node list [--json] | node show NAME [--json]
-    \\  node enrollment renew NAME | node enrollment reset NAME
+    \\  node enrollment renew NAME --bootstrap-out FILE
+    \\  node enrollment reset NAME --bootstrap-out FILE
     \\  route add CIDR NODE | route delete CIDR | route list [--json] | route show CIDR [--json]
     \\  user bootstrap USERNAME --password-stdin
     \\  backup --output-dir DIR | restore --input FILE
@@ -131,7 +132,7 @@ fn execute(
         );
         return .success;
     }
-    const repository = ntip.state.management_repository.Repository.init(&sqlite_owner.db);
+    var repository = ntip.state.management_repository.Repository.init(&sqlite_owner.db);
     var store = try repository.loadInventory(allocator);
     defer store.deinit();
     const settings_state = try (ntip.state.settings_repository.Repository.init(&sqlite_owner.db)).loadState();
@@ -139,6 +140,13 @@ fn execute(
     try settings.validate(store.nodes.items.len);
     var identity = try ntip.state.identity.loadOrCreate(allocator, io, state_dir);
     defer std.crypto.secureZero(u8, &identity.secret);
+    var enrollment_bootstrap = try ntip.management.bootstrap_service.Service.init(
+        &repository,
+        io,
+        &identity.secret,
+        identity.public,
+    );
+    defer enrollment_bootstrap.deinit();
     var application = try ntip.management.server_application.Application.init(
         allocator,
         io,
@@ -148,6 +156,7 @@ fn execute(
         settings,
         ntip.version,
     );
+    application.setBootstrapService(&enrollment_bootstrap);
     application.service_state = "stopped";
     try application.execute(parsed.command, stdout, stderr);
     return .success;
@@ -230,12 +239,13 @@ fn restoreDatabase(
         recovery_name,
         .{
             .id = randomUuid(io),
+            .bootstrap_revoke_id = randomUuid(io),
             .occurred_at = now,
         },
     );
     try stdout.print(
-        "Database restored; revoked {d} web session(s)\nRecoverable copy: {s}/{s}\n",
-        .{ result.revoked_sessions, state_path, recovery_name },
+        "Database restored; revoked {d} web session(s) and {d} setup invitation(s)\nRecoverable copy: {s}/{s}\n",
+        .{ result.revoked_sessions, result.revoked_bootstraps, state_path, recovery_name },
     );
 }
 
@@ -355,7 +365,10 @@ fn validateCommand(command: Command) !void {
         },
         .node_delete => |name| _ = try ntip.domain.model.Name.parse(name),
         .node_show => |show| _ = try ntip.domain.model.Name.parse(show.name),
-        .node_enrollment_renew, .node_enrollment_reset => |name| _ = try ntip.domain.model.Name.parse(name),
+        .node_enrollment_renew, .node_enrollment_reset => |request| {
+            _ = try ntip.domain.model.Name.parse(request.name);
+            if (request.bootstrap_out.len == 0) return error.InvalidPath;
+        },
         .route_add => |add| {
             const prefix = try ntip.domain.ipv4.Cidr.parse(add.cidr);
             try prefix.validateRouted();
@@ -440,7 +453,7 @@ test "offline Master rejects legacy JSON without modifying it" {
     );
 }
 
-test "offline credential output failure leaves node and enrollment state unchanged" {
+test "offline bootstrap output preflight failure leaves node and enrollment state unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -474,7 +487,7 @@ test "offline credential output failure leaves node and enrollment state unchang
         "vnr0",
         "--addr",
         "10.1.0.2",
-        "--credential-out",
+        "--bootstrap-out",
         credential_path,
     };
     try std.testing.expectEqual(
@@ -509,15 +522,15 @@ test "offline credential output failure leaves node and enrollment state unchang
     try std.testing.expectEqual(ntip.state.sqlite.Step.done, try enrollment_count.step());
 }
 
-test "offline credential output success is private and matches durable enrollment" {
+test "offline bootstrap output success is private and contains no internal credential" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
     const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "server" });
     defer std.testing.allocator.free(state_path);
-    const credential_path = try std.fs.path.join(std.testing.allocator, &.{ state_path, "node01.enroll" });
-    defer std.testing.allocator.free(credential_path);
+    const bootstrap_path = try std.fs.path.join(std.testing.allocator, &.{ state_path, "node01-bootstrap.json" });
+    defer std.testing.allocator.free(bootstrap_path);
 
     var setup_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer setup_out.deinit();
@@ -543,38 +556,44 @@ test "offline credential output success is private and matches durable enrollmen
         "vnr0",
         "--addr",
         "10.1.0.2",
-        "--credential-out",
-        credential_path,
+        "--bootstrap-out",
+        bootstrap_path,
     };
     try std.testing.expectEqual(
         ExitCode.success,
         try run(std.testing.allocator, std.testing.io, &create_args, &out.writer, &err.writer),
     );
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Created node \"node01\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), credential_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), bootstrap_path) != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), ntip.protocol.credential.prefix) == null);
 
-    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, credential_path, .{ .follow_symlinks = false });
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, bootstrap_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
-    const credential_bytes = try std.Io.Dir.cwd().readFileAlloc(
+    const bootstrap_bytes = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
-        credential_path,
+        bootstrap_path,
         std.testing.allocator,
-        .limited(ntip.protocol.credential.text_len + 2),
+        .limited(256),
     );
     defer {
-        std.crypto.secureZero(u8, credential_bytes);
-        std.testing.allocator.free(credential_bytes);
+        std.crypto.secureZero(u8, bootstrap_bytes);
+        std.testing.allocator.free(bootstrap_bytes);
     }
-    try std.testing.expectEqual(@as(usize, ntip.protocol.credential.text_len + 1), credential_bytes.len);
-    try std.testing.expectEqual(@as(u8, '\n'), credential_bytes[credential_bytes.len - 1]);
-    var credential = try ntip.protocol.credential.Credential.decode(
-        credential_bytes[0..ntip.protocol.credential.text_len],
-    );
-    defer credential.deinit();
-    var derived_psk = credential.derivePsk();
-    defer std.crypto.secureZero(u8, &derived_psk);
+    try std.testing.expectEqual(@as(u8, '\n'), bootstrap_bytes[bootstrap_bytes.len - 1]);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap_bytes, ntip.protocol.credential.prefix) == null);
+    const Disclosure = struct {
+        bootstrapId: []const u8,
+        secretCode: []const u8,
+        expiresAt: []const u8,
+    };
+    const parsed = try std.json.parseFromSlice(Disclosure, std.testing.allocator, bootstrap_bytes, .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, ntip.management.bootstrap_service.locator_len), parsed.value.bootstrapId.len);
+    try std.testing.expectEqual(@as(usize, ntip.management.bootstrap_service.code_text_len), parsed.value.secretCode.len);
+    try std.testing.expectEqual(@as(usize, ntip.management.api_response.timestamp_text_len), parsed.value.expiresAt.len);
 
     var state_dir = try ntip.cli.runner.openPrivateDirectory(std.testing.io, state_path);
     defer state_dir.close(std.testing.io);
@@ -589,14 +608,20 @@ test "offline credential output success is private and matches durable enrollmen
     defer store.deinit();
     const node = store.findNode("node01") orelse return error.TestExpectedEqual;
     var enrollment = try sqlite_owner.db.prepare(
-        "SELECT node_id, handle, derived_psk FROM enrollment_credentials WHERE status = 'unused';",
+        "SELECT node_id, derived_psk FROM enrollment_credentials WHERE status = 'unused';",
     );
     defer enrollment.deinit();
     try std.testing.expectEqual(ntip.state.sqlite.Step.row, try enrollment.step());
     try std.testing.expectEqualSlices(u8, &node.id.bytes, enrollment.columnBlob(0).?);
-    try std.testing.expectEqualSlices(u8, &credential.handle, enrollment.columnBlob(1).?);
-    try std.testing.expectEqualSlices(u8, &derived_psk, enrollment.columnBlob(2).?);
+    try std.testing.expectEqual(@as(usize, 32), enrollment.columnBlob(1).?.len);
     try std.testing.expectEqual(ntip.state.sqlite.Step.done, try enrollment.step());
+    var invitations = try sqlite_owner.db.prepare(
+        "SELECT count(*) FROM enrollment_bootstraps WHERE locator=?1 AND status='active';",
+    );
+    defer invitations.deinit();
+    try invitations.bindText(1, parsed.value.bootstrapId);
+    try std.testing.expectEqual(ntip.state.sqlite.Step.row, try invitations.step());
+    try std.testing.expectEqual(@as(i64, 1), invitations.columnInt64(0));
 }
 
 test "down without a daemon fails explicitly with exit code four" {

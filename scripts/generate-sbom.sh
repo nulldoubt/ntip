@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
-    echo "usage: $0 PACKAGE_ROOT VERSION OUTPUT.spdx.json [core|api|dashboard]" >&2
+    echo "usage: $0 PACKAGE_ROOT VERSION OUTPUT.spdx.json [core|api|dashboard|node]" >&2
     exit 2
 fi
 
@@ -32,6 +32,11 @@ case "$component" in
         primary_path=runtime/bun
         bun_version=1.3.14
         bun_package_id=SPDXRef-Package-Bun
+        ;;
+    node)
+        package_name=ntip-node
+        package_id=SPDXRef-Package-NTIP-Node
+        primary_path=bin/ntcl
         ;;
     *)
         echo "unsupported SBOM component: $component" >&2

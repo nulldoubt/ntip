@@ -32,7 +32,6 @@ import {
   Activity,
   AlertCircle,
   ArrowLeft,
-  Download,
   KeyRound,
   Pencil,
   Plus,
@@ -47,6 +46,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "@/components/auth-context";
+import { BootstrapDisclosure } from "@/components/nodes/bootstrap-disclosure";
 import {
   fieldError,
   InlineFieldError,
@@ -58,7 +58,6 @@ import { NodeAddressSelect, SegmentedCidrSelect } from "@/components/network/seg
 import {
   fetchJson,
   fetchJsonWithEtag,
-  freshIdempotencyKey,
   reauthenticate,
   responseError,
 } from "@/components/nodes/browser-api";
@@ -71,7 +70,7 @@ import {
   shortId,
 } from "@/components/nodes/node-presenters";
 import { createMutationAttempt } from "@/lib/behavior/mutation";
-import { actionableApiError, BrowserApiError } from "@/lib/browser-api-error";
+import { actionableApiError, BrowserApiError, readBrowserApiJson } from "@/lib/browser-api-error";
 import {
   createCidrSelection,
   createEmptyCidrSelection,
@@ -80,12 +79,19 @@ import {
   type SegmentedCidrSelection,
 } from "@/lib/network/segmented-network";
 import { usePolledResource } from "@/lib/use-polled-resource";
+import {
+  bootstrapActionLabel,
+  buildNodeInstallationCommand,
+  parseEnrollmentBootstrapConfig,
+  parseNodeBootstrapDisclosure,
+  type EnrollmentBootstrapConfig,
+  type NodeBootstrapDisclosure,
+} from "@/lib/node-bootstrap";
 
 type ConnectivityCheck = components["schemas"]["ConnectivityCheck"];
 type ConnectivityCheckCreate = components["schemas"]["ConnectivityCheckCreate"];
 type ConnectivityCheckPage = components["schemas"]["ConnectivityCheckPage"];
 type DangerousConfirmation = components["schemas"]["DangerousConfirmation"];
-type EnrollmentCredentialRequest = components["schemas"]["EnrollmentCredentialRequest"];
 type Node = components["schemas"]["Node"];
 type NodeDetail = components["schemas"]["NodeDetail"];
 type NodePage = components["schemas"]["NodePage"];
@@ -112,6 +118,10 @@ function FormError({ children }: Readonly<{ children: string | null }>) {
 function nodeOperationError(reason: unknown, resourceLabel: string, fallback: string): string {
   if (!(reason instanceof Error)) return fallback;
   return actionableApiError(reason, { resourceLabel, includeRequestId: true });
+}
+
+function isAbortError(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === "AbortError";
 }
 
 function Field({ label, htmlFor, children, hint, hintId }: Readonly<{
@@ -409,101 +419,214 @@ function ConnectivityDialog({ node, onCreated }: Readonly<{ node: Node; onCreate
   );
 }
 
-type EnrollmentOperation = "issue" | "reset";
-
-function EnrollmentDialog({ node, operation, onChanged }: Readonly<{ node: Node; operation: EnrollmentOperation; onChanged: () => void }>) {
+function EnrollmentBootstrapDialog({ node, onChanged }: Readonly<{ node: Node; onChanged: () => void }>) {
   const { auth, can } = useAuth();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [operation, setOperation] = useState<Readonly<{
+    enrollmentState: Node["enrollmentState"];
+    generation: number;
+    label: string;
+    nodeId: string;
+    nodeName: string;
+    resetsEnrollment: boolean;
+  }> | null>(null);
+  const [config, setConfig] = useState<EnrollmentBootstrapConfig | null>(null);
+  const [configPending, setConfigPending] = useState(false);
+  const [disclosure, setDisclosure] = useState<NodeBootstrapDisclosure | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [discardPending, setDiscardPending] = useState(false);
+  const [discardError, setDiscardError] = useState<string | null>(null);
+  const configAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    configAbortRef.current?.abort();
+    configAbortRef.current = null;
+  }, []);
+
   if (!can("enrollment:manage")) return null;
-  const issue = operation === "issue";
+
+  const actionLabel = operation?.label ?? bootstrapActionLabel(node);
+  const resetsEnrollment = operation?.resetsEnrollment ?? node.enrollmentState === "enrolled";
+  const confirmationName = operation?.nodeName ?? node.name;
+  const command = disclosure === null || config === null
+    ? null
+    : buildNodeInstallationCommand(config, disclosure.bootstrap.bootstrapId);
+
+  function clearSecretState(): void {
+    configAbortRef.current?.abort();
+    configAbortRef.current = null;
+    setPassword("");
+    setConfirmation("");
+    setOperation(null);
+    setDisclosure(null);
+    setConfig(null);
+    setConfigPending(false);
+    setDiscardError(null);
+  }
+
+  async function loadConfig(): Promise<void> {
+    configAbortRef.current?.abort();
+    const controller = new AbortController();
+    configAbortRef.current = controller;
+    setConfigPending(true);
+    setError(null);
+    try {
+      const loaded = parseEnrollmentBootstrapConfig(
+        await fetchJson<unknown>("/api/v1/enrollment/bootstrap-config", controller.signal),
+      );
+      if (controller.signal.aborted || configAbortRef.current !== controller) return;
+      setConfig(loaded);
+    } catch (reason) {
+      if (isAbortError(reason) || configAbortRef.current !== controller) return;
+      setConfig(null);
+      setError(nodeOperationError(reason, "Node installer configuration", "Installer configuration could not be loaded"));
+    } finally {
+      if (configAbortRef.current === controller) {
+        configAbortRef.current = null;
+        setConfigPending(false);
+      }
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const intent = operation;
+    if (config === null || intent === null || confirmation !== intent.nodeName) return;
     setPending(true);
     setError(null);
-    const data = new FormData(event.currentTarget);
-    const password = String(data.get("password") ?? "");
-    const confirmation = String(data.get("confirmation") ?? "");
+    const currentPassword = password;
+    setPassword("");
+    let invitationDispatched = false;
     try {
-      await reauthenticate(auth.csrfToken, password);
-      const current = await fetchJsonWithEtag<NodeDetail>(`/api/v1/nodes/${node.id}`);
-      if (issue) {
-        const body: EnrollmentCredentialRequest = {
-          confirmation,
-          expiresInSeconds: Number(data.get("expiresInSeconds")),
-        };
-        // Construct and send exactly once with the credential media type. This
-        // branch has no retry path, and the response never enters component state.
-        const oneTimeRequest = new Request(`/api/v1/nodes/${node.id}/enrollment-credentials`, {
-          method: "POST",
-          credentials: "same-origin",
-          cache: "no-store",
-          redirect: "error",
-          headers: {
-            Accept: "application/vnd.ntip.enrollment-credential",
-            "Content-Type": "application/json",
-            "Idempotency-Key": freshIdempotencyKey(),
-            "If-Match": current.etag,
-            "X-CSRF-Token": auth.csrfToken,
-          },
-          body: JSON.stringify(body),
-        });
-        const response = await fetch(oneTimeRequest);
-        if (!response.ok) throw await responseError(response);
-        const secretBlob = await response.blob();
-        const objectUrl = URL.createObjectURL(secretBlob);
-        const anchor = document.createElement("a");
-        anchor.href = objectUrl;
-        anchor.download = `${node.name.replaceAll(/[^a-zA-Z0-9._-]/g, "_")}.ntip-enrollment`;
-        anchor.hidden = true;
-        document.body.append(anchor);
-        anchor.click();
-        anchor.remove();
-        requestAnimationFrame(() => URL.revokeObjectURL(objectUrl));
-      } else {
-        const body: DangerousConfirmation = { confirmation };
-        const attempt = createMutationAttempt({
-          method: "POST",
-          url: `/api/v1/nodes/${node.id}/actions/reset-enrollment`,
-          csrfToken: auth.csrfToken,
-          ifMatch: current.etag,
-          requiresIfMatch: true,
-          body,
-        });
-        const response = await fetch(attempt.buildRequest());
-        if (!response.ok) throw await responseError(response);
+      await reauthenticate(auth.csrfToken, currentPassword);
+      const current = await fetchJsonWithEtag<NodeDetail>(`/api/v1/nodes/${intent.nodeId}`);
+      if (
+        current.data.node.id !== intent.nodeId ||
+        current.data.node.name !== intent.nodeName ||
+        current.data.node.enrollmentState !== intent.enrollmentState ||
+        current.data.node.generation !== intent.generation
+      ) {
+        setError("The Node changed while this confirmation was open. Review the refreshed enrollment state and try again.");
+        onChanged();
+        return;
       }
-      setOpen(false);
+      const body: DangerousConfirmation = { confirmation: intent.nodeName };
+      const attempt = createMutationAttempt({
+        method: "POST",
+        url: intent.resetsEnrollment
+          ? `/api/v1/nodes/${intent.nodeId}/actions/reset-enrollment`
+          : `/api/v1/nodes/${intent.nodeId}/enrollment-bootstrap`,
+        csrfToken: auth.csrfToken,
+        ifMatch: current.etag,
+        requiresIfMatch: true,
+        responseKind: "one-time",
+        body,
+      });
+      const request = attempt.buildRequest();
+      invitationDispatched = true;
+      const response = await fetch(request);
+      const created = parseNodeBootstrapDisclosure(await readBrowserApiJson<unknown>(response));
+      setDisclosure(created);
       onChanged();
     } catch (reason) {
-      const message = nodeOperationError(reason, "Node enrollment", "Enrollment operation failed");
-      setError(issue ? `${message} The credential request was not retried.` : message);
+      const message = nodeOperationError(reason, "Node setup invitation", "Setup invitation could not be generated");
+      setError(invitationDispatched
+        ? `${message} The one-time request was not retried. If the Node now shows a pending credential, generate a replacement.`
+        : message);
+      if (invitationDispatched) onChanged();
     } finally {
-      // Clear the password and typed confirmation with the closed form instance.
       setPending(false);
     }
   }
 
+  function complete(): void {
+    clearSecretState();
+    setOpen(false);
+    onChanged();
+  }
+
+  async function discard(): Promise<void> {
+    if (disclosure === null || discardPending) return;
+    setDiscardPending(true);
+    setDiscardError(null);
+    try {
+      const current = await fetchJsonWithEtag<NodeDetail>(`/api/v1/nodes/${node.id}`);
+      const attempt = createMutationAttempt({
+        method: "DELETE",
+        url: `/api/v1/nodes/${node.id}/enrollment-bootstrap`,
+        csrfToken: auth.csrfToken,
+        ifMatch: current.etag,
+        requiresIfMatch: true,
+        body: { confirmation: node.name },
+      });
+      const response = await fetch(attempt.buildRequest());
+      await readBrowserApiJson<Node>(response);
+      clearSecretState();
+      setOpen(false);
+      onChanged();
+    } catch (reason) {
+      setDiscardError(nodeOperationError(reason, "setup invitation", "The setup invitation could not be revoked"));
+    } finally {
+      setDiscardPending(false);
+    }
+  }
+
   return (
-    <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (!next) setError(null); }}>
+    <Dialog open={open} onOpenChange={(next) => {
+      if (pending || disclosure !== null || discardPending) return;
+      setOpen(next);
+      clearSecretState();
+      setError(null);
+      if (next) {
+        setOperation({
+          enrollmentState: node.enrollmentState,
+          generation: node.generation,
+          label: bootstrapActionLabel(node),
+          nodeId: node.id,
+          nodeName: node.name,
+          resetsEnrollment: node.enrollmentState === "enrolled",
+        });
+        void loadConfig();
+      } else {
+        setOperation(null);
+      }
+    }}>
       <DialogTrigger asChild>
-        <Button variant={issue ? "default" : "outline"}>{issue ? <Download aria-hidden="true" /> : <Unplug aria-hidden="true" />}{issue ? "Issue credential" : "Reset enrollment"}</Button>
+        <Button variant={resetsEnrollment ? "outline" : "default"}><KeyRound aria-hidden="true" />{actionLabel}</Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent
+        className={disclosure === null ? undefined : "max-h-[calc(100vh-2rem)] w-[min(46rem,calc(100vw-2rem))] overflow-y-auto [&>button:last-child]:hidden"}
+        onEscapeKeyDown={(event) => { if (disclosure !== null) event.preventDefault(); }}
+        onPointerDownOutside={(event) => { if (disclosure !== null) event.preventDefault(); }}
+        onInteractOutside={(event) => { if (disclosure !== null) event.preventDefault(); }}
+      >
         <DialogHeader>
-          <DialogTitle>{issue ? "Issue enrollment credential" : "Reset enrollment"}</DialogTitle>
-          <DialogDescription>{issue ? "This replaces any unused predecessor and starts a one-time download." : "This revokes any unused credential and returns the Node to unenrolled state."}</DialogDescription>
+          <DialogTitle>{actionLabel}</DialogTitle>
+          <DialogDescription>{resetsEnrollment
+            ? "Retire the enrolled identity, then disclose a new short-lived setup invitation once."
+            : "Generate a short-lived setup invitation. Any unused predecessor is revoked atomically."}</DialogDescription>
         </DialogHeader>
-        <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
-          <FormError>{error}</FormError>
-          <Alert tone="warning"><ShieldAlert aria-hidden="true" /><AlertDescription>Reauthentication and a fresh resource ETag are required. Type the exact Node name to continue.</AlertDescription></Alert>
-          {issue ? <Field label="Validity in seconds" htmlFor="credential-lifetime" hint="Allowed range: 60 seconds to 30 days."><Input id="credential-lifetime" name="expiresInSeconds" type="number" min={60} max={2_592_000} defaultValue={3_600} required /></Field> : null}
-          <Field label="Current password" htmlFor={`${operation}-password`}><Input id={`${operation}-password`} name="password" type="password" minLength={14} maxLength={256} autoComplete="current-password" required /></Field>
-          <Field label={`Type “${node.name}”`} htmlFor={`${operation}-confirmation`}><Input id={`${operation}-confirmation`} name="confirmation" autoComplete="off" required pattern={node.name.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")} /></Field>
-          <DialogFooter><Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" variant={issue ? "default" : "destructive"} disabled={pending}>{pending ? "Authorizing" : issue ? "Issue and download" : "Reset enrollment"}</Button></DialogFooter>
-        </form>
+        {disclosure !== null && command !== null ? (
+          <BootstrapDisclosure
+            command={command}
+            disclosure={disclosure}
+            discardError={discardError}
+            discardPending={discardPending}
+            onComplete={complete}
+            onDiscard={() => void discard()}
+          />
+        ) : (
+          <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
+            <FormError>{error}</FormError>
+            <Alert tone="warning"><ShieldAlert aria-hidden="true" /><AlertDescription>Reauthentication and a fresh resource ETag are required. Type the exact Node name to continue.</AlertDescription></Alert>
+            <Field label="Current password" htmlFor="bootstrap-password"><Input id="bootstrap-password" type="password" minLength={14} maxLength={256} autoComplete="current-password" required value={password} disabled={pending} onChange={(event) => setPassword(event.target.value)} /></Field>
+            <Field label={`Type “${confirmationName}”`} htmlFor="bootstrap-confirmation"><Input id="bootstrap-confirmation" autoComplete="off" required value={confirmation} disabled={pending} onChange={(event) => setConfirmation(event.target.value)} /></Field>
+            <DialogFooter><Button type="button" variant="ghost" disabled={pending} onClick={() => { setOpen(false); clearSecretState(); }}>Cancel</Button><Button type="submit" variant={resetsEnrollment ? "destructive" : "default"} disabled={pending || configPending || config === null || password.length < 14 || confirmation !== confirmationName}>{pending ? "Authorizing" : actionLabel}</Button></DialogFooter>
+          </form>
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -801,8 +924,7 @@ export function NodeDetailWorkspace({ initialChecks, initialDetail, nodes, vnrs 
         <div className="flex flex-wrap justify-end gap-2">
           <UpdateNodeDialog detail={detail} vnrs={vnrs} onChanged={detailPolling.refresh} />
           <ConnectivityDialog node={detail.node} onCreated={checksPolling.refresh} />
-          <EnrollmentDialog node={detail.node} operation="issue" onChanged={detailPolling.refresh} />
-          <EnrollmentDialog node={detail.node} operation="reset" onChanged={detailPolling.refresh} />
+          <EnrollmentBootstrapDialog node={detail.node} onChanged={detailPolling.refresh} />
           <DeleteNodeDialog node={detail.node} />
         </div>
       </div>

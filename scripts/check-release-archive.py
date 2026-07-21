@@ -36,6 +36,12 @@ COMPONENTS = {
         "binaries": ("ntip-api",),
         "internal_sbom_prefix": "ntip-api",
     },
+    "node": {
+        "package_name": "ntip-node",
+        "package_id": "SPDXRef-Package-NTIP-Node",
+        "binaries": ("ntcl",),
+        "internal_sbom_prefix": "ntip-node",
+    },
 }
 
 SQLITE_COMPONENT = {
@@ -123,6 +129,37 @@ def expected_payload(
             "packaging",
             "packaging/config",
             "packaging/systemd",
+            "scripts",
+        }
+    elif component == "node":
+        files = common | {
+            "VERSION",
+            "TARGET",
+            "bin/ntcl",
+            "scripts/install-node.sh",
+            "scripts/uninstall-node.sh",
+            "packaging/config/client.json",
+            "packaging/systemd/ntcl.service",
+            "packaging/tmpfiles/ntip-node.conf",
+            f"ntip-node-{version}.spdx.json",
+        }
+        files.update(
+            f"docs/{name}"
+            for name in (
+                "node-bootstrap.md",
+                "operator-guide.md",
+                "protocol.md",
+                "threat-model.md",
+            )
+        )
+        directories = {
+            ".",
+            "bin",
+            "docs",
+            "packaging",
+            "packaging/config",
+            "packaging/systemd",
+            "packaging/tmpfiles",
             "scripts",
         }
     else:
@@ -342,12 +379,16 @@ def inspect(args: argparse.Namespace) -> None:
     archive = args.archive.resolve()
     core_root = f"ntip-v{args.version}-{args.target}"
     api_root = f"ntip-api-v{args.version}-{args.target}"
+    node_root = f"ntip-node-v{args.version}-{args.target}"
     if archive.name == f"{core_root}.tar.gz":
         component = "core"
         root_name = core_root
     elif archive.name == f"{api_root}.tar.gz":
         component = "api"
         root_name = api_root
+    elif archive.name == f"{node_root}.tar.gz":
+        component = "node"
+        root_name = node_root
     else:
         raise ContractError("archive filename does not match version, target, or component")
     require(archive.is_file(), f"archive does not exist: {archive}")
@@ -381,6 +422,8 @@ def inspect(args: argparse.Namespace) -> None:
                 "scripts/uninstall.sh",
                 "scripts/install-api.sh",
                 "scripts/uninstall-api.sh",
+                "scripts/install-node.sh",
+                "scripts/uninstall-node.sh",
             } else 0o644
             require(stat.S_IMODE(member.mode) == expected_mode, f"{relative}: unexpected file mode")
             extracted = bundle.extractfile(member)

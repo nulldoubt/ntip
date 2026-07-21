@@ -172,9 +172,12 @@ set their initial group to `ntip-admin` so `RuntimeDirectory=ntip` preserves the
 required `root:ntip-admin` ownership. Systemd executes foreground mode and
 applies additional namespace, filesystem, syscall, and capability restrictions.
 
-The optional API and dashboard are separate unprivileged service identities.
-The API has no capabilities or state-directory access and can use only its
-typed Unix socket plus loopback IP. The dashboard has no capabilities,
+The separately installed API and optional dashboard use distinct unprivileged
+service identities. The API and HTTPS/bootstrap-assets edge are required to
+provision new Nodes, although an established protocol-only deployment can run
+without the management HTTP tier. The API has no capabilities or
+state-directory access and can use only its typed Unix socket plus loopback IP.
+The dashboard has no capabilities,
 supplementary groups, writable state, or access to either socket directory; it
 can use only loopback IPv4/IPv6 and its read-only configuration/application
 tree. Bun's JavaScriptCore JIT requires executable mappings, so the dashboard

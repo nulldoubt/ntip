@@ -44,7 +44,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils jq unzip
+          sudo apt-get install -y binutils jq nginx openssl unzip
       - name: Select and validate version
         id: version
         env:
@@ -114,11 +114,16 @@ jobs:
             "${{ steps.version.outputs.version }}"
           ./scripts/check-dashboard-release-reproducibility.sh \
             "${{ steps.version.outputs.version }}"
+          ./scripts/check-bootstrap-assets-install.sh
+          ./scripts/check-nginx-bootstrap-config.sh
       - name: Verify isolated installer lifecycle and aggregate checksums
         run: |
           ./scripts/check-installer-isolation.sh dist/*.tar.gz
           python3 scripts/check-secret-exposure.py --archives dist/*.tar.gz
-          (cd dist && sha256sum *.tar.gz *.tar.gz.sha256 *.spdx.json > SHA256SUMS)
+          (cd dist && sha256sum \
+            *.tar.gz *.tar.gz.sha256 *.spdx.json \
+            bootstrap-assets.json bootstrap-assets.json.sha256 \
+            > SHA256SUMS)
       - name: Inspect archive contracts
         run: |
           version="${{ steps.version.outputs.version }}"
@@ -136,6 +141,13 @@ jobs:
           python3 scripts/check-release-archive.py \
             "$version" aarch64-linux-musl \
             "dist/ntip-api-v$version-aarch64-linux-musl.tar.gz"
+          python3 scripts/check-release-archive.py \
+            "$version" x86_64-linux-musl \
+            "dist/ntip-node-v$version-x86_64-linux-musl.tar.gz" \
+            --require-native-execution
+          python3 scripts/check-release-archive.py \
+            "$version" aarch64-linux-musl \
+            "dist/ntip-node-v$version-aarch64-linux-musl.tar.gz"
           python3 scripts/check-dashboard-release-archive.py \
             "$version" x86_64-linux \
             "dist/ntip-dashboard-v$version-x86_64-linux.tar.gz" \
@@ -143,6 +155,7 @@ jobs:
           python3 scripts/check-dashboard-release-archive.py \
             "$version" aarch64-linux \
             "dist/ntip-dashboard-v$version-aarch64-linux.tar.gz"
+          (cd dist && sha256sum --check bootstrap-assets.json.sha256)
           (cd dist && sha256sum --check SHA256SUMS)
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -230,13 +243,14 @@ jobs:
             test "$(jq -r '.tag' <<<"$tag_json")" = "$GITHUB_REF_NAME"
             test "$(jq -r '.object.sha' <<<"$tag_json")" = "$EXPECTED_COMMIT"
           fi
-      - name: Attest archives and SBOMs
+      - name: Attest archives, manifests, and SBOMs
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.sha256
             dist/*.spdx.json
+            dist/bootstrap-assets.json
             dist/SHA256SUMS
       - name: Publish tagged GitHub release
         if: github.ref_type == 'tag'

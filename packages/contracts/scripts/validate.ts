@@ -1,7 +1,12 @@
-import { validateContract } from "./contract.ts";
+import { validateBootstrapContract, validateContract } from "./contract.ts";
 
-const summary = await validateContract();
+const [summary, bootstrapSummary] = await Promise.all([
+  validateContract(),
+  validateBootstrapContract(),
+]);
 console.log(
-  `Validated NTIP OpenAPI v1: ${summary.pathCount} paths, ` +
-    `${summary.operationCount} operations, ${summary.schemaCount} schemas.`,
+  `Validated NTIP management OpenAPI v1.1: ${summary.pathCount} paths, ` +
+    `${summary.operationCount} operations, ${summary.schemaCount} schemas; ` +
+    `Bootstrap v1: ${bootstrapSummary.pathCount} paths, ` +
+    `${bootstrapSummary.operationCount} operations, ${bootstrapSummary.schemaCount} schemas.`,
 );

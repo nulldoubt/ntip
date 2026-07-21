@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { createNtipApiClient } from "../src/index.ts";
-import type { components } from "../src/index.ts";
+import { createNtipApiClient, createNtipBootstrapClient } from "../src/index.ts";
+import type { bootstrapComponents, components } from "../src/index.ts";
 
 describe("generated openapi-fetch client", () => {
   test("uses typed paths and preserves same-origin credentials", async () => {
@@ -36,6 +36,53 @@ describe("generated openapi-fetch client", () => {
 
     expect(request.timeoutMilliseconds).toBe(3000);
     expect(role).toBe("operator");
+  });
+
+  test("keeps the public bootstrap client cookie-free and rejects redirects", async () => {
+    let request: Request | undefined;
+    let requestedCredentials: RequestCredentials | undefined;
+    let requestedRedirect: RequestRedirect | undefined;
+    class CapturingRequest extends Request {
+      constructor(input: RequestInfo | URL, init?: RequestInit) {
+        requestedCredentials = init?.credentials;
+        requestedRedirect = init?.redirect;
+        super(input, init);
+      }
+    }
+    const client = createNtipBootstrapClient({
+      baseUrl: "https://console.example",
+      Request: CapturingRequest,
+      fetch: async (input) => {
+        request = input;
+        return Response.json({
+          schemaVersion: 1,
+          bootstrapId: "ABCDEFGH",
+          nodeName: "edge-01",
+          masterEndpoint: "43.157.23.67:49152",
+          expiresAt: "2026-07-22T19:00:00Z",
+          enrollmentCredential: `ntip-enroll-v1.${"A".repeat(107)}`,
+          archives: [],
+        });
+      },
+    });
+
+    await client.POST("/enrollment/v1/redeem", {
+      body: { bootstrapId: "ABCDEFGH", secretCode: "ABC-DEF-GHJ" },
+    });
+    expect(request?.url).toBe("https://console.example/enrollment/v1/redeem");
+    expect(requestedCredentials).toBe("omit");
+    expect(requestedRedirect).toBe("error");
+  });
+
+  test("exports public bootstrap DTO types without changing management aliases", () => {
+    const request: bootstrapComponents["schemas"]["BootstrapRedeemRequest"] = {
+      bootstrapId: "ABCDEFGH",
+      secretCode: "ABC-DEF-GHJ",
+    };
+    const managementRole: components["schemas"]["Role"] = "superuser";
+
+    expect(request.bootstrapId).toBe("ABCDEFGH");
+    expect(managementRole).toBe("superuser");
   });
 
   test("serializes opaque cursors and canonical timestamps as URI query components", async () => {

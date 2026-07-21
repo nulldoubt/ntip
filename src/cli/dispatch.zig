@@ -43,9 +43,9 @@ pub const MutationOutcome = union(enum) {
     enrollment_reset_required: []const u8,
 };
 
-/// Applies only the durable domain mutation. Enrollment credential generation
-/// remains a separate persistence transaction so the caller can commit
-/// `state.json` and `enrollments.json` under the same state-directory lock.
+/// Applies only the in-memory domain mutation. The SQLite-backed caller owns
+/// the atomic inventory/invitation commit and publishes the resulting
+/// projection only after that transaction succeeds.
 pub fn applyServerMutation(store: *model.Store, io: std.Io, command: server.Command) !MutationOutcome {
     return switch (command) {
         .vnr_create => |create| blk: {
@@ -76,13 +76,13 @@ pub fn applyServerMutation(store: *model.Store, io: std.Io, command: server.Comm
             try store.deleteRoute(prefix);
             break :blk .route_deleted;
         },
-        .node_enrollment_renew => |name| blk: {
-            if (store.findNode(name) == null) return error.NodeNotFound;
-            break :blk .{ .enrollment_renew_required = name };
+        .node_enrollment_renew => |request| blk: {
+            if (store.findNode(request.name) == null) return error.NodeNotFound;
+            break :blk .{ .enrollment_renew_required = request.name };
         },
-        .node_enrollment_reset => |name| blk: {
-            try store.resetNodeEnrollment(name);
-            break :blk .{ .enrollment_reset_required = name };
+        .node_enrollment_reset => |request| blk: {
+            try store.resetNodeEnrollment(request.name);
+            break :blk .{ .enrollment_reset_required = request.name };
         },
         else => error.NotMutation,
     };

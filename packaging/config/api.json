@@ -1,9 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "bind_address": "127.0.0.1",
   "port": 8787,
   "service_socket": "/run/ntip-api/ntsrv-api.sock",
   "public_https_origin": "https://ntip.example.invalid",
+  "bootstrap_spki_pin": "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "bootstrap_manifest_path": "/etc/ntip/bootstrap-assets.json",
   "workers": 4,
   "maximum_connections": 256
 }
