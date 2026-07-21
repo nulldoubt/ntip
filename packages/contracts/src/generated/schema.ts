@@ -753,7 +753,9 @@ export interface components {
         readonly ErrorObject: {
             readonly code: components["schemas"]["ErrorCode"];
             readonly message: string;
+            /** @description Same identifier as the `X-Request-ID` response header. */
             readonly requestId: components["schemas"]["Id"];
+            /** @description Optional field details for validation, invariant, and conflict failures. */
             readonly violations?: readonly components["schemas"]["FieldViolation"][];
         };
         readonly ErrorResponse: {
@@ -774,9 +776,29 @@ export interface components {
         };
         /** @enum {string} */
         readonly EventSeverity: "info" | "warning" | "critical";
+        /**
+         * @description Structured detail for an invalid inventory field. The top-level error
+         *     code and HTTP status remain authoritative; clients use these details to
+         *     associate an actionable error with a form field. Known inventory
+         *     fields are `address`, `cidr`, and `prefix`.
+         */
         readonly FieldViolation: {
+            /**
+             * @description Stable inventory violation code. v0.2 defines
+             *     `invalid_ipv4_address`, `address_outside_vnr`,
+             *     `address_reserved_network`, `address_reserved_master`,
+             *     `address_reserved_broadcast`, `address_in_use`,
+             *     `invalid_ipv4_cidr`, `noncanonical_ipv4_cidr`,
+             *     `prefix_out_of_range`, `range_reserved`,
+             *     `range_overlaps_vnr`, `range_overlaps_route`,
+             *     `range_excludes_node`, and `range_reserves_node_address`.
+             *     Future revisions may add codes, so clients must preserve and
+             *     gracefully display unknown values.
+             */
             readonly code: string;
+            /** @description Canonical request field name; known inventory fields are `address`, `cidr`, and `prefix`. */
             readonly field: string;
+            /** @description Human-readable explanation; wording is not a stable contract. */
             readonly message: string;
         };
         /** Format: int64 */
@@ -1082,7 +1104,11 @@ export interface components {
         };
     };
     responses: {
-        /** @description Malformed framing, JSON, parameters, or validation input. */
+        /**
+         * @description Malformed framing, JSON, parameters, or validation input. Inventory
+         *     address/CIDR parsing and prefix-range failures use HTTP 400 with the
+         *     top-level `validation_failed` error code.
+         */
         readonly BadRequest: {
             headers: {
                 readonly "Cache-Control": components["headers"]["NoStore"];
@@ -1093,7 +1119,12 @@ export interface components {
                 readonly "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description The operation conflicts with a domain invariant or idempotency record. */
+        /**
+         * @description The operation conflicts with a domain invariant or idempotency record.
+         *     Inventory reserved-address, outside-VNR, overlap, and dependent-resource
+         *     failures use HTTP 409 with `invariant_violation`; an address already
+         *     assigned to another Node uses HTTP 409 with `conflict`.
+         */
         readonly Conflict: {
             headers: {
                 readonly "Cache-Control": components["headers"]["NoStore"];

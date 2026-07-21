@@ -1,4 +1,12 @@
 import type { components } from "@ntip/contracts";
+import {
+  containsIpv4,
+  formatIpv4,
+  networkAddress,
+  parseIpv4,
+  parseIpv4Cidr,
+  type Ipv4Cidr,
+} from "../../src/lib/network/ipv4";
 
 type AcceptedOperation = components["schemas"]["AcceptedOperation"];
 type AuditEntry = components["schemas"]["AuditEntry"];
@@ -7,6 +15,7 @@ type AuthContext = components["schemas"]["AuthContext"];
 type ConnectivityCheck = components["schemas"]["ConnectivityCheck"];
 type ConnectivityCheckPage = components["schemas"]["ConnectivityCheckPage"];
 type ErrorCode = components["schemas"]["ErrorCode"];
+type FieldViolation = components["schemas"]["FieldViolation"];
 type Event = components["schemas"]["Event"];
 type Node = components["schemas"]["Node"];
 type NodeDetail = components["schemas"]["NodeDetail"];
@@ -25,6 +34,22 @@ type Vnr = components["schemas"]["Vnr"];
 const NOW = "2026-07-20T10:00:00Z";
 const LATER = "2026-07-20T22:00:00Z";
 const IDLE = "2026-07-20T10:30:00Z";
+
+const reservedRanges = [
+  "0.0.0.0/8",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "224.0.0.0/4",
+  "240.0.0.0/4",
+].map(parseIpv4Cidr);
+
+const privateRanges = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+].map(parseIpv4Cidr);
+
+const inventoryNamePattern = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$/;
 
 const ids = {
   audit: "a1000000000000000000000000000001",
@@ -247,8 +272,21 @@ function empty(sequence: number, status = 204, extra?: HeadersInit): Response {
   return new Response(null, { status, headers: standardHeaders(sequence, extra) });
 }
 
-function apiError(sequence: number, status: number, code: ErrorCode, message: string): Response {
-  return json(sequence, { error: { code, message, requestId: requestId(sequence) } }, status);
+function apiError(
+  sequence: number,
+  status: number,
+  code: ErrorCode,
+  message: string,
+  violations: readonly FieldViolation[] = [],
+): Response {
+  return json(sequence, {
+    error: {
+      code,
+      message,
+      requestId: requestId(sequence),
+      ...(violations.length === 0 ? {} : { violations }),
+    },
+  }, status);
 }
 
 function roleRank(role: Role): number {
@@ -299,6 +337,62 @@ function loggedHeaders(request: Request): Readonly<Record<string, string>> {
 function exactFields(value: unknown, allowed: readonly string[]): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function rangesOverlap(left: Ipv4Cidr, right: Ipv4Cidr): boolean {
+  return left.network <= right.broadcast && right.network <= left.broadcast;
+}
+
+function rangeContainsRange(container: Ipv4Cidr, candidate: Ipv4Cidr): boolean {
+  return candidate.network >= container.network && candidate.broadcast <= container.broadcast;
+}
+
+function isReservedRange(cidr: Ipv4Cidr): boolean {
+  return reservedRanges.some((reserved) => rangesOverlap(cidr, reserved));
+}
+
+function isPublicRange(cidr: Ipv4Cidr): boolean {
+  return !privateRanges.some((privateRange) => rangeContainsRange(privateRange, cidr));
+}
+
+function cidrFailureCode(value: string): FieldViolation["code"] {
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash !== value.lastIndexOf("/") || slash === value.length - 1) {
+    return "invalid_ipv4_cidr";
+  }
+
+  const addressText = value.slice(0, slash);
+  const prefixText = value.slice(slash + 1);
+  if (/^(?:[0-9]+\.){3}[0-9]+$/.test(addressText)) {
+    const hasLeadingZero = addressText.split(".").some((octet) => octet.length > 1 && octet.startsWith("0"));
+    if (hasLeadingZero) return "noncanonical_ipv4_cidr";
+  }
+
+  let address: bigint;
+  try {
+    address = parseIpv4(addressText);
+  } catch {
+    return "invalid_ipv4_cidr";
+  }
+
+  if (/^[0-9]+$/.test(prefixText) && prefixText.length > 1 && prefixText.startsWith("0")) {
+    return "noncanonical_ipv4_cidr";
+  }
+  if (!/^(?:0|[1-9][0-9]{0,2})$/.test(prefixText)) return "prefix_out_of_range";
+  const prefixLength = Number(prefixText);
+  if (prefixLength > 32) return "prefix_out_of_range";
+  if (networkAddress(address, prefixLength) !== address) return "noncanonical_ipv4_cidr";
+  return "invalid_ipv4_cidr";
+}
+
+function cidrFailureMessage(code: FieldViolation["code"]): string {
+  if (code === "noncanonical_ipv4_cidr") return "The IPv4 range must use canonical network notation.";
+  if (code === "prefix_out_of_range") return "The IPv4 prefix length is outside the permitted range.";
+  return "The value must be a valid IPv4 CIDR.";
+}
+
+function violation(field: string, code: string, message: string): FieldViolation {
+  return { field, code, message };
 }
 
 export class FixtureApi {
@@ -572,6 +666,176 @@ export class FixtureApi {
     return { items: this.#state.audit.map((entry) => role === "viewer" ? { ...entry, proxyPeer: null, userAgent: null } : entry), nextCursor: null };
   }
 
+  #parseInventoryCidr(
+    sequence: number,
+    value: string,
+    field: "cidr" | "prefix",
+    purpose: "vnr" | "route",
+  ): Ipv4Cidr | Response {
+    let cidr: Ipv4Cidr;
+    try {
+      cidr = parseIpv4Cidr(value);
+    } catch {
+      const code = cidrFailureCode(value);
+      const message = cidrFailureMessage(code);
+      return apiError(sequence, 400, "validation_failed", "Request validation failed", [
+        violation(field, code, message),
+      ]);
+    }
+
+    const prefixIsValid = purpose === "vnr"
+      ? cidr.prefixLength >= 1 && cidr.prefixLength <= 30
+      : cidr.prefixLength >= 1 && cidr.prefixLength <= 32;
+    if (!prefixIsValid) {
+      const message = "The IPv4 prefix length is outside the permitted range.";
+      return apiError(sequence, 400, "validation_failed", "Request validation failed", [
+        violation(field, "prefix_out_of_range", message),
+      ]);
+    }
+    if (isReservedRange(cidr)) {
+      const message = "The range overlaps reserved IPv4 address space.";
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation(field, "range_reserved", message),
+      ]);
+    }
+    return cidr;
+  }
+
+  #validateVnrRange(
+    sequence: number,
+    cidr: Ipv4Cidr,
+    currentName?: string,
+  ): Response | null {
+    const overlappingVnr = this.#state.vnrs.find((candidate) =>
+      candidate.name !== currentName && rangesOverlap(parseIpv4Cidr(candidate.cidr), cidr)
+    );
+    if (overlappingVnr !== undefined) {
+      const message = `The range overlaps VNR "${overlappingVnr.name}".`;
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation("cidr", "range_overlaps_vnr", message),
+      ]);
+    }
+
+    const overlappingRoute = this.#state.routes.find((route) => rangesOverlap(parseIpv4Cidr(route.prefix), cidr));
+    if (overlappingRoute !== undefined) {
+      const message = `The range overlaps a route owned by Node "${overlappingRoute.nodeName}".`;
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation("cidr", "range_overlaps_route", message),
+      ]);
+    }
+
+    if (currentName === undefined) return null;
+    const masterAddress = cidr.network + 1n;
+    for (const node of this.#state.nodes) {
+      if (node.vnrName !== currentName) continue;
+      const address = parseIpv4(node.address);
+      if (!containsIpv4(cidr, address)) {
+        const message = `The range excludes Node "${node.name}".`;
+        return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+          violation("cidr", "range_excludes_node", message),
+        ]);
+      }
+      if (address === cidr.network || address === masterAddress || address === cidr.broadcast) {
+        const message = `The range would reserve Node "${node.name}"'s address.`;
+        return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+          violation("cidr", "range_reserves_node_address", message),
+        ]);
+      }
+    }
+    return null;
+  }
+
+  #validateNodeState(
+    sequence: number,
+    input: Readonly<{ name: string; address: string; vnrName: string }>,
+    currentId?: string,
+  ): Readonly<{ address: bigint; vnr: Vnr }> | Response {
+    if (!inventoryNamePattern.test(input.name)) {
+      return apiError(sequence, 400, "validation_failed", "Node name is invalid");
+    }
+    const vnr = this.#state.vnrs.find((candidate) => candidate.name === input.vnrName);
+    if (vnr === undefined) return apiError(sequence, 400, "validation_failed", "Selected VNR does not exist");
+    const duplicateName = this.#state.nodes.find((candidate) =>
+      candidate.id !== currentId && candidate.name === input.name
+    );
+    if (duplicateName !== undefined) return apiError(sequence, 409, "conflict", "Node name is already in use");
+
+    let address: bigint;
+    try {
+      address = parseIpv4(input.address);
+    } catch {
+      const message = "Address must be canonical dotted-decimal IPv4.";
+      return apiError(sequence, 400, "validation_failed", "Request validation failed", [
+        violation("address", "invalid_ipv4_address", message),
+      ]);
+    }
+
+    const range = parseIpv4Cidr(vnr.cidr);
+    if (!containsIpv4(range, address)) {
+      const message = "Address must be a usable host inside the selected VNR.";
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation("address", "address_outside_vnr", message),
+      ]);
+    }
+    const masterAddress = parseIpv4(vnr.masterAddress);
+    if (address === range.network || address === masterAddress || address === range.broadcast) {
+      const code = address === range.network
+        ? "address_reserved_network"
+        : address === masterAddress
+          ? "address_reserved_master"
+          : "address_reserved_broadcast";
+      const message = address === range.network
+        ? "The VNR network address cannot be assigned to a Node."
+        : address === masterAddress
+          ? "The VNR Master address cannot be assigned to a Node."
+          : "The VNR broadcast address cannot be assigned to a Node.";
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation("address", code, message),
+      ]);
+    }
+    const duplicateAddress = this.#state.nodes.find((candidate) =>
+      candidate.id !== currentId && candidate.address === input.address
+    );
+    if (duplicateAddress !== undefined) {
+      const message = `Address is already assigned to Node "${duplicateAddress.name}".`;
+      return apiError(sequence, 409, "conflict", "Resource conflicts with current state", [
+        violation("address", "address_in_use", message),
+      ]);
+    }
+    return { address, vnr };
+  }
+
+  #validateRouteState(
+    sequence: number,
+    input: Readonly<{ nodeId: string; prefix: string }>,
+    currentId?: string,
+  ): Readonly<{ node: Node; prefix: Ipv4Cidr }> | Response {
+    const node = this.#state.nodes.find((candidate) => candidate.id === input.nodeId);
+    if (node === undefined) return apiError(sequence, 400, "validation_failed", "Route owner does not exist");
+    const parsed = this.#parseInventoryCidr(sequence, input.prefix, "prefix", "route");
+    if (parsed instanceof Response) return parsed;
+
+    const overlappingVnr = this.#state.vnrs.find((vnr) => rangesOverlap(parseIpv4Cidr(vnr.cidr), parsed));
+    if (overlappingVnr !== undefined) {
+      const message = `The range overlaps VNR "${overlappingVnr.name}".`;
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation("prefix", "range_overlaps_vnr", message),
+      ]);
+    }
+    const sameRoute = this.#state.routes.find((route) => route.id !== currentId && route.prefix === input.prefix);
+    if (sameRoute !== undefined) return apiError(sequence, 409, "conflict", "Route already exists");
+    const overlappingRoute = this.#state.routes.find((route) =>
+      route.id !== currentId && rangesOverlap(parseIpv4Cidr(route.prefix), parsed)
+    );
+    if (overlappingRoute !== undefined) {
+      const message = `The range overlaps a route owned by Node "${overlappingRoute.nodeName}".`;
+      return apiError(sequence, 409, "invariant_violation", "Domain invariant would be violated", [
+        violation("prefix", "range_overlaps_route", message),
+      ]);
+    }
+    return { node, prefix: parsed };
+  }
+
   async #vnrs(request: Request, sequence: number, user: User, session: FixtureSession): Promise<Response> {
     if (request.method === "GET") return json(sequence, { items: this.#state.vnrs, nextCursor: null });
     const roleError = this.#requireRole(user, "operator", sequence);
@@ -581,8 +845,21 @@ export class FixtureApi {
     if (validation !== null) return validation;
     const body: unknown = await request.json().catch(() => null);
     if (!exactFields(body, ["name", "cidr"]) || typeof body.name !== "string" || typeof body.cidr !== "string") return apiError(sequence, 400, "validation_failed", "Name and CIDR are required");
+    if (!inventoryNamePattern.test(body.name)) return apiError(sequence, 400, "validation_failed", "VNR name is invalid");
     if (this.#state.vnrs.some((item) => item.name === body.name)) return apiError(sequence, 409, "conflict", "VNR already exists");
-    const vnr: Vnr = { name: body.name, cidr: body.cidr, masterAddress: body.cidr.replace(/\.0\/\d+$/, ".1"), publicRangeWarning: false, generation: 1, createdAt: NOW, updatedAt: NOW };
+    const parsed = this.#parseInventoryCidr(sequence, body.cidr, "cidr", "vnr");
+    if (parsed instanceof Response) return parsed;
+    const rangeError = this.#validateVnrRange(sequence, parsed);
+    if (rangeError !== null) return rangeError;
+    const vnr: Vnr = {
+      name: body.name,
+      cidr: body.cidr,
+      masterAddress: formatIpv4(parsed.network + 1n),
+      publicRangeWarning: isPublicRange(parsed),
+      generation: 1,
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
     this.#state.vnrs.push(vnr);
     this.#state.generation += 1;
     return json(sequence, vnr, 201, { ETag: entityTag("vnr", vnr.name, vnr.generation), Location: `/api/v1/vnrs/${encodeURIComponent(vnr.name)}` });
@@ -603,7 +880,18 @@ export class FixtureApi {
     if (request.method === "PATCH") {
       const body: unknown = await request.json().catch(() => null);
       if (!exactFields(body, ["cidr"]) || typeof body.cidr !== "string") return apiError(sequence, 400, "validation_failed", "CIDR is required");
-      const updated: Vnr = { ...current, cidr: body.cidr, generation: current.generation + 1, updatedAt: NOW };
+      const parsed = this.#parseInventoryCidr(sequence, body.cidr, "cidr", "vnr");
+      if (parsed instanceof Response) return parsed;
+      const rangeError = this.#validateVnrRange(sequence, parsed, current.name);
+      if (rangeError !== null) return rangeError;
+      const updated: Vnr = {
+        ...current,
+        cidr: body.cidr,
+        masterAddress: formatIpv4(parsed.network + 1n),
+        publicRangeWarning: isPublicRange(parsed),
+        generation: current.generation + 1,
+        updatedAt: NOW,
+      };
       this.#state.vnrs[index] = updated;
       this.#state.generation += 1;
       return json(sequence, updated, 200, { ETag: entityTag("vnr", updated.name, updated.generation) });
@@ -611,6 +899,9 @@ export class FixtureApi {
     if (request.method === "DELETE") {
       const reauth = this.#requireReauthentication(session, sequence);
       if (reauth !== null) return reauth;
+      if (this.#state.nodes.some((node) => node.vnrName === current.name)) {
+        return apiError(sequence, 409, "invariant_violation", "VNR must have no Nodes before deletion");
+      }
       this.#state.vnrs.splice(index, 1);
       this.#state.generation += 1;
       return empty(sequence);
@@ -627,6 +918,12 @@ export class FixtureApi {
     if (validation !== null) return validation;
     const body: unknown = await request.json().catch(() => null);
     if (!exactFields(body, ["name", "address", "vnrName"]) || typeof body.name !== "string" || typeof body.address !== "string" || typeof body.vnrName !== "string") return apiError(sequence, 400, "validation_failed", "Node fields are required");
+    const state = this.#validateNodeState(sequence, {
+      name: body.name,
+      address: body.address,
+      vnrName: body.vnrName,
+    });
+    if (state instanceof Response) return state;
     const id = (this.#state.nodes.length + 100).toString(16).padStart(32, "0");
     const node: Node = { id, name: body.name, address: body.address, vnrName: body.vnrName, enrollmentState: "unenrolled", generation: 1, createdAt: NOW, updatedAt: NOW };
     this.#state.nodes.push(node);
@@ -649,15 +946,40 @@ export class FixtureApi {
     if (validation !== null) return validation;
     if (request.headers.get("if-match") !== etag) return apiError(sequence, 412, "precondition_failed", "The Node changed");
     if (request.method === "PATCH") {
-      const body = await request.json() as Partial<Pick<Node, "name" | "address" | "vnrName">>;
-      const updated: Node = { ...current, ...body, generation: current.generation + 1, updatedAt: NOW };
+      const body: unknown = await request.json().catch(() => null);
+      if (!exactFields(body, ["name", "address", "vnrName"]) || Object.keys(body).length === 0) {
+        return apiError(sequence, 400, "validation_failed", "At least one Node field is required");
+      }
+      if (
+        (body.name !== undefined && typeof body.name !== "string") ||
+        (body.address !== undefined && typeof body.address !== "string") ||
+        (body.vnrName !== undefined && typeof body.vnrName !== "string")
+      ) {
+        return apiError(sequence, 400, "validation_failed", "Node fields are invalid");
+      }
+      const requested = {
+        name: typeof body.name === "string" ? body.name : current.name,
+        address: typeof body.address === "string" ? body.address : current.address,
+        vnrName: typeof body.vnrName === "string" ? body.vnrName : current.vnrName,
+      };
+      const state = this.#validateNodeState(sequence, requested, current.id);
+      if (state instanceof Response) return state;
+      const updated: Node = { ...current, ...requested, generation: current.generation + 1, updatedAt: NOW };
       this.#state.nodes[index] = updated;
+      if (updated.name !== current.name) {
+        this.#state.routes = this.#state.routes.map((route) =>
+          route.nodeId === current.id ? { ...route, nodeName: updated.name, updatedAt: NOW } : route
+        );
+      }
       this.#state.generation += 1;
       return json(sequence, updated, 200, { ETag: entityTag("node", id, updated.generation) });
     }
     if (request.method === "DELETE") {
       const reauth = this.#requireReauthentication(session, sequence);
       if (reauth !== null) return reauth;
+      if (this.#state.routes.some((route) => route.nodeId === current.id)) {
+        return apiError(sequence, 409, "invariant_violation", "Node must own no routes before deletion");
+      }
       this.#state.nodes.splice(index, 1);
       this.#state.runtime = this.#state.runtime.filter((item) => item.nodeId !== id);
       this.#state.generation += 1;
@@ -707,14 +1029,19 @@ export class FixtureApi {
     if (request.method === "GET") return json(sequence, { items: this.#state.routes, nextCursor: null });
     const roleError = this.#requireRole(user, "operator", sequence);
     if (roleError !== null) return roleError;
+    if (request.method !== "POST") return apiError(sequence, 400, "invalid_request", "Unsupported Route collection method");
     const validation = this.#validateMutation(request, sequence, session, false);
     if (validation !== null) return validation;
-    const body = await request.json() as { nodeId: string; prefix: string };
-    const node = this.#state.nodes.find((item) => item.id === body.nodeId);
-    if (node === undefined) return apiError(sequence, 400, "validation_failed", "Route owner does not exist");
+    const body: unknown = await request.json().catch(() => null);
+    if (!exactFields(body, ["nodeId", "prefix"]) || typeof body.nodeId !== "string" || typeof body.prefix !== "string") {
+      return apiError(sequence, 400, "validation_failed", "Route owner and prefix are required");
+    }
+    const state = this.#validateRouteState(sequence, { nodeId: body.nodeId, prefix: body.prefix });
+    if (state instanceof Response) return state;
     const id = (this.#state.routes.length + 200).toString(16).padStart(32, "0");
-    const route: Route = { id, nodeId: node.id, nodeName: node.name, prefix: body.prefix, generation: 1, createdAt: NOW, updatedAt: NOW };
+    const route: Route = { id, nodeId: state.node.id, nodeName: state.node.name, prefix: body.prefix, generation: 1, createdAt: NOW, updatedAt: NOW };
     this.#state.routes.push(route);
+    this.#state.generation += 1;
     return json(sequence, route, 201, { ETag: entityTag("route", id, 1), Location: `/api/v1/routes/${id}` });
   }
 
@@ -731,17 +1058,38 @@ export class FixtureApi {
     if (validation !== null) return validation;
     if (request.headers.get("if-match") !== etag) return apiError(sequence, 412, "precondition_failed", "The Route changed");
     if (request.method === "PATCH") {
-      const body = await request.json() as { nodeId?: string; prefix?: string };
-      const owner = this.#state.nodes.find((item) => item.id === (body.nodeId ?? current.nodeId));
-      if (owner === undefined) return apiError(sequence, 400, "validation_failed", "Route owner does not exist");
-      const updated: Route = { ...current, ...body, nodeName: owner.name, generation: current.generation + 1, updatedAt: NOW };
+      const body: unknown = await request.json().catch(() => null);
+      if (!exactFields(body, ["nodeId", "prefix"]) || Object.keys(body).length === 0) {
+        return apiError(sequence, 400, "validation_failed", "At least one Route field is required");
+      }
+      if (
+        (body.nodeId !== undefined && typeof body.nodeId !== "string") ||
+        (body.prefix !== undefined && typeof body.prefix !== "string")
+      ) {
+        return apiError(sequence, 400, "validation_failed", "Route fields are invalid");
+      }
+      const requested = {
+        nodeId: typeof body.nodeId === "string" ? body.nodeId : current.nodeId,
+        prefix: typeof body.prefix === "string" ? body.prefix : current.prefix,
+      };
+      const state = this.#validateRouteState(sequence, requested, current.id);
+      if (state instanceof Response) return state;
+      const updated: Route = {
+        ...current,
+        ...requested,
+        nodeName: state.node.name,
+        generation: current.generation + 1,
+        updatedAt: NOW,
+      };
       this.#state.routes[index] = updated;
+      this.#state.generation += 1;
       return json(sequence, updated, 200, { ETag: entityTag("route", id, updated.generation) });
     }
     if (request.method === "DELETE") {
       const reauth = this.#requireReauthentication(session, sequence);
       if (reauth !== null) return reauth;
       this.#state.routes.splice(index, 1);
+      this.#state.generation += 1;
       return empty(sequence);
     }
     return apiError(sequence, 400, "invalid_request", "Unsupported Route method");

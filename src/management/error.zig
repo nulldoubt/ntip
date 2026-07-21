@@ -66,6 +66,7 @@ pub fn encode(
     code: Code,
     message: []const u8,
 ) ![]u8 {
+    try validateEnvelopeBounds(request_id, code, message, null);
     const envelope = try make(request_id, code, message);
     return encodeEnvelope(allocator, envelope);
 }
@@ -77,11 +78,46 @@ pub fn encodeWithViolations(
     message: []const u8,
     violations: []const FieldViolation,
 ) ![]u8 {
-    if (violations.len == 0 or violations.len > maximum_violations) return error.InvalidViolations;
+    try validateEnvelopeBounds(request_id, code, message, violations);
     var envelope = try make(request_id, code, message);
-    for (violations) |violation| try validateViolation(violation);
     envelope.@"error".violations = violations;
     return encodeEnvelope(allocator, envelope);
+}
+
+/// Validates the public field-violation shape independently of JSON
+/// encoding so the typed ntsrv -> ntip-api protocol can enforce the exact
+/// same bounds before accepting a response frame.
+pub fn validateViolations(violations: []const FieldViolation) !void {
+    if (violations.len == 0 or violations.len > maximum_violations) {
+        return error.InvalidViolations;
+    }
+    for (violations) |violation| try validateViolation(violation);
+}
+
+/// Ensures a shape accepted across service IPC is also guaranteed to fit the
+/// public HTTP error-envelope limit. The estimate deliberately assumes every
+/// input byte may require a six-byte JSON escape, so accepted shapes cannot
+/// fail later when the HTTP bridge performs exact serialization.
+pub fn validateEnvelopeBounds(
+    request_id: []const u8,
+    code: Code,
+    message: []const u8,
+    violations: ?[]const FieldViolation,
+) !void {
+    _ = try make(request_id, code, message);
+    var maximum_json_bytes: usize = 512 +
+        6 * (request_id.len + @tagName(code).len + message.len);
+    if (violations) |items| {
+        try validateViolations(items);
+        for (items) |violation| {
+            maximum_json_bytes += 128 +
+                6 * (violation.field.len + violation.code.len + violation.message.len);
+            if (maximum_json_bytes > maximum_encoded_bytes) {
+                return error.ErrorEnvelopeTooLarge;
+            }
+        }
+    }
+    if (maximum_json_bytes > maximum_encoded_bytes) return error.ErrorEnvelopeTooLarge;
 }
 
 fn encodeEnvelope(allocator: std.mem.Allocator, envelope: Envelope) ![]u8 {
@@ -154,5 +190,23 @@ test "management errors reject unsafe public messages and request ids" {
     try std.testing.expectError(
         error.InvalidErrorMessage,
         make("0123456789abcdef0123456789abcdef", .invalid_request, "line one\nline two"),
+    );
+}
+
+test "management errors reject aggregate violation shapes that cannot fit HTTP" {
+    const large = FieldViolation{
+        .field = "\\" ** 256,
+        .code = "bounded_violation",
+        .message = "\\" ** maximum_message_bytes,
+    };
+    const violations = [_]FieldViolation{large} ** maximum_violations;
+    try std.testing.expectError(
+        error.ErrorEnvelopeTooLarge,
+        validateEnvelopeBounds(
+            "0123456789abcdef0123456789abcdef",
+            .invariant_violation,
+            "domain invariant would be violated",
+            &violations,
+        ),
     );
 }

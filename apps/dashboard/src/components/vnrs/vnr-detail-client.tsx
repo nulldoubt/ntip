@@ -39,19 +39,26 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "@/components/auth-context";
+import {
+  fieldError,
+  InlineFieldError,
+  InventoryErrorSummary,
+  inventoryFormErrorState,
+  type InventoryFormErrorState,
+} from "@/components/network/inventory-form-errors";
+import { SegmentedCidrSelect } from "@/components/network/segmented-network-input";
 import { actionableError, ClientApiError, getJson, readJson, requireOk } from "@/components/vnrs/client-api";
 import { usePolling } from "@/components/vnrs/use-polling";
 import type { EntityTag, NodeRuntime, Topology, Vnr, VnrDetailData } from "@/components/vnrs/vnr-types";
 import { createMutationAttempt } from "@/lib/behavior/mutation";
+import { createCidrSelection, type SegmentedCidrSelection } from "@/lib/network/segmented-network";
 
 type VnrUpdate = components["schemas"]["VnrUpdate"];
 type ReauthenticationStatus = components["schemas"]["ReauthenticationStatus"];
 type LivenessState = components["schemas"]["LivenessState"];
 type RuntimeSessionState = components["schemas"]["RuntimeSessionState"];
-
-const cidrPattern = "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])";
 
 function detailPath(name: string): `/api/v1/${string}` {
   return `/api/v1/vnrs/${encodeURIComponent(name)}`;
@@ -116,29 +123,37 @@ function UpdateVnrDialog({
 }>) {
   const { auth } = useAuth();
   const [open, setOpen] = useState(false);
-  const [cidr, setCidr] = useState(vnr.cidr);
+  const [cidr, setCidr] = useState<SegmentedCidrSelection>(() => createCidrSelection(vnr.cidr, "vnr"));
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [violations, setViolations] = useState<readonly components["schemas"]["FieldViolation"][]>([]);
+  const [error, setError] = useState<InventoryFormErrorState | null>(null);
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (error !== null) errorSummaryRef.current?.focus();
+  }, [error]);
 
   function reset() {
-    setCidr(vnr.cidr);
+    setCidr(createCidrSelection(vnr.cidr, "vnr"));
     setPending(false);
     setError(null);
-    setViolations([]);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (etag === null) {
-      setError("A current resource version is unavailable. Refresh the page and try again.");
+      setError({
+        message: "A current resource version is unavailable. Refresh the page and try again.",
+        requestId: null,
+        violations: [],
+      });
       return;
     }
 
+    if (cidr.value === null) return;
+
     setPending(true);
     setError(null);
-    setViolations([]);
-    const body: VnrUpdate = { cidr: cidr.trim() };
+    const body: VnrUpdate = { cidr: cidr.value };
     try {
       const attempt = createMutationAttempt({
         body,
@@ -160,12 +175,13 @@ function UpdateVnrDialog({
       reset();
       refresh();
     } catch (reason) {
-      setError(actionableError(reason));
-      setViolations(reason instanceof ClientApiError ? reason.violations : []);
+      setError(inventoryFormErrorState(reason, "VNR"));
       setPending(false);
       if (reason instanceof ClientApiError && (reason.status === 412 || reason.status === 428)) refresh();
     }
   }
+
+  const cidrViolation = fieldError(error, "cidr");
 
   return (
     <Dialog
@@ -173,7 +189,7 @@ function UpdateVnrDialog({
       onOpenChange={(nextOpen) => {
         if (pending) return;
         setOpen(nextOpen);
-        if (nextOpen) setCidr(vnr.cidr);
+        if (nextOpen) setCidr(createCidrSelection(vnr.cidr, "vnr"));
         else reset();
       }}
     >
@@ -192,42 +208,26 @@ function UpdateVnrDialog({
         <form className="grid gap-5" onSubmit={(event) => void submit(event)}>
           <div className="grid gap-1.5">
             <Label htmlFor="update-vnr-cidr">IPv4 CIDR</Label>
-            <Input
+            <SegmentedCidrSelect
               id="update-vnr-cidr"
-              className="font-mono"
-              autoComplete="off"
-              autoFocus
-              inputMode="decimal"
-              pattern={cidrPattern}
+              ariaLabel={`${vnr.name} IPv4 CIDR`}
+              ariaDescribedBy={`update-vnr-cidr-help${cidrViolation === null ? "" : " update-vnr-cidr-error"}`}
+              invalid={cidrViolation !== null}
+              disabled={pending}
               required
-              value={cidr}
-              onChange={(event) => setCidr(event.target.value)}
-              aria-describedby="update-vnr-cidr-help"
+              selection={cidr}
+              onSelectionChange={setCidr}
             />
             <p id="update-vnr-cidr-help" className="text-xs text-muted-foreground">
-              Existing Node addresses and routes must remain valid and non-overlapping.
+              Existing Node addresses and routes must remain valid and non-overlapping. Prefix changes never rewrite selected octets.
             </p>
+            <InlineFieldError id="update-vnr-cidr-error" violation={cidrViolation} />
           </div>
-          {error !== null ? (
-            <Alert tone="critical">
-              <CircleAlert aria-hidden="true" />
-              <AlertTitle>VNR was not updated</AlertTitle>
-              <AlertDescription>
-                <p>{error}</p>
-                {violations.length > 0 ? (
-                  <ul className="mt-2 list-disc space-y-1 ps-4">
-                    {violations.map((violation) => (
-                      <li key={`${violation.field}:${violation.code}`}>{violation.field}: {violation.message}</li>
-                    ))}
-                  </ul>
-                ) : null}
-              </AlertDescription>
-            </Alert>
-          ) : null}
+          <InventoryErrorSummary ref={errorSummaryRef} error={error} title="VNR was not updated" />
           <p className="sr-only" aria-live="polite">{pending ? "Updating VNR" : ""}</p>
           <DialogFooter>
-            <Button type="button" variant="ghost" disabled={pending} onClick={() => setOpen(false)}>Cancel</Button>
-            <Button type="submit" disabled={pending || cidr.trim() === vnr.cidr}>
+            <Button type="button" variant="ghost" disabled={pending} onClick={() => { setOpen(false); reset(); }}>Cancel</Button>
+            <Button type="submit" disabled={pending || cidr.value === null || cidr.value === vnr.cidr}>
               {pending ? <RefreshCw aria-hidden="true" className="animate-spin" /> : <Pencil aria-hidden="true" />}
               {pending ? "Updating" : "Apply CIDR"}
             </Button>

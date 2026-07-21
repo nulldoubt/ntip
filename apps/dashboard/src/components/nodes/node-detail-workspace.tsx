@@ -45,8 +45,16 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "@/components/auth-context";
+import {
+  fieldError,
+  InlineFieldError,
+  InventoryErrorSummary,
+  inventoryFormErrorState,
+  type InventoryFormErrorState,
+} from "@/components/network/inventory-form-errors";
+import { NodeAddressSelect, SegmentedCidrSelect } from "@/components/network/segmented-network-input";
 import {
   fetchJson,
   fetchJsonWithEtag,
@@ -63,6 +71,14 @@ import {
   shortId,
 } from "@/components/nodes/node-presenters";
 import { createMutationAttempt } from "@/lib/behavior/mutation";
+import { actionableApiError, BrowserApiError } from "@/lib/browser-api-error";
+import {
+  createCidrSelection,
+  createEmptyCidrSelection,
+  createNodeAddressAvailability,
+  createNodeAddressSelection,
+  type SegmentedCidrSelection,
+} from "@/lib/network/segmented-network";
 import { usePolledResource } from "@/lib/use-polled-resource";
 
 type ConnectivityCheck = components["schemas"]["ConnectivityCheck"];
@@ -77,6 +93,7 @@ type NodeUpdate = components["schemas"]["NodeUpdate"];
 type Route = components["schemas"]["Route"];
 type RouteCreate = components["schemas"]["RouteCreate"];
 type RouteUpdate = components["schemas"]["RouteUpdate"];
+type Topology = components["schemas"]["Topology"];
 type Vnr = components["schemas"]["Vnr"];
 
 type WorkspaceProps = Readonly<{
@@ -92,12 +109,23 @@ function FormError({ children }: Readonly<{ children: string | null }>) {
   );
 }
 
-function Field({ label, htmlFor, children, hint }: Readonly<{ label: string; htmlFor: string; children: ReactNode; hint?: string }>) {
+function nodeOperationError(reason: unknown, resourceLabel: string, fallback: string): string {
+  if (!(reason instanceof Error)) return fallback;
+  return actionableApiError(reason, { resourceLabel, includeRequestId: true });
+}
+
+function Field({ label, htmlFor, children, hint, hintId }: Readonly<{
+  label: string;
+  htmlFor: string;
+  children: ReactNode;
+  hint?: string;
+  hintId?: string;
+}>) {
   return (
     <div className="grid gap-1.5">
       <Label htmlFor={htmlFor}>{label}</Label>
       {children}
-      {hint === undefined ? null : <p className="text-xs text-muted-foreground">{hint}</p>}
+      {hint === undefined ? null : <p id={hintId} className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   );
 }
@@ -106,18 +134,139 @@ function UpdateNodeDialog({ detail, vnrs, onChanged }: Readonly<{ detail: NodeDe
   const { auth, can } = useAuth();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<InventoryFormErrorState | null>(null);
+  const [topology, setTopology] = useState<Topology | null>(null);
+  const [topologyPhase, setTopologyPhase] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [topologyError, setTopologyError] = useState<string | null>(null);
   const [vnrName, setVnrName] = useState(detail.node.vnrName);
+  const [address, setAddress] = useState<string | null>(detail.node.address);
+  const [unavailableAddress, setUnavailableAddress] = useState<string | null>(null);
+  const [associationNotice, setAssociationNotice] = useState<string | null>(null);
+  const [collisionNotice, setCollisionNotice] = useState<string | null>(null);
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+  const topologyRequest = useRef(0);
+
+  useEffect(() => {
+    if (error !== null) errorSummaryRef.current?.focus();
+  }, [error]);
+
+  const selectorTopology = useMemo((): Topology | null => {
+    if (topology === null || unavailableAddress === null) return topology;
+    return {
+      ...topology,
+      nodes: [...topology.nodes, {
+        ...detail.node,
+        id: "__concurrent_allocation__",
+        address: unavailableAddress,
+      }],
+    };
+  }, [detail.node, topology, unavailableAddress]);
+
   if (!can("inventory:write")) return null;
+
+  async function refreshTopology(
+    targetVnrName: string,
+    preferredAddress: string | null,
+    knownUnavailableAddress: string | null = null,
+  ): Promise<string | null | undefined> {
+    const request = ++topologyRequest.current;
+    setTopologyPhase("loading");
+    setTopologyError(null);
+    try {
+      const fresh = await fetchJson<Topology>("/api/v1/topology");
+      if (request !== topologyRequest.current) return undefined;
+      const targetVnr = fresh.vnrs.find((vnr) => vnr.name === targetVnrName) ?? fresh.vnrs[0];
+      if (targetVnr === undefined) {
+        setTopology(fresh);
+        setVnrName("");
+        setAddress(null);
+        setTopologyPhase("ready");
+        return null;
+      }
+      const availabilityTopology: Topology = knownUnavailableAddress === null
+        ? fresh
+        : {
+            ...fresh,
+            nodes: [...fresh.nodes, {
+              ...detail.node,
+              id: "__concurrent_allocation__",
+              address: knownUnavailableAddress,
+            }],
+          };
+      const availability = createNodeAddressAvailability({
+        topology: availabilityTopology,
+        vnrName: targetVnr.name,
+        currentNodeId: detail.node.id,
+      });
+      const selected = createNodeAddressSelection(availability, preferredAddress).value;
+      setTopology(fresh);
+      setVnrName(targetVnr.name);
+      setAddress(selected);
+      setTopologyPhase("ready");
+      return selected;
+    } catch (reason) {
+      if (request !== topologyRequest.current) return undefined;
+      setTopology(null);
+      setAddress(null);
+      setTopologyPhase("error");
+      setTopologyError(actionableApiError(reason));
+      return undefined;
+    }
+  }
+
+  function changeOpen(next: boolean) {
+    if (pending) return;
+    setOpen(next);
+    setError(null);
+    setAssociationNotice(null);
+    setCollisionNotice(null);
+    setUnavailableAddress(null);
+    if (next) {
+      setVnrName(detail.node.vnrName);
+      setAddress(detail.node.address);
+      void refreshTopology(detail.node.vnrName, detail.node.address);
+    } else {
+      topologyRequest.current += 1;
+      setTopology(null);
+      setTopologyPhase("idle");
+      setTopologyError(null);
+    }
+  }
+
+  function changeVnr(nextVnrName: string) {
+    if (
+      topology === null ||
+      nextVnrName.length === 0 ||
+      !topology.vnrs.some((vnr) => vnr.name === nextVnrName)
+    ) return;
+    setVnrName(nextVnrName);
+    setError(null);
+    setCollisionNotice(null);
+    setUnavailableAddress(null);
+    const availability = createNodeAddressAvailability({
+      topology,
+      vnrName: nextVnrName,
+      currentNodeId: detail.node.id,
+    });
+    const nextAddress = createNodeAddressSelection(availability).value;
+    setAddress(nextAddress);
+    setAssociationNotice(nextVnrName === detail.node.vnrName
+      ? null
+      : nextAddress === null
+        ? `Moving this Node to ${nextVnrName} would retire its current association, but the destination VNR has no free address.`
+        : `Moving this Node to ${nextVnrName} retires its current association. Address ${nextAddress} is selected as the destination VNR’s lowest free host.`);
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (address === null || topologyPhase !== "ready") return;
     setPending(true);
     setError(null);
+    setCollisionNotice(null);
     const data = new FormData(event.currentTarget);
     const body: NodeUpdate = {
       name: String(data.get("name") ?? "").trim(),
-      address: String(data.get("address") ?? "").trim(),
+      address,
       vnrName,
     };
     try {
@@ -135,28 +284,83 @@ function UpdateNodeDialog({ detail, vnrs, onChanged }: Readonly<{ detail: NodeDe
       setOpen(false);
       onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Node update failed");
+      setError(inventoryFormErrorState(reason, "Node"));
+      const collision = reason instanceof BrowserApiError &&
+        reason.violations.some((violation) => violation.code === "address_in_use");
+      if (collision) {
+        setUnavailableAddress(address);
+        const replacement = await refreshTopology(vnrName, null, address);
+        if (replacement !== undefined) {
+          setCollisionNotice(replacement === null
+            ? `Address ${address} was allocated concurrently, and this VNR now has no free Node address.`
+            : `Address ${address} was allocated concurrently. The selection moved to ${replacement}; review it and submit again.`);
+        }
+      }
     } finally {
       setPending(false);
     }
   }
 
+  const nameViolation = fieldError(error, "name");
+  const addressViolation = collisionNotice === null ? fieldError(error, "address") : null;
+  const availableVnrs = topology?.vnrs ?? vnrs;
+
   return (
-    <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (next) setVnrName(detail.node.vnrName); else setError(null); }}>
+    <Dialog open={open} onOpenChange={changeOpen}>
       <DialogTrigger asChild><Button variant="outline"><Pencil aria-hidden="true" />Edit Node</Button></DialogTrigger>
       <DialogContent>
-        <DialogHeader><DialogTitle>Edit {detail.node.name}</DialogTitle><DialogDescription>A current read supplies the precondition immediately before this update.</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle>Edit {detail.node.name}</DialogTitle><DialogDescription>A fresh topology snapshot limits address choices; a current read supplies the update precondition.</DialogDescription></DialogHeader>
         <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
-          <FormError>{error}</FormError>
-          <Field label="Name" htmlFor="edit-node-name"><Input id="edit-node-name" name="name" required defaultValue={detail.node.name} autoComplete="off" /></Field>
-          <Field label="Address" htmlFor="edit-node-address"><Input id="edit-node-address" name="address" required defaultValue={detail.node.address} autoComplete="off" /></Field>
+          <InventoryErrorSummary ref={errorSummaryRef} error={error} title="Node was not updated" />
+          <Field label="Name" htmlFor="edit-node-name">
+            <Input
+              id="edit-node-name"
+              name="name"
+              required
+              defaultValue={detail.node.name}
+              autoComplete="off"
+              disabled={pending}
+              aria-invalid={nameViolation !== null || undefined}
+              aria-describedby={nameViolation === null ? undefined : "edit-node-name-error"}
+            />
+            <InlineFieldError id="edit-node-name-error" violation={nameViolation} />
+          </Field>
           <Field label="VNR" htmlFor="edit-node-vnr">
-            <Select value={vnrName} onValueChange={setVnrName}>
+            <Select value={vnrName} onValueChange={changeVnr} disabled={pending || topologyPhase !== "ready"}>
               <SelectTrigger id="edit-node-vnr"><SelectValue /></SelectTrigger>
-              <SelectContent>{vnrs.map((vnr) => <SelectItem key={vnr.name} value={vnr.name}>{vnr.name} · {vnr.cidr}</SelectItem>)}</SelectContent>
+              <SelectContent>{availableVnrs.map((vnr) => <SelectItem key={vnr.name} value={vnr.name}>{vnr.name} · {vnr.cidr}</SelectItem>)}</SelectContent>
             </Select>
           </Field>
-          <DialogFooter><Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" disabled={pending}>{pending ? "Saving" : "Save changes"}</Button></DialogFooter>
+          <Field label="Address" htmlFor="edit-node-address">
+            {selectorTopology === null || vnrName.length === 0 ? (
+              <div id="edit-node-address" role="status" aria-live="polite" className="border border-dashed border-border px-3 py-2 text-sm text-muted-foreground">
+                {topologyPhase === "loading" ? "Loading current address availability…" : "Address choices are unavailable."}
+              </div>
+            ) : (
+              <NodeAddressSelect
+                id="edit-node-address"
+                ariaLabel="Node IPv4 address"
+                ariaDescribedBy={`edit-node-address-help${addressViolation === null ? "" : " edit-node-address-error"}`}
+                currentNodeId={detail.node.id}
+                topology={selectorTopology}
+                vnrName={vnrName}
+                value={address}
+                onValueChange={setAddress}
+                invalid={addressViolation !== null}
+                disabled={pending}
+                required
+              />
+            )}
+            <p id="edit-node-address-help" className="text-xs text-muted-foreground">
+              Network, Master, broadcast, and allocated addresses are unavailable.
+            </p>
+            <InlineFieldError id="edit-node-address-error" violation={addressViolation} />
+          </Field>
+          {topologyError === null ? null : <Alert tone="warning"><AlertCircle aria-hidden="true" /><AlertDescription>{topologyError}</AlertDescription></Alert>}
+          {address === null && topologyPhase === "ready" ? <Alert tone="warning"><AlertCircle aria-hidden="true" /><AlertDescription>The selected VNR has no free Node address.</AlertDescription></Alert> : null}
+          {associationNotice === null ? null : <Alert tone="info" aria-live="polite"><Unplug aria-hidden="true" /><AlertDescription>{associationNotice}</AlertDescription></Alert>}
+          {collisionNotice === null ? null : <Alert role="alert" tone="warning"><RefreshCw aria-hidden="true" /><AlertDescription>{collisionNotice}</AlertDescription></Alert>}
+          <DialogFooter><Button type="button" variant="ghost" disabled={pending} onClick={() => changeOpen(false)}>Cancel</Button><Button type="submit" disabled={pending || topologyPhase !== "ready" || address === null}>{pending ? "Saving" : "Save changes"}</Button></DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
@@ -183,7 +387,7 @@ function ConnectivityDialog({ node, onCreated }: Readonly<{ node: Node; onCreate
       setOpen(false);
       onCreated();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Connectivity check could not be started");
+      setError(nodeOperationError(reason, "connectivity check", "Connectivity check could not be started"));
     } finally {
       setPending(false);
     }
@@ -274,8 +478,8 @@ function EnrollmentDialog({ node, operation, onChanged }: Readonly<{ node: Node;
       setOpen(false);
       onChanged();
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : "Enrollment operation failed";
-      setError(issue ? `${message}. The credential request was not retried.` : message);
+      const message = nodeOperationError(reason, "Node enrollment", "Enrollment operation failed");
+      setError(issue ? `${message} The credential request was not retried.` : message);
     } finally {
       // Clear the password and typed confirmation with the closed form instance.
       setPending(false);
@@ -328,7 +532,7 @@ function DeleteNodeDialog({ node }: Readonly<{ node: Node }>) {
       router.replace("/nodes");
       router.refresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Node deletion failed");
+      setError(nodeOperationError(reason, "Node", "Node deletion failed"));
       setPending(false);
     }
   }
@@ -353,15 +557,23 @@ function DeleteNodeDialog({ node }: Readonly<{ node: Node }>) {
 function CreateRouteDialog({ node, onChanged }: Readonly<{ node: Node; onChanged: () => void }>) {
   const { auth, can } = useAuth();
   const [open, setOpen] = useState(false);
+  const [prefix, setPrefix] = useState<SegmentedCidrSelection>(() => createEmptyCidrSelection("route"));
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<InventoryFormErrorState | null>(null);
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (error !== null) errorSummaryRef.current?.focus();
+  }, [error]);
+
   if (!can("inventory:write")) return null;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (prefix.value === null) return;
     setPending(true);
     setError(null);
-    const body: RouteCreate = { nodeId: node.id, prefix: String(new FormData(event.currentTarget).get("prefix") ?? "").trim() };
+    const body: RouteCreate = { nodeId: node.id, prefix: prefix.value };
     try {
       const attempt = createMutationAttempt({ method: "POST", url: "/api/v1/routes", csrfToken: auth.csrfToken, body });
       const response = await fetch(attempt.buildRequest());
@@ -369,21 +581,40 @@ function CreateRouteDialog({ node, onChanged }: Readonly<{ node: Node; onChanged
       setOpen(false);
       onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Route creation failed");
+      setError(inventoryFormErrorState(reason, "route"));
     } finally {
       setPending(false);
     }
   }
 
+  const prefixViolation = fieldError(error, "prefix");
+
   return (
-    <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (!next) setError(null); }}>
+    <Dialog open={open} onOpenChange={(next) => {
+      if (pending) return;
+      setOpen(next);
+      setError(null);
+      setPrefix(createEmptyCidrSelection("route"));
+    }}>
       <DialogTrigger asChild><Button size="sm"><Plus aria-hidden="true" />Add route</Button></DialogTrigger>
       <DialogContent>
         <DialogHeader><DialogTitle>Add route</DialogTitle><DialogDescription>The prefix will be owned by {node.name}. Overlap and reserved-address invariants are checked transactionally.</DialogDescription></DialogHeader>
         <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
-          <FormError>{error}</FormError>
-          <Field label="IPv4 prefix" htmlFor="create-route-prefix"><Input id="create-route-prefix" name="prefix" required autoComplete="off" placeholder="192.0.2.0/24" /></Field>
-          <DialogFooter><Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" disabled={pending}>{pending ? "Adding" : "Add route"}</Button></DialogFooter>
+          <InventoryErrorSummary ref={errorSummaryRef} error={error} title="Route was not created" />
+          <Field label="IPv4 prefix" htmlFor="create-route-prefix" hintId="create-route-prefix-help" hint="Select four octets and an explicit /1–/32 prefix. Host bits must be zero for the selected prefix.">
+            <SegmentedCidrSelect
+              id="create-route-prefix"
+              ariaLabel="Route IPv4 prefix"
+              ariaDescribedBy={`create-route-prefix-help${prefixViolation === null ? "" : " create-route-prefix-error"}`}
+              invalid={prefixViolation !== null}
+              disabled={pending}
+              required
+              selection={prefix}
+              onSelectionChange={setPrefix}
+            />
+            <InlineFieldError id="create-route-prefix-error" violation={prefixViolation} />
+          </Field>
+          <DialogFooter><Button type="button" variant="ghost" disabled={pending} onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" disabled={pending || prefix.value === null}>{pending ? "Adding" : "Add route"}</Button></DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
@@ -394,15 +625,23 @@ function EditRouteDialog({ route, nodes, onChanged }: Readonly<{ route: Route; n
   const { auth, can } = useAuth();
   const [open, setOpen] = useState(false);
   const [ownerId, setOwnerId] = useState(route.nodeId);
+  const [prefix, setPrefix] = useState<SegmentedCidrSelection>(() => createCidrSelection(route.prefix, "route"));
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<InventoryFormErrorState | null>(null);
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (error !== null) errorSummaryRef.current?.focus();
+  }, [error]);
+
   if (!can("inventory:write")) return null;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (prefix.value === null) return;
     setPending(true);
     setError(null);
-    const body: RouteUpdate = { prefix: String(new FormData(event.currentTarget).get("prefix") ?? "").trim(), nodeId: ownerId };
+    const body: RouteUpdate = { prefix: prefix.value, nodeId: ownerId };
     try {
       const current = await fetchJsonWithEtag<Route>(`/api/v1/routes/${route.id}`);
       const attempt = createMutationAttempt({ method: "PATCH", url: `/api/v1/routes/${route.id}`, csrfToken: auth.csrfToken, ifMatch: current.etag, requiresIfMatch: true, body });
@@ -411,24 +650,44 @@ function EditRouteDialog({ route, nodes, onChanged }: Readonly<{ route: Route; n
       setOpen(false);
       onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Route update failed");
+      setError(inventoryFormErrorState(reason, "route"));
     } finally {
       setPending(false);
     }
   }
 
+  const prefixViolation = fieldError(error, "prefix");
+
   return (
-    <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (next) setOwnerId(route.nodeId); else setError(null); }}>
+    <Dialog open={open} onOpenChange={(next) => {
+      if (pending) return;
+      setOpen(next);
+      setError(null);
+      setOwnerId(route.nodeId);
+      setPrefix(createCidrSelection(route.prefix, "route"));
+    }}>
       <DialogTrigger asChild><Button size="icon" variant="ghost" aria-label={`Edit route ${route.prefix}`}><Pencil aria-hidden="true" /></Button></DialogTrigger>
       <DialogContent>
         <DialogHeader><DialogTitle>Edit route</DialogTitle><DialogDescription>A current route read supplies the ETag before the update commits.</DialogDescription></DialogHeader>
         <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
-          <FormError>{error}</FormError>
-          <Field label="IPv4 prefix" htmlFor={`edit-route-prefix-${route.id}`}><Input id={`edit-route-prefix-${route.id}`} name="prefix" required defaultValue={route.prefix} autoComplete="off" /></Field>
-          <Field label="Owner" htmlFor={`edit-route-owner-${route.id}`}>
-            <Select value={ownerId} onValueChange={setOwnerId}><SelectTrigger id={`edit-route-owner-${route.id}`}><SelectValue /></SelectTrigger><SelectContent>{nodes.map((node) => <SelectItem key={node.id} value={node.id}>{node.name} · {node.address}</SelectItem>)}</SelectContent></Select>
+          <InventoryErrorSummary ref={errorSummaryRef} error={error} title="Route was not updated" />
+          <Field label="IPv4 prefix" htmlFor={`edit-route-prefix-${route.id}`} hintId={`edit-route-prefix-help-${route.id}`} hint="Changing the prefix keeps the selected octets visible and blocks a noncanonical boundary.">
+            <SegmentedCidrSelect
+              id={`edit-route-prefix-${route.id}`}
+              ariaLabel={`Route ${route.prefix} IPv4 prefix`}
+              ariaDescribedBy={`edit-route-prefix-help-${route.id}${prefixViolation === null ? "" : ` edit-route-prefix-error-${route.id}`}`}
+              invalid={prefixViolation !== null}
+              disabled={pending}
+              required
+              selection={prefix}
+              onSelectionChange={setPrefix}
+            />
+            <InlineFieldError id={`edit-route-prefix-error-${route.id}`} violation={prefixViolation} />
           </Field>
-          <DialogFooter><Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" disabled={pending}>{pending ? "Saving" : "Save route"}</Button></DialogFooter>
+          <Field label="Owner" htmlFor={`edit-route-owner-${route.id}`}>
+            <Select value={ownerId} onValueChange={setOwnerId} disabled={pending}><SelectTrigger id={`edit-route-owner-${route.id}`}><SelectValue /></SelectTrigger><SelectContent>{nodes.map((node) => <SelectItem key={node.id} value={node.id}>{node.name} · {node.address}</SelectItem>)}</SelectContent></Select>
+          </Field>
+          <DialogFooter><Button type="button" variant="ghost" disabled={pending} onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" disabled={pending || prefix.value === null || (prefix.value === route.prefix && ownerId === route.nodeId)}>{pending ? "Saving" : "Save route"}</Button></DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
@@ -457,7 +716,7 @@ function DeleteRouteDialog({ route, onChanged }: Readonly<{ route: Route; onChan
       setOpen(false);
       onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Route deletion failed");
+      setError(nodeOperationError(reason, "route", "Route deletion failed"));
     } finally {
       setPending(false);
     }
@@ -522,7 +781,7 @@ export function NodeDetailWorkspace({ initialChecks, initialDetail, nodes, vnrs 
       setOlderChecks((current) => [...current, ...page.items]);
       setNextChecksCursor(page.nextCursor);
     } catch (reason) {
-      setChecksError(reason instanceof Error ? reason.message : "Could not load older checks");
+      setChecksError(nodeOperationError(reason, "connectivity checks", "Could not load older checks"));
     } finally {
       setLoadingChecks(false);
     }

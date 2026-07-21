@@ -10,20 +10,22 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: native x86_64 hardware release verification; dashboard
-  implementation, cross-root two-target reproducibility, clean two-root
-  core/API compiler reproducibility, privileged AArch64 three-service
-  lifecycle/namespace compatibility, and AMD64-container lifecycle are
-  verified
+- Current milestone: segmented inventory inputs and actionable management
+  errors are implemented and pass the complete local pre-deployment gate.
+  Settled-tree backend, contract, dashboard, browser, production-runtime,
+  archive, SBOM, and secret-exposure proofs pass; live deployment and native
+  x86_64 service evidence remain pending.
 - SQLite schema version: `1`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
   runtime lifecycle wiring implemented
-- OpenAPI revision: `1.0.0` (`packages/contracts/openapi/ntip-v1.yaml`, 81 schemas)
+- OpenAPI revision: `1.0.1` (`packages/contracts/openapi/ntip-v1.yaml`, 81
+  schemas). This revision fixes inventory-error semantics without adding or
+  removing a public path, operation, or schema shape.
 - Dashboard: Direction A implementation present as a pinned Bun 1.3.14 /
-  Next.js 16.2.10 standalone service; current typecheck, unit, 12-route
-  production build, exact-Bun runtime smoke, full lint, and 14/14 production
-  Playwright journeys passed
+  Next.js 16.2.10 standalone service. The current segmented-input/actionable-
+  error tree passes typecheck, lint, 37/37 unit tests, the 12-route production
+  build, exact-Bun runtime smoke, and 19/19 Playwright journeys.
 - Last verified commit: `a718a835107438da545c56787689ca5c4e8530f6`
   (v0.2 implementation)
 - Last verified implementation: commit `a718a835107438da545c56787689ca5c4e8530f6`;
@@ -40,18 +42,20 @@ security policy, or milestone status.
   packaging paths, 2026-07-20
 - Migration 0001 SHA-256:
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
-- Proof commands: `zig build check --summary all` (47/47 steps, 421/421
-  aggregate tests); `zig build test --summary all` (412/412); `zig build
-  cross-build --summary all` (x86_64-linux-musl and aarch64-linux-musl,
-  18/18); native build/version smoke; frozen Bun/OpenAPI/typecheck/tests;
-  dashboard current lint/typecheck/unit/production build/runtime smoke and
-  14/14 Playwright; different-root two-target dashboard reproducibility;
-  dashboard archive/launcher/preview-guard/installer checks for both targets;
-  packaging-contract,
-  vendored-SQLite, secret-scan, shell-syntax, release-gate, and generated-
-  artifact checks; privileged AArch64 systemd security/runtime, current
-  namespace, and exact-v0.1 compatibility execution. Native x86_64 hardware
-  execution remains open.
+- Proof commands: `zig build check --summary all` (429/429 aggregate tests)
+  and `zig build test --summary all` (420/420) pass for the current backend
+  slice; dashboard typecheck, lint, tests (37/37), production build, exact-Bun
+  runtime smoke, and Playwright (19/19) pass. Settled-tree contract validation,
+  typecheck, lint, generated-artifact drift, and 13/13 tests pass. The three
+  x86_64 release archives pass structure and SBOM checks, and the combined
+  source/archive secret scan passes across 3,333 archive members. Prior
+  verified evidence includes
+  `zig build cross-build --summary all` for both static-musl targets (18/18),
+  native build/version smoke, dashboard production build/runtime smoke and
+  14/14 Playwright, different-root dashboard reproducibility,
+  archive/installer and packaging checks, privileged AArch64 systemd/runtime
+  and namespace checks, and exact-v0.1 compatibility execution. Native x86_64
+  hardware execution remains open.
 
 ## Current State
 
@@ -107,7 +111,11 @@ Browser
 - `ntsrv` is the sole live SQLite owner and remains the protocol authority.
 - `ntip-api` is an unprivileged, DB-free Zig HTTP service.
 - `ntip-dashboard` is a separately packaged Bun system service.
-- The existing human CLI socket and Node wire protocol remain compatible.
+- The private typed service socket is a lockstep-deployed implementation
+  boundary. Its v2 response frame may carry bounded field violations from
+  `ntsrv` to `ntip-api`; v1 frames fail closed instead of being reinterpreted.
+- The existing human CLI socket, public `/api/v1` route/schema shapes, and Node
+  wire protocol remain compatible.
 
 ### Persistence
 
@@ -142,6 +150,17 @@ sessions, Argon2id passwords, CSRF and exact-Origin validation, RBAC, ETags,
 idempotency keys, cursor pagination, stable error codes, and strict bounded
 JSON. OpenAPI is canonical and generates the TypeScript client. Machine tokens
 and third-party automation guarantees are deferred.
+
+Inventory failures may add bounded `violations` entries with canonical
+`field`, stable machine-readable `code`, and human-readable `message` values.
+HTTP 400 with top-level `validation_failed` covers address/CIDR parsing and
+prefix-range failures. HTTP 409 with `invariant_violation` covers reserved,
+outside-VNR, overlap, and dependent-resource failures; an address allocated to
+another Node uses HTTP 409 with top-level `conflict` and violation code
+`address_in_use`. Status and top-level code remain authoritative, message text
+is not stable, and clients must preserve unknown additive violation codes.
+OpenAPI 1.0.1 documents those existing public shapes and semantics; it does not
+add a public route, operation, schema shape, or Node wire message.
 
 Roles are:
 
@@ -184,6 +203,13 @@ state, database handle, or Unix socket access.
 - Three-role controlled-operator RBAC and hardened database-backed sessions.
 - Append-only audit, bounded polling, Master-originated ICMP checks, and
   validated in-place inventory edits.
+- Inventory IPv4 entry is selection-only: four owned Radix octet controls,
+  prefix-aware VNR/route CIDRs, topology-derived Node availability, explicit
+  retained-invalid host bits, and no free-text normalization.
+- Actionable inventory errors cross the private socket as bounded structured
+  violations. The private protocol advances to v2 in lockstep, while OpenAPI
+  1.0.1 only fixes the semantics of its existing public error shape; public
+  route/schema shapes, the human CLI protocol, and Node wire remain unchanged.
 - Dashboard is distributed as a separate versioned artifact and runs on a
   pinned Bun runtime. Its `x86_64-linux`/`aarch64-linux` artifacts use Bun's
   glibc builds while core/API remain static-musl. Release is blocked if the
@@ -221,6 +247,34 @@ state, database handle, or Unix socket access.
   login redirect. This prevents parallel layout/page rendering from logging a
   child `ApiError`; `/auth/me` remains the authorization source and cookie
   presence alone still grants nothing.
+- Private service IPC advances to v2; its only frame-shape extension is
+  optional, strictly bounded field violations on terminal errors. `ntsrv` maps
+  domain errors before framing, `ntip-api` validates and forwards the exact
+  bounded shape, and v1 requests or responses are rejected. The public HTTP
+  paths, DTO shapes, existing human CLI socket, and protocol DATA/control
+  messages do not change.
+- OpenAPI 1.0.1 fixes the stable inventory-violation register for fields
+  `address`, `cidr`, and `prefix`: `invalid_ipv4_address`,
+  `address_outside_vnr`, `address_reserved_network`,
+  `address_reserved_master`, `address_reserved_broadcast`, `address_in_use`,
+  `invalid_ipv4_cidr`, `noncanonical_ipv4_cidr`, `prefix_out_of_range`,
+  `range_reserved`, `range_overlaps_vnr`, `range_overlaps_route`,
+  `range_excludes_node`, and `range_reserves_node_address`. The code property
+  deliberately remains open to additive future values; stable HTTP/top-level
+  semantics and non-stable human message wording are enforced by contract
+  validation and generated-artifact drift checks.
+- VNR create/edit, Node create/edit, and route create/edit now use the shared
+  four-octet selection core. BigInt-safe interval arithmetic derives partial
+  prefixes and sparse Node availability without enumerating host ranges;
+  fixed segments disable, variable segments choose the lowest compatible
+  completion, VNR `/1`-`/30` and route `/1`-`/32` rules remain distinct, and a
+  prefix change retains invalid host bits until an explicit correction.
+- Inventory forms now focus a shared actionable-error summary, associate each
+  structured violation with its field, retain request IDs, and render unknown
+  additive codes safely. `address_in_use` refreshes topology, removes the
+  rejected address, selects the next lowest free address, announces the
+  change, and requires explicit resubmission; unavailable or exhausted
+  topology disables submission.
 - Domain-level VNR range, Node identity-preserving, and route update operations
   validate every dependent invariant before committing exactly one generation.
   Route IDs now travel with the in-memory projection, so prefix and owner edits
@@ -568,6 +622,17 @@ state, database handle, or Unix socket access.
   numeric identity. Both scenarios passed in the privileged,
   architecture-matched AArch64 Linux container; native x86_64 remains CI-only.
 
+### Deployment-pending
+
+- Take an online SQLite backup, then deploy `ntsrv` and `ntip-api` together
+  because private IPC v1 and v2 are
+  intentionally incompatible. Exercise VNR, Node, route, collision,
+  unavailable, and exhausted flows through the real same-origin UI before
+  recording live verification.
+- Complete native x86_64 hardware execution during that deployment. No current
+  statement in this brief claims that the segmented-input/actionable-error tree
+  is deployed or release-final.
+
 ### Deferred or out of scope
 
 - SSO, MFA, API tokens, SSE/WebSockets, mobile administration, Node software
@@ -587,7 +652,12 @@ state, database handle, or Unix socket access.
 - [x] Typed service IPC and hardened HTTP API
 - [x] OpenAPI and generated TypeScript client
 - [x] Bun workspace and Direction A dashboard implementation verification
-- [ ] Packaging, systemd, CI, documentation, and release evidence
+- [x] Segmented inventory inputs, private IPC v2 violations, and scoped
+  backend/dashboard verification
+- [x] Settled-tree contract, production dashboard, browser, and release-archive
+  proof for the segmented-input/actionable-error milestone
+- [ ] Live deployment, native x86_64 service, and same-origin verification
+- [x] Packaging, systemd, CI, documentation, and release evidence
 
 ## Verification Commands
 
@@ -597,17 +667,20 @@ prerequisites still apply to the commands that exercise those facilities.
 
 ```sh
 zig build check --summary all
-zig build test
+zig build test --summary all
 zig build
 zig build cross-build
 bun install --frozen-lockfile
 bun run contracts:validate
 bun run contracts:check
+bun run --cwd packages/contracts typecheck
+bun run --cwd packages/contracts test
 bun run typecheck
 bun run test
 bun run dashboard:lint
 bun run dashboard:typecheck
 bun run dashboard:test
+bun test ./apps/dashboard/test/unit/segmented-network-input.test.tsx
 bun run dashboard:build
 bun run dashboard:runtime-smoke
 bun run dashboard:e2e
@@ -629,6 +702,30 @@ scripts/check-systemd-security.sh --offline packaging/systemd/*.service
 ```
 
 Latest evidence:
+
+- Current working-tree backend slice: `zig build test --summary all` passed
+  420/420 and `zig build check --summary all` passed 429/429, including private
+  IPC v2 field-violation framing, public mapping, bounded forwarding, and
+  contract-conformance coverage.
+- Current integrated dashboard slice: `bun run dashboard:typecheck`,
+  `bun run dashboard:lint`, and `bun run dashboard:test` passed; the unit
+  result is 37/37 and includes 14 segmented-network tests for BigInt
+  boundaries, `/20` partial prefixes, `/24` allocation holes, `/30`
+  exhaustion, `/16` host/broadcast semantics, retained-invalid host bits,
+  fixed segments, and no parent change callback during render.
+- Settled-tree contract validation, typecheck/lint, generated-artifact drift,
+  and 13/13 contract tests pass. The 12-route dashboard production build,
+  exact-Bun runtime smoke, and 19/19 Playwright journeys pass on the same tree.
+  The core and API x86_64 static-musl archives and dashboard x86_64 glibc
+  archive pass contract/SBOM checks; source and all 3,333 archive members pass
+  the secret-exposure scan. Live deployment and native x86_64 service proof
+  remain pending. These working-tree results do not advance the Last verified
+  commit field or claim release-final verification.
+
+The remaining evidence in this section records the previously verified
+implementation unless a bullet explicitly identifies the current working-tree
+milestone. It must not be read as production proof for the new controls or
+private IPC v2.
 
 - `zig build check --summary all`: 47/47 steps and 421/421 aggregate unit,
   integration, primitive-vector, and fuzz tests passed, including formatting,

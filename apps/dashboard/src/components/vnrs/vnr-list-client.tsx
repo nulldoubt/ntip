@@ -34,19 +34,26 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "@/components/auth-context";
-import { actionableError, ClientApiError, getJson, readJson } from "@/components/vnrs/client-api";
+import {
+  fieldError,
+  InlineFieldError,
+  InventoryErrorSummary,
+  inventoryFormErrorState,
+  type InventoryFormErrorState,
+} from "@/components/network/inventory-form-errors";
+import { SegmentedCidrSelect } from "@/components/network/segmented-network-input";
+import { actionableError, getJson, readJson } from "@/components/vnrs/client-api";
 import type { Topology, Vnr, VnrListData, VnrPage } from "@/components/vnrs/vnr-types";
 import { createMutationAttempt } from "@/lib/behavior/mutation";
+import { createEmptyCidrSelection, type SegmentedCidrSelection } from "@/lib/network/segmented-network";
 import { usePolledResource } from "@/lib/use-polled-resource";
 
 type VnrCreate = components["schemas"]["VnrCreate"];
 type LivenessState = components["schemas"]["LivenessState"];
 
 const namePattern = "[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}";
-const cidrPattern = "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])";
-
 function formatUtc(timestamp: string): string {
   const parsed = new Date(timestamp);
   if (Number.isNaN(parsed.getTime())) return "Invalid time";
@@ -102,25 +109,28 @@ function CreateVnrDialog() {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
-  const [cidr, setCidr] = useState("");
+  const [cidr, setCidr] = useState<SegmentedCidrSelection>(() => createEmptyCidrSelection("vnr"));
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [violations, setViolations] = useState<readonly components["schemas"]["FieldViolation"][]>([]);
+  const [error, setError] = useState<InventoryFormErrorState | null>(null);
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (error !== null) errorSummaryRef.current?.focus();
+  }, [error]);
 
   function reset() {
     setName("");
-    setCidr("");
+    setCidr(createEmptyCidrSelection("vnr"));
     setPending(false);
     setError(null);
-    setViolations([]);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (cidr.value === null) return;
     setPending(true);
     setError(null);
-    setViolations([]);
-    const body: VnrCreate = { name: name.trim(), cidr: cidr.trim() };
+    const body: VnrCreate = { name: name.trim(), cidr: cidr.value };
 
     try {
       const attempt = createMutationAttempt({
@@ -135,11 +145,13 @@ function CreateVnrDialog() {
       router.push(`/vnrs/${encodeURIComponent(created.name)}`);
       router.refresh();
     } catch (reason) {
-      setError(actionableError(reason));
-      setViolations(reason instanceof ClientApiError ? reason.violations : []);
+      setError(inventoryFormErrorState(reason, "VNR"));
       setPending(false);
     }
   }
+
+  const nameViolation = fieldError(error, "name");
+  const cidrViolation = fieldError(error, "cidr");
 
   return (
     <Dialog
@@ -175,54 +187,40 @@ function CreateVnrDialog() {
               placeholder="berlin-edge"
               required
               value={name}
+              disabled={pending}
               onChange={(event) => setName(event.target.value)}
-              aria-describedby="create-vnr-name-help"
+              aria-invalid={nameViolation !== null || undefined}
+              aria-describedby={`create-vnr-name-help${nameViolation === null ? "" : " create-vnr-name-error"}`}
             />
             <p id="create-vnr-name-help" className="text-xs text-muted-foreground">
               1–63 letters, numbers, underscores, periods, or hyphens.
             </p>
+            <InlineFieldError id="create-vnr-name-error" violation={nameViolation} />
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="create-vnr-cidr">IPv4 CIDR</Label>
-            <Input
+            <SegmentedCidrSelect
               id="create-vnr-cidr"
-              name="cidr"
-              autoComplete="off"
-              className="font-mono"
-              inputMode="decimal"
-              pattern={cidrPattern}
-              placeholder="10.42.0.0/24"
+              ariaLabel="VNR IPv4 CIDR"
+              ariaDescribedBy={`create-vnr-cidr-help${cidrViolation === null ? "" : " create-vnr-cidr-error"}`}
+              invalid={cidrViolation !== null}
+              disabled={pending}
               required
-              value={cidr}
-              onChange={(event) => setCidr(event.target.value)}
-              aria-describedby="create-vnr-cidr-help"
+              selection={cidr}
+              onSelectionChange={setCidr}
             />
             <p id="create-vnr-cidr-help" className="text-xs text-muted-foreground">
-              The service validates overlap, reserved addresses, and the canonical network prefix.
+              Select four octets and a /1–/30 prefix. New VNRs default to /24.
             </p>
+            <InlineFieldError id="create-vnr-cidr-error" violation={cidrViolation} />
           </div>
-          {error !== null ? (
-            <Alert tone="critical">
-              <CircleAlert aria-hidden="true" />
-              <AlertTitle>VNR was not created</AlertTitle>
-              <AlertDescription>
-                <p>{error}</p>
-                {violations.length > 0 ? (
-                  <ul className="mt-2 list-disc space-y-1 ps-4">
-                    {violations.map((violation) => (
-                      <li key={`${violation.field}:${violation.code}`}>{violation.field}: {violation.message}</li>
-                    ))}
-                  </ul>
-                ) : null}
-              </AlertDescription>
-            </Alert>
-          ) : null}
+          <InventoryErrorSummary ref={errorSummaryRef} error={error} title="VNR was not created" />
           <p className="sr-only" aria-live="polite">{pending ? "Creating VNR" : ""}</p>
           <DialogFooter>
-            <Button type="button" variant="ghost" disabled={pending} onClick={() => setOpen(false)}>
+            <Button type="button" variant="ghost" disabled={pending} onClick={() => { setOpen(false); reset(); }}>
               Cancel
             </Button>
-            <Button type="submit" disabled={pending}>
+            <Button type="submit" disabled={pending || cidr.value === null}>
               {pending ? <RefreshCw aria-hidden="true" className="animate-spin" /> : <Plus aria-hidden="true" />}
               {pending ? "Creating" : "Create VNR"}
             </Button>

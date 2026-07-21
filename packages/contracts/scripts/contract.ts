@@ -122,6 +122,25 @@ export const stableErrorCodes = [
   "validation_failed",
 ] as const;
 
+export const stableInventoryViolationCodes = [
+  "invalid_ipv4_address",
+  "address_outside_vnr",
+  "address_reserved_network",
+  "address_reserved_master",
+  "address_reserved_broadcast",
+  "address_in_use",
+  "invalid_ipv4_cidr",
+  "noncanonical_ipv4_cidr",
+  "prefix_out_of_range",
+  "range_reserved",
+  "range_overlaps_vnr",
+  "range_overlaps_route",
+  "range_excludes_node",
+  "range_reserves_node_address",
+] as const;
+
+export const stableInventoryViolationFields = ["address", "cidr", "prefix"] as const;
+
 export const operationalSettingFields = [
   "connectivityRetentionDays",
   "defaultEnrollmentLifetimeSeconds",
@@ -173,7 +192,7 @@ export async function validateContract(): Promise<ContractSummary> {
   const document = await loadContract();
   const paths = objectAt(document.paths, "paths");
   assertEqual(document.openapi, "3.1.1", "OpenAPI version");
-  assertEqual(objectAt(document.info, "info").version, "1.0.0", "contract version");
+  assertEqual(objectAt(document.info, "info").version, "1.0.1", "contract version");
 
   const actualPaths = Object.keys(paths).sort();
   assertArrayEqual(actualPaths, [...expectedPaths], "canonical path set");
@@ -237,6 +256,40 @@ export async function validateContract(): Promise<ContractSummary> {
   const errorCode = objectAt(schemas.ErrorCode, "components.schemas.ErrorCode");
   const errorCodes = arrayAt(errorCode.enum, "ErrorCode.enum").map(String).sort();
   assertArrayEqual(errorCodes, [...stableErrorCodes], "stable error code set");
+
+  const fieldViolation = objectAt(schemas.FieldViolation, "components.schemas.FieldViolation");
+  const fieldViolationProperties = objectAt(fieldViolation.properties, "FieldViolation.properties");
+  const fieldProperty = objectAt(fieldViolationProperties.field, "FieldViolation.field");
+  const violationCodeProperty = objectAt(fieldViolationProperties.code, "FieldViolation.code");
+  const fieldDescription = stringAt(fieldProperty.description, "FieldViolation.field.description");
+  const violationCodeDescription = stringAt(
+    violationCodeProperty.description,
+    "FieldViolation.code.description",
+  );
+  for (const field of stableInventoryViolationFields) {
+    assertIncludes(fieldDescription, `\`${field}\``, `FieldViolation field ${field}`);
+  }
+  for (const code of stableInventoryViolationCodes) {
+    assertIncludes(violationCodeDescription, `\`${code}\``, `FieldViolation code ${code}`);
+  }
+  if ("enum" in violationCodeProperty) {
+    throw new Error("FieldViolation.code must remain open to additive future values");
+  }
+
+  const responses = objectAt(components.responses, "components.responses");
+  const badRequestDescription = stringAt(
+    objectAt(responses.BadRequest, "components.responses.BadRequest").description,
+    "BadRequest.description",
+  );
+  assertIncludes(badRequestDescription, "HTTP 400", "inventory parse response status");
+  assertIncludes(badRequestDescription, "`validation_failed`", "inventory parse response code");
+  const conflictDescription = stringAt(
+    objectAt(responses.Conflict, "components.responses.Conflict").description,
+    "Conflict.description",
+  );
+  assertIncludes(conflictDescription, "HTTP 409", "inventory invariant response status");
+  assertIncludes(conflictDescription, "`invariant_violation`", "inventory invariant response code");
+  assertIncludes(conflictDescription, "`conflict`", "inventory address conflict response code");
 
   const operationalSettings = objectAt(schemas.OperationalSettings, "components.schemas.OperationalSettings");
   const settingProperties = objectAt(operationalSettings.properties, "OperationalSettings.properties");
@@ -379,6 +432,12 @@ function assertEqual(actual: unknown, expected: unknown, label: string): void {
 function assertArrayEqual(actual: readonly unknown[], expected: readonly unknown[], label: string): void {
   if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) {
     throw new Error(`${label}: expected ${JSON.stringify(expected)}, received ${JSON.stringify(actual)}`);
+  }
+}
+
+function assertIncludes(actual: string, expected: string, label: string): void {
+  if (!actual.includes(expected)) {
+    throw new Error(`${label}: expected ${JSON.stringify(actual)} to include ${JSON.stringify(expected)}`);
   }
 }
 

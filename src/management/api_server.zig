@@ -287,7 +287,11 @@ pub const UnixBackend = struct {
                 const metadata = failure.metadata orelse service_ipc.ErrorMetadata{};
                 if (metadata.etag) |value| etag = try allocator.dupe(u8, value);
                 retry_after_seconds = metadata.retry_after_seconds;
-                const error_body = try api_error.encode(allocator, request.request_id, failure.code, failure.message);
+                const error_body = try encodeServiceError(
+                    allocator,
+                    request.request_id,
+                    failure,
+                );
                 errdefer allocator.free(error_body);
                 return .{
                     .allocator = allocator,
@@ -424,11 +428,10 @@ pub const UnixBackend = struct {
 
             if (frame.@"error") |failure| {
                 if (headers_started) return .aborted;
-                const error_body = try api_error.encode(
+                const error_body = try encodeServiceError(
                     allocator,
                     request.request_id,
-                    failure.code,
-                    failure.message,
+                    failure,
                 );
                 errdefer allocator.free(error_body);
                 const metadata = failure.metadata orelse service_ipc.ErrorMetadata{};
@@ -714,10 +717,32 @@ fn wipeDecodedResponseFrame(frame: *service_ipc.ResponseFrame) void {
     if (frame.payload) |*payload| wipeJsonValue(payload);
     if (frame.@"error") |*failure| {
         std.crypto.secureZero(u8, @constCast(failure.message));
+        if (failure.violations) |violations| for (violations) |violation| {
+            std.crypto.secureZero(u8, @constCast(violation.field));
+            std.crypto.secureZero(u8, @constCast(violation.code));
+            std.crypto.secureZero(u8, @constCast(violation.message));
+        };
         if (failure.metadata) |*metadata| {
             if (metadata.etag) |value| std.crypto.secureZero(u8, @constCast(value));
         }
     }
+}
+
+fn encodeServiceError(
+    allocator: Allocator,
+    request_id: []const u8,
+    failure: service_ipc.ErrorBody,
+) ![]u8 {
+    if (failure.violations) |violations| {
+        return api_error.encodeWithViolations(
+            allocator,
+            request_id,
+            failure.code,
+            failure.message,
+            violations,
+        );
+    }
+    return api_error.encode(allocator, request_id, failure.code, failure.message);
 }
 
 /// The strict second parse of a service HTTP payload also uses
@@ -1836,7 +1861,7 @@ test "keep-alive reader wipes each consumed request before retaining the connect
 
 test "allocator-owned service response secrets are wiped before parsed arenas are released" {
     const encoded_frame =
-        \\{"version":1,"request_id":"0123456789abcdef0123456789abcdef","sequence":0,"final":true,"payload":{"status":200,"contentType":"application/json; charset=utf-8","bodyChunk":"csrf-session-temporary-password","setCookie":"__Host-ntip_session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; Secure; HttpOnly; SameSite=Strict; Path=/"}}
+        \\{"version":2,"request_id":"0123456789abcdef0123456789abcdef","sequence":0,"final":true,"payload":{"status":200,"contentType":"application/json; charset=utf-8","bodyChunk":"csrf-session-temporary-password","setCookie":"__Host-ntip_session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; Secure; HttpOnly; SameSite=Strict; Path=/"}}
     ;
     var parsed = try service_ipc.decodeResponseFrame(std.testing.allocator, encoded_frame);
     defer parsed.deinit();
@@ -1868,6 +1893,26 @@ test "allocator-owned service response secrets are wiped before parsed arenas ar
     try expectSecurelyZeroed(reparsed_content_type);
     try expectSecurelyZeroed(reparsed_chunk);
     try expectSecurelyZeroed(reparsed_cookie);
+}
+
+test "buffered and streaming bridges preserve service field violations" {
+    const violations = [_]service_ipc.FieldViolation{.{
+        .field = "address",
+        .code = "address_in_use",
+        .message = "Address is already assigned.",
+    }};
+    const body = try encodeServiceError(
+        std.testing.allocator,
+        "0123456789abcdef0123456789abcdef",
+        .{
+            .code = .conflict,
+            .message = "resource conflicts with current state",
+            .violations = &violations,
+        },
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"violations\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"code\":\"address_in_use\"") != null);
 }
 
 fn expectSecurelyZeroed(bytes: []const u8) !void {

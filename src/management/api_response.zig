@@ -84,6 +84,16 @@ pub fn fail(
     return sink.fail(code, message, retryable);
 }
 
+pub fn failWithViolations(
+    sink: *service_server.ResponseSink,
+    code: service_ipc.ErrorCode,
+    message: []const u8,
+    retryable: bool,
+    violations: []const service_ipc.FieldViolation,
+) !void {
+    return sink.failWithViolations(code, message, retryable, violations);
+}
+
 pub fn failWithMetadata(
     sink: *service_server.ResponseSink,
     code: service_ipc.ErrorCode,

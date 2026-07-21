@@ -1,7 +1,7 @@
 openapi: 3.1.1
 info:
   title: NTIP Management API
-  version: 1.0.0
+  version: 1.0.1
   summary: Same-origin management contract for NTIP v0.2.
   description: |
     The versioned operator API exposed by the loopback-only `ntip-api` service.
@@ -1908,7 +1908,10 @@ components:
         Cache-Control:
           $ref: '#/components/headers/NoStore'
     BadRequest:
-      description: Malformed framing, JSON, parameters, or validation input.
+      description: |
+        Malformed framing, JSON, parameters, or validation input. Inventory
+        address/CIDR parsing and prefix-range failures use HTTP 400 with the
+        top-level `validation_failed` error code.
       headers:
         X-Request-ID:
           $ref: '#/components/headers/XRequestId'
@@ -1952,7 +1955,11 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     Conflict:
-      description: The operation conflicts with a domain invariant or idempotency record.
+      description: |
+        The operation conflicts with a domain invariant or idempotency record.
+        Inventory reserved-address, outside-VNR, overlap, and dependent-resource
+        failures use HTTP 409 with `invariant_violation`; an address already
+        assigned to another Node uses HTTP 409 with `conflict`.
       headers:
         X-Request-ID:
           $ref: '#/components/headers/XRequestId'
@@ -2134,17 +2141,35 @@ components:
         - internal_error
     FieldViolation:
       type: object
+      description: |
+        Structured detail for an invalid inventory field. The top-level error
+        code and HTTP status remain authoritative; clients use these details to
+        associate an actionable error with a form field. Known inventory
+        fields are `address`, `cidr`, and `prefix`.
       additionalProperties: false
       required: [field, code, message]
       properties:
         field:
           type: string
+          description: Canonical request field name; known inventory fields are `address`, `cidr`, and `prefix`.
           maxLength: 256
         code:
           type: string
+          description: |
+            Stable inventory violation code. v0.2 defines
+            `invalid_ipv4_address`, `address_outside_vnr`,
+            `address_reserved_network`, `address_reserved_master`,
+            `address_reserved_broadcast`, `address_in_use`,
+            `invalid_ipv4_cidr`, `noncanonical_ipv4_cidr`,
+            `prefix_out_of_range`, `range_reserved`,
+            `range_overlaps_vnr`, `range_overlaps_route`,
+            `range_excludes_node`, and `range_reserves_node_address`.
+            Future revisions may add codes, so clients must preserve and
+            gracefully display unknown values.
           pattern: '^[a-z][a-z0-9_]{0,63}$'
         message:
           type: string
+          description: Human-readable explanation; wording is not a stable contract.
           maxLength: 512
     ErrorObject:
       type: object
@@ -2157,9 +2182,11 @@ components:
           type: string
           maxLength: 512
         requestId:
+          description: Same identifier as the `X-Request-ID` response header.
           $ref: '#/components/schemas/Id'
         violations:
           type: array
+          description: Optional field details for validation, invariant, and conflict failures.
           maxItems: 64
           items:
             $ref: '#/components/schemas/FieldViolation'

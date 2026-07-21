@@ -30,10 +30,18 @@ import {
 import { AlertCircle, ArrowRight, Plus, RefreshCw, Search, Server } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "@/components/auth-context";
+import {
+  fieldError,
+  InlineFieldError,
+  inventoryFormErrorState,
+  InventoryErrorSummary,
+  type InventoryFormErrorState,
+} from "@/components/network/inventory-form-errors";
+import { NodeAddressSelect } from "@/components/network/segmented-network-input";
 import { createMutationAttempt } from "@/lib/behavior/mutation";
-import { fetchJson, responseError } from "@/components/nodes/browser-api";
+import { fetchJson } from "@/components/nodes/browser-api";
 import {
   enrollmentTone,
   formatUtc,
@@ -42,13 +50,28 @@ import {
   shortId,
 } from "@/components/nodes/node-presenters";
 import { useOperationalPolling, type OperationalPolling } from "@/components/nodes/use-operational-polling";
+import {
+  actionableApiError,
+  BrowserApiError,
+  readBrowserApiJson,
+} from "@/lib/browser-api-error";
+import {
+  createNodeAddressAvailability,
+  createNodeAddressSelection,
+  selectNodeAddressOctet,
+  type NodeAddressAvailability,
+  type SegmentedIpv4Selection,
+} from "@/lib/network/segmented-network";
 
 type Node = components["schemas"]["Node"];
 type NodeCreate = components["schemas"]["NodeCreate"];
 type NodePage = components["schemas"]["NodePage"];
 type NodeRuntime = components["schemas"]["NodeRuntime"];
 type NodeRuntimePage = components["schemas"]["NodeRuntimePage"];
+type Topology = components["schemas"]["Topology"];
 type Vnr = components["schemas"]["Vnr"];
+
+type TopologyPhase = "idle" | "loading" | "ready" | "unavailable";
 
 type NodesWorkspaceProps = Readonly<{
   initialNodes: NodePage;
@@ -102,24 +125,183 @@ function PollingStatus({ runtime }: Readonly<{ runtime: OperationalPolling<NodeR
   );
 }
 
+function isAbortError(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === "AbortError";
+}
+
+function addressSelection(
+  topology: Topology,
+  vnrName: string,
+  preferredAddress: string | null = null,
+): Readonly<{
+  availability: NodeAddressAvailability;
+  selection: SegmentedIpv4Selection;
+}> {
+  const availability = createNodeAddressAvailability({ topology, vnrName });
+  return {
+    availability,
+    selection: createNodeAddressSelection(availability, preferredAddress),
+  };
+}
+
+function nextAddressAfterConflict(topology: Topology, vnrName: string, rejectedAddress: string): string | null {
+  const { availability, selection } = addressSelection(topology, vnrName, rejectedAddress);
+  if (selection.value !== rejectedAddress) return selection.value;
+
+  const lowest = createNodeAddressSelection(availability, null);
+  if (lowest.value !== rejectedAddress) return lowest.value;
+
+  // A just-refreshed projection should contain the winning allocation. If it
+  // is briefly behind, skip the rejected address locally instead of offering
+  // the same value again.
+  for (let index = 3; index >= 0; index -= 1) {
+    const octetIndex = index as 0 | 1 | 2 | 3;
+    const currentOctet = selection.octets[octetIndex];
+    if (currentOctet === null) continue;
+    const nextOption = selection.octetOptions[octetIndex]
+      .find((option) => option.status === "available" && option.value > currentOctet);
+    if (nextOption !== undefined) {
+      return selectNodeAddressOctet(availability, selection, octetIndex, nextOption.value).value;
+    }
+  }
+  return null;
+}
+
 function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
   const { auth, can } = useAuth();
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [vnrName, setVnrName] = useState(vnrs[0]?.name ?? "");
+  const [name, setName] = useState("");
+  const [vnrName, setVnrName] = useState("");
+  const [address, setAddress] = useState<string | null>(null);
+  const [topology, setTopology] = useState<Topology | null>(null);
+  const [topologyPhase, setTopologyPhase] = useState<TopologyPhase>("idle");
+  const [topologyError, setTopologyError] = useState<string | null>(null);
+  const [formError, setFormError] = useState<InventoryFormErrorState | null>(null);
+  const [announcement, setAnnouncement] = useState("");
+  const [collisionNotice, setCollisionNotice] = useState<string | null>(null);
+  const topologyAbortRef = useRef<AbortController | null>(null);
+  const errorSummaryRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (formError !== null) errorSummaryRef.current?.focus();
+  }, [formError]);
+
+  useEffect(() => () => topologyAbortRef.current?.abort(), []);
 
   if (!can("inventory:write")) return null;
 
+  function reset() {
+    topologyAbortRef.current?.abort();
+    topologyAbortRef.current = null;
+    setName("");
+    setVnrName("");
+    setAddress(null);
+    setTopology(null);
+    setTopologyPhase("idle");
+    setTopologyError(null);
+    setFormError(null);
+    setAnnouncement("");
+    setCollisionNotice(null);
+  }
+
+  async function refreshTopology(options: Readonly<{
+    vnrName?: string;
+    rejectedAddress?: string;
+  }> = {}) {
+    topologyAbortRef.current?.abort();
+    const controller = new AbortController();
+    topologyAbortRef.current = controller;
+    setTopologyPhase("loading");
+    setTopologyError(null);
+    setTopology(null);
+    setAddress(null);
+    if (options.rejectedAddress === undefined) setCollisionNotice(null);
+    setAnnouncement(options.rejectedAddress === undefined
+      ? "Loading current VNRs and available Node addresses."
+      : "The address was claimed by another Node. Refreshing available addresses.");
+
+    try {
+      const freshTopology = await fetchJson<Topology>("/api/v1/topology", controller.signal);
+      if (controller.signal.aborted) return;
+
+      const selectedVnrName = options.vnrName !== undefined && freshTopology.vnrs.some((vnr) => vnr.name === options.vnrName)
+        ? options.vnrName
+        : (freshTopology.vnrs[0]?.name ?? "");
+      const selectedAddress = selectedVnrName.length === 0
+        ? null
+        : options.rejectedAddress === undefined
+          ? addressSelection(freshTopology, selectedVnrName).selection.value
+          : nextAddressAfterConflict(freshTopology, selectedVnrName, options.rejectedAddress);
+
+      setTopology(freshTopology);
+      setTopologyPhase("ready");
+      setVnrName(selectedVnrName);
+      setAddress(selectedAddress);
+
+      if (selectedVnrName.length === 0) {
+        setAnnouncement("No VNR is available. Create a VNR before adding a Node.");
+      } else if (selectedAddress === null) {
+        setAnnouncement(`${selectedVnrName} has no available Node addresses.`);
+      } else if (options.rejectedAddress !== undefined) {
+        const notice = `Address ${options.rejectedAddress} was allocated concurrently. The selection moved to ${selectedAddress}; review it and submit again.`;
+        setCollisionNotice(notice);
+        setAnnouncement(notice);
+      } else {
+        setAnnouncement(`Address ${selectedAddress} is selected as the lowest available address in ${selectedVnrName}.`);
+      }
+    } catch (reason) {
+      if (isAbortError(reason)) return;
+      setTopology(null);
+      setTopologyPhase("unavailable");
+      setVnrName("");
+      setAddress(null);
+      setTopologyError(actionableApiError(reason, {
+        resourceLabel: "topology",
+        includeRequestId: true,
+      }));
+      setAnnouncement("Current topology is unavailable. Node address selection is disabled.");
+    } finally {
+      if (topologyAbortRef.current === controller) topologyAbortRef.current = null;
+    }
+  }
+
+  function changeVnr(nextVnrName: string) {
+    if (
+      topology === null ||
+      nextVnrName.length === 0 ||
+      !topology.vnrs.some((vnr) => vnr.name === nextVnrName)
+    ) return;
+    try {
+      const nextAddress = addressSelection(topology, nextVnrName).selection.value;
+      setVnrName(nextVnrName);
+      setAddress(nextAddress);
+      setFormError(null);
+      setCollisionNotice(null);
+      setAnnouncement(nextAddress === null
+        ? `${nextVnrName} has no available Node addresses.`
+        : `Address ${nextAddress} is selected as the lowest available address in ${nextVnrName}.`);
+    } catch (reason) {
+      setTopology(null);
+      setTopologyPhase("unavailable");
+      setVnrName("");
+      setAddress(null);
+      setTopologyError(actionableApiError(reason, { resourceLabel: "topology" }));
+      setAnnouncement("Current topology is unavailable. Node address selection is disabled.");
+    }
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (topologyPhase !== "ready" || topology === null || vnrName.length === 0 || address === null) return;
     setPending(true);
-    setError(null);
-    const data = new FormData(event.currentTarget);
+    setFormError(null);
+    setCollisionNotice(null);
+    setAnnouncement("Creating Node.");
     const body: NodeCreate = {
-      name: String(data.get("name") ?? "").trim(),
-      address: String(data.get("address") ?? "").trim(),
+      name: name.trim(),
+      address,
       vnrName,
     };
     try {
@@ -130,20 +312,45 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
         body,
       });
       const response = await fetch(attempt.buildRequest());
-      if (!response.ok) throw await responseError(response);
-      const node = (await response.json()) as Node;
+      const node = await readBrowserApiJson<Node>(response);
       setOpen(false);
       router.push(`/nodes/${node.id}`);
       router.refresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Node creation failed");
+      setFormError(inventoryFormErrorState(reason, "Node"));
+      setAnnouncement("Node was not created. Review the error summary and the marked fields.");
+      const addressWasClaimed = reason instanceof BrowserApiError && (
+        reason.code === "address_in_use" ||
+        reason.violations.some((violation) => violation.field === "address" && violation.code === "address_in_use")
+      );
+      if (addressWasClaimed) {
+        await refreshTopology({ vnrName: body.vnrName, rejectedAddress: body.address });
+      }
     } finally {
       setPending(false);
     }
   }
 
+  const nameViolation = fieldError(formError, "name");
+  const vnrViolation = fieldError(formError, "vnrName") ?? fieldError(formError, "vnr");
+  const addressViolation = collisionNotice === null ? fieldError(formError, "address") : null;
+  const topologyReady = topologyPhase === "ready" && topology !== null;
+  const exhausted = topologyReady && vnrName.length > 0 && address === null;
+
   return (
-    <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (!next) setError(null); }}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (pending) return;
+        setOpen(nextOpen);
+        if (nextOpen) {
+          reset();
+          void refreshTopology();
+        } else {
+          reset();
+        }
+      }}
+    >
       <DialogTrigger asChild>
         <Button disabled={vnrs.length === 0}><Plus aria-hidden="true" />Add Node</Button>
       </DialogTrigger>
@@ -153,29 +360,115 @@ function CreateNodeDialog({ vnrs }: Readonly<{ vnrs: readonly Vnr[] }>) {
           <DialogDescription>Create the inventory record first. Enrollment credentials are issued separately.</DialogDescription>
         </DialogHeader>
         <form className="grid gap-4" onSubmit={(event) => void submit(event)}>
-          {error === null ? null : (
-            <Alert tone="critical"><AlertCircle aria-hidden="true" /><AlertDescription>{error}</AlertDescription></Alert>
-          )}
+          <InventoryErrorSummary ref={errorSummaryRef} error={formError} title="Node was not created" />
           <div className="grid gap-1.5">
             <Label htmlFor="node-name">Name</Label>
-            <Input id="node-name" name="name" required maxLength={63} autoComplete="off" placeholder="edge-berlin-01" />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="node-address">Address</Label>
-            <Input id="node-address" name="address" required inputMode="decimal" autoComplete="off" placeholder="10.42.0.2" />
+            <Input
+              id="node-name"
+              name="name"
+              required
+              maxLength={63}
+              autoComplete="off"
+              autoFocus
+              placeholder="edge-berlin-01"
+              value={name}
+              disabled={pending}
+              aria-invalid={nameViolation !== null || undefined}
+              aria-describedby={nameViolation === null ? undefined : "node-name-error"}
+              onChange={(event) => setName(event.target.value)}
+            />
+            <InlineFieldError id="node-name-error" violation={nameViolation} />
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="node-vnr">VNR</Label>
-            <Select value={vnrName} onValueChange={setVnrName} required>
-              <SelectTrigger id="node-vnr"><SelectValue placeholder="Select a VNR" /></SelectTrigger>
+            <Select
+              value={vnrName}
+              onValueChange={changeVnr}
+              disabled={!topologyReady || pending || topology.vnrs.length === 0}
+              required
+            >
+              <SelectTrigger
+                id="node-vnr"
+                aria-invalid={vnrViolation !== null || undefined}
+                aria-describedby={vnrViolation === null ? "node-vnr-help" : "node-vnr-help node-vnr-error"}
+              >
+                <SelectValue placeholder={topologyPhase === "loading" ? "Loading VNRs" : "Select a VNR"} />
+              </SelectTrigger>
               <SelectContent>
-                {vnrs.map((vnr) => <SelectItem key={vnr.name} value={vnr.name}>{vnr.name} · {vnr.cidr}</SelectItem>)}
+                {topology?.vnrs.map((vnr) => <SelectItem key={vnr.name} value={vnr.name}>{vnr.name} · {vnr.cidr}</SelectItem>)}
               </SelectContent>
             </Select>
+            <p id="node-vnr-help" className="text-xs text-muted-foreground">
+              Address availability comes from a fresh topology snapshot each time this dialog opens.
+            </p>
+            <InlineFieldError id="node-vnr-error" violation={vnrViolation} />
           </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="node-address">Address</Label>
+            {topologyPhase === "loading" ? (
+              <div className="min-h-9 rounded-md border border-border bg-muted px-3 py-2 text-sm text-muted-foreground" role="status">
+                Loading available addresses…
+              </div>
+            ) : topologyPhase === "unavailable" ? (
+              <div className="min-h-9 rounded-md border border-warning-border bg-warning-muted px-3 py-2 text-sm text-muted-foreground" role="status">
+                Address selection is unavailable until the topology can be loaded.
+              </div>
+            ) : !topologyReady || vnrName.length === 0 ? (
+              <div className="min-h-9 rounded-md border border-border bg-muted px-3 py-2 text-sm text-muted-foreground" role="status">
+                Select a VNR to choose an address.
+              </div>
+            ) : (
+              <NodeAddressSelect
+                id="node-address"
+                ariaLabel="Node IPv4 address"
+                ariaDescribedBy={addressViolation === null ? "node-address-help" : "node-address-help node-address-error"}
+                topology={topology}
+                vnrName={vnrName}
+                value={address}
+                onValueChange={setAddress}
+                disabled={pending}
+                invalid={addressViolation !== null}
+                required
+              />
+            )}
+            <p id="node-address-help" className="text-xs text-muted-foreground">
+              {exhausted
+                ? `${vnrName} has no free host address after reserving the network, Master, broadcast, and current Node allocations.`
+                : address === null
+                  ? "The lowest free host address is selected after a VNR is available."
+                  : `${address} is the current lowest compatible free address.`}
+            </p>
+            <InlineFieldError id="node-address-error" violation={addressViolation} />
+          </div>
+          {topologyError === null ? null : (
+            <Alert tone="warning">
+              <AlertCircle aria-hidden="true" />
+              <AlertDescription>{topologyError}</AlertDescription>
+            </Alert>
+          )}
+          {collisionNotice === null ? null : (
+            <Alert role="alert" tone="warning">
+              <RefreshCw aria-hidden="true" />
+              <AlertDescription>{collisionNotice}</AlertDescription>
+            </Alert>
+          )}
+          <p className="sr-only" aria-live="polite" aria-atomic="true">{collisionNotice === null ? announcement : ""}</p>
+          <p className="sr-only" aria-live="assertive" aria-atomic="true">{collisionNotice ?? ""}</p>
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button type="submit" disabled={pending || vnrName.length === 0}>{pending ? "Creating" : "Create Node"}</Button>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={pending}
+              onClick={() => {
+                setOpen(false);
+                reset();
+              }}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" disabled={pending || !topologyReady || vnrName.length === 0 || address === null}>
+              {pending ? "Creating" : "Create Node"}
+            </Button>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -212,7 +505,9 @@ export function NodesWorkspace({ initialNodes, initialRuntime, vnrs }: NodesWork
       });
       setNextCursor(page.nextCursor);
     } catch (reason) {
-      setPageError(reason instanceof Error ? reason.message : "Could not load more Nodes");
+      setPageError(reason instanceof Error
+        ? actionableApiError(reason, { resourceLabel: "Node list", includeRequestId: true })
+        : "Could not load more Nodes");
     } finally {
       setLoadingMore(false);
     }

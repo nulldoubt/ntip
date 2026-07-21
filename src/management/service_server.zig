@@ -191,9 +191,33 @@ pub const ResponseSink = struct {
     ) !void {
         const requirements = service_ipc.errorMetadataRequirements(code);
         if (requirements.etag) return error.ErrorMetadataRequired;
-        return self.failWithMetadata(code, message, retryable, .{
-            .retry_after_seconds = if (requirements.retry_after_seconds) 1 else null,
-        });
+        return self.failWithDetails(
+            code,
+            message,
+            retryable,
+            .{ .retry_after_seconds = if (requirements.retry_after_seconds) 1 else null },
+            null,
+        );
+    }
+
+    /// Sends a stable failure with bounded, machine-readable field details.
+    /// Violations remain body data and are never promoted into headers.
+    pub fn failWithViolations(
+        self: *ResponseSink,
+        code: service_ipc.ErrorCode,
+        message: []const u8,
+        retryable: bool,
+        violations: []const service_ipc.FieldViolation,
+    ) !void {
+        const requirements = service_ipc.errorMetadataRequirements(code);
+        if (requirements.etag) return error.ErrorMetadataRequired;
+        return self.failWithDetails(
+            code,
+            message,
+            retryable,
+            .{ .retry_after_seconds = if (requirements.retry_after_seconds) 1 else null },
+            violations,
+        );
     }
 
     /// Sends a stable failure with validated public-header metadata. Callers
@@ -207,6 +231,19 @@ pub const ResponseSink = struct {
         retryable: bool,
         metadata: service_ipc.ErrorMetadata,
     ) !void {
+        return self.failWithDetails(code, message, retryable, metadata, null);
+    }
+
+    /// Preserves both public-header metadata and public body violations when
+    /// forwarding or replaying a typed service failure.
+    pub fn failWithDetails(
+        self: *ResponseSink,
+        code: service_ipc.ErrorCode,
+        message: []const u8,
+        retryable: bool,
+        metadata: service_ipc.ErrorMetadata,
+        violations: ?[]const service_ipc.FieldViolation,
+    ) !void {
         try self.write(.{
             .version = service_ipc.protocol_version,
             .request_id = self.request_id,
@@ -217,6 +254,7 @@ pub const ResponseSink = struct {
                 .message = message,
                 .retryable = retryable,
                 .metadata = metadata,
+                .violations = violations,
             },
         });
     }
@@ -782,6 +820,37 @@ test "handler failures use a fixed terminal message rather than an error name" {
     try sink.internalFailure();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "internal service error") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "InternalFailure") == null);
+}
+
+test "response sink preserves typed field violations" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var sink = try ResponseSink.init(
+        std.testing.allocator,
+        &output.writer,
+        "0123456789abcdef0123456789abcdef",
+    );
+    const violations = [_]service_ipc.FieldViolation{.{
+        .field = "address",
+        .code = "address_in_use",
+        .message = "Address is already assigned.",
+    }};
+    try sink.failWithViolations(
+        .conflict,
+        "resource conflicts with current state",
+        false,
+        &violations,
+    );
+
+    var framed = std.Io.Reader.fixed(output.written());
+    var storage: [service_ipc.maximum_frame_bytes]u8 = undefined;
+    const body = try service_ipc.readFrame(&framed, &storage);
+    const parsed = try service_ipc.decodeResponseFrame(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "address_in_use",
+        parsed.value.@"error".?.violations.?[0].code,
+    );
 }
 
 test "service socket path is absolute and Linux ucred layout is stable" {

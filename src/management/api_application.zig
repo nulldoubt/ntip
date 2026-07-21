@@ -91,8 +91,7 @@ pub const Application = struct {
     ) !void {
         self.handleRequest(request, request_allocator, response) catch |failure| {
             if (response.terminal or response.poisoned) return failure;
-            const public = publicError(failure);
-            try api_response.fail(response, public.code, public.message, public.retryable);
+            try failMappedRequest(self, request, failure, response);
         };
     }
 
@@ -117,8 +116,7 @@ pub const Application = struct {
     ) !void {
         self.dispatch(request, allocator, response) catch |failure| {
             if (response.terminal or response.poisoned) return failure;
-            const public = publicError(failure);
-            try api_response.fail(response, public.code, public.message, public.retryable);
+            try failMappedRequest(self, request, failure, response);
         };
     }
 
@@ -1719,11 +1717,12 @@ fn forwardCapturedResponse(
         defer parsed.deinit();
         const frame = parsed.value;
         if (frame.@"error") |failure| {
-            try response.failWithMetadata(
+            try response.failWithDetails(
                 failure.code,
                 failure.message,
                 failure.retryable,
                 failure.metadata orelse .{},
+                failure.violations,
             );
         } else {
             try response.send(frame.payload, frame.final);
@@ -1753,11 +1752,12 @@ fn finishIdempotencyReplay(
         if (@intFromEnum(http.statusForError(failure.code)) != replay.status) {
             return error.CorruptIdempotencyState;
         }
-        try response.failWithMetadata(
+        try response.failWithDetails(
             failure.code,
             failure.message,
             failure.retryable,
             failure.metadata orelse .{},
+            failure.violations,
         );
         return;
     }
@@ -1775,7 +1775,353 @@ const PublicError = struct {
     code: service_ipc.ErrorCode,
     message: []const u8,
     retryable: bool = false,
+    violation: ?service_ipc.FieldViolation = null,
 };
+
+fn failMappedRequest(
+    application: *Application,
+    request: service_ipc.Request,
+    failure: anyerror,
+    response: *service_server.ResponseSink,
+) !void {
+    var message_buffer: [512]u8 = undefined;
+    const public = publicErrorForRequest(
+        application.inventory.live,
+        request,
+        failure,
+        &message_buffer,
+    );
+    if (public.violation) |violation| {
+        const violations = [_]service_ipc.FieldViolation{violation};
+        return api_response.failWithViolations(
+            response,
+            public.code,
+            public.message,
+            public.retryable,
+            &violations,
+        );
+    }
+    return api_response.fail(response, public.code, public.message, public.retryable);
+}
+
+fn publicErrorForRequest(
+    live: *const model.Store,
+    request: service_ipc.Request,
+    failure: anyerror,
+    message_buffer: []u8,
+) PublicError {
+    var result = publicError(failure);
+    if (!std.mem.startsWith(u8, request.operation, "inventory.")) return result;
+    result.violation = inventoryViolation(live, request, failure, message_buffer);
+    return result;
+}
+
+const RequestedNodeState = struct {
+    id: ?model.NodeId,
+    vnr: *const model.Vnr,
+    address: model.Ipv4,
+};
+
+const RequestedRouteState = struct {
+    id: ?model.RouteId,
+    prefix: model.Cidr,
+};
+
+fn inventoryViolation(
+    live: *const model.Store,
+    request: service_ipc.Request,
+    failure: anyerror,
+    message_buffer: []u8,
+) ?service_ipc.FieldViolation {
+    const node_mutation = isNodeMutation(request.operation);
+    const vnr_mutation = isVnrMutation(request.operation);
+    const route_mutation = isRouteMutation(request.operation);
+
+    if (failure == error.InvalidAddress and node_mutation) return .{
+        .field = "address",
+        .code = "invalid_ipv4_address",
+        .message = "Address must be canonical dotted-decimal IPv4.",
+    };
+    if (failure == error.InvalidCidr and (vnr_mutation or route_mutation)) {
+        return invalidCidrViolation(request, if (route_mutation) "prefix" else "cidr");
+    }
+    if ((failure == error.InvalidVnrPrefix and vnr_mutation) or
+        (failure == error.InvalidRoutePrefix and route_mutation)) return .{
+        .field = if (route_mutation) "prefix" else "cidr",
+        .code = "prefix_out_of_range",
+        .message = "The IPv4 prefix length is outside the permitted range.",
+    };
+    if ((failure == error.InvalidVnrRange and vnr_mutation) or
+        (failure == error.InvalidRouteRange and route_mutation)) return .{
+        .field = if (route_mutation) "prefix" else "cidr",
+        .code = "range_reserved",
+        .message = "The range overlaps reserved IPv4 address space.",
+    };
+
+    if (failure == error.AddressInUse and node_mutation) {
+        const requested = requestedNodeState(live, request) orelse return .{
+            .field = "address",
+            .code = "address_in_use",
+            .message = "Address is already assigned.",
+        };
+        const message = for (live.nodes.items) |node| {
+            if (node.address.value != requested.address.value) continue;
+            if (requested.id) |id| if (node.id.eql(id)) continue;
+            break formatMessage(
+                message_buffer,
+                "Address is already assigned to Node \"{s}\".",
+                .{node.name.slice()},
+                "Address is already assigned.",
+            );
+        } else "Address is already assigned.";
+        return .{ .field = "address", .code = "address_in_use", .message = message };
+    }
+    if (failure == error.NodeAddressOutsideVnr and node_mutation) return .{
+        .field = "address",
+        .code = "address_outside_vnr",
+        .message = "Address must be a usable host inside the selected VNR.",
+    };
+    if (failure == error.NodeAddressReserved and node_mutation) {
+        const requested = requestedNodeState(live, request) orelse return null;
+        const range = requested.vnr.range;
+        const code: []const u8 = if (requested.address.value == range.network.value)
+            "address_reserved_network"
+        else if (requested.address.value == requested.vnr.masterAddress().value)
+            "address_reserved_master"
+        else if (requested.address.value == range.broadcast().value)
+            "address_reserved_broadcast"
+        else
+            return null;
+        const message: []const u8 = if (std.mem.eql(u8, code, "address_reserved_network"))
+            "The VNR network address cannot be assigned to a Node."
+        else if (std.mem.eql(u8, code, "address_reserved_master"))
+            "The VNR Master address cannot be assigned to a Node."
+        else
+            "The VNR broadcast address cannot be assigned to a Node.";
+        return .{ .field = "address", .code = code, .message = message };
+    }
+
+    if (failure == error.VnrOverlap and vnr_mutation) {
+        const range = requestedCidr(request, "cidr") orelse return .{
+            .field = "cidr",
+            .code = "range_overlaps_vnr",
+            .message = "The range overlaps another VNR.",
+        };
+        const target_name = requestedVnrName(request);
+        const message = for (live.vnrs.items) |vnr| {
+            if (target_name) |name| if (vnr.name.eqlSlice(name)) continue;
+            if (!vnr.range.overlaps(range)) continue;
+            break formatMessage(
+                message_buffer,
+                "The range overlaps VNR \"{s}\".",
+                .{vnr.name.slice()},
+                "The range overlaps another VNR.",
+            );
+        } else "The range overlaps another VNR.";
+        return .{ .field = "cidr", .code = "range_overlaps_vnr", .message = message };
+    }
+    if (failure == error.RouteOverlap and route_mutation) {
+        const requested = requestedRouteState(live, request) orelse return .{
+            .field = "prefix",
+            .code = "range_overlaps_route",
+            .message = "The range overlaps another route.",
+        };
+        const message = overlappingRouteMessage(live, requested, message_buffer);
+        return .{ .field = "prefix", .code = "range_overlaps_route", .message = message };
+    }
+    if (failure == error.RouteOverlapsVnr) {
+        if (route_mutation) {
+            const requested = requestedRouteState(live, request) orelse return .{
+                .field = "prefix",
+                .code = "range_overlaps_vnr",
+                .message = "The range overlaps a VNR.",
+            };
+            const message = for (live.vnrs.items) |vnr| {
+                if (!vnr.range.overlaps(requested.prefix)) continue;
+                break formatMessage(
+                    message_buffer,
+                    "The range overlaps VNR \"{s}\".",
+                    .{vnr.name.slice()},
+                    "The range overlaps a VNR.",
+                );
+            } else "The range overlaps a VNR.";
+            return .{ .field = "prefix", .code = "range_overlaps_vnr", .message = message };
+        }
+        if (vnr_mutation) {
+            const range = requestedCidr(request, "cidr") orelse return .{
+                .field = "cidr",
+                .code = "range_overlaps_route",
+                .message = "The range overlaps a route.",
+            };
+            const message = for (live.routes.items) |route| {
+                if (!route.prefix.overlaps(range)) continue;
+                break formatMessage(
+                    message_buffer,
+                    "The range overlaps a route owned by Node \"{s}\".",
+                    .{route.node.slice()},
+                    "The range overlaps a route.",
+                );
+            } else "The range overlaps a route.";
+            return .{ .field = "cidr", .code = "range_overlaps_route", .message = message };
+        }
+    }
+    if (failure == error.NodeAddressOutsideVnr and vnr_mutation) {
+        const range = requestedCidr(request, "cidr") orelse return .{
+            .field = "cidr",
+            .code = "range_excludes_node",
+            .message = "The range excludes an existing Node address.",
+        };
+        const name = requestedVnrName(request) orelse return null;
+        const message = for (live.nodes.items) |node| {
+            if (!node.vnr.eqlSlice(name) or range.contains(node.address)) continue;
+            break formatMessage(
+                message_buffer,
+                "The range excludes Node \"{s}\".",
+                .{node.name.slice()},
+                "The range excludes an existing Node address.",
+            );
+        } else "The range excludes an existing Node address.";
+        return .{ .field = "cidr", .code = "range_excludes_node", .message = message };
+    }
+    if (failure == error.NodeAddressReserved and vnr_mutation) {
+        const range = requestedCidr(request, "cidr") orelse return .{
+            .field = "cidr",
+            .code = "range_reserves_node_address",
+            .message = "The range reserves an existing Node address.",
+        };
+        const name = requestedVnrName(request) orelse return null;
+        const master = range.firstUsable() orelse return null;
+        const message = for (live.nodes.items) |node| {
+            if (!node.vnr.eqlSlice(name)) continue;
+            if (range.isUsableHost(node.address) and node.address.value != master.value) continue;
+            break formatMessage(
+                message_buffer,
+                "The range would reserve Node \"{s}\"'s address.",
+                .{node.name.slice()},
+                "The range reserves an existing Node address.",
+            );
+        } else "The range reserves an existing Node address.";
+        return .{ .field = "cidr", .code = "range_reserves_node_address", .message = message };
+    }
+    return null;
+}
+
+fn invalidCidrViolation(request: service_ipc.Request, field: []const u8) service_ipc.FieldViolation {
+    const text = requestBodyString(request, field);
+    const code: []const u8 = if (text) |value| classify: {
+        _ = model.Cidr.parse(value) catch |failure| break :classify switch (failure) {
+            error.NonCanonicalIpv4, error.NonCanonicalCidr => "noncanonical_ipv4_cidr",
+            error.InvalidPrefix => "prefix_out_of_range",
+            error.InvalidIpv4, error.InvalidCidr => "invalid_ipv4_cidr",
+        };
+        break :classify "invalid_ipv4_cidr";
+    } else "invalid_ipv4_cidr";
+    const message: []const u8 = if (std.mem.eql(u8, code, "noncanonical_ipv4_cidr"))
+        "The IPv4 range must use canonical network notation."
+    else if (std.mem.eql(u8, code, "prefix_out_of_range"))
+        "The IPv4 prefix length is outside the permitted range."
+    else
+        "The value must be a valid IPv4 CIDR.";
+    return .{ .field = field, .code = code, .message = message };
+}
+
+fn requestedNodeState(live: *const model.Store, request: service_ipc.Request) ?RequestedNodeState {
+    const forwarded = api_request.decode(request.payload) catch return null;
+    const body = forwarded.body orelse return null;
+    const address_text = bodyString(body, "address");
+    const vnr_text = bodyString(body, "vnrName");
+    if (std.mem.eql(u8, request.operation, "inventory.node.create")) {
+        const address = model.Ipv4.parse(address_text orelse return null) catch return null;
+        const vnr = live.findVnr(vnr_text orelse return null) orelse return null;
+        return .{ .id = null, .vnr = vnr, .address = address };
+    }
+    if (!std.mem.eql(u8, request.operation, "inventory.node.update")) return null;
+    const id_text = api_request.pathParameter(forwarded.target, "/api/v1/nodes/", "") catch return null;
+    const id = model.NodeId.parse(id_text) catch return null;
+    const current = live.findNodeById(id) orelse return null;
+    const address = if (address_text) |value| model.Ipv4.parse(value) catch return null else current.address;
+    const vnr = live.findVnr(vnr_text orelse current.vnr.slice()) orelse return null;
+    return .{ .id = id, .vnr = vnr, .address = address };
+}
+
+fn requestedRouteState(live: *const model.Store, request: service_ipc.Request) ?RequestedRouteState {
+    const forwarded = api_request.decode(request.payload) catch return null;
+    const body = forwarded.body orelse return null;
+    const prefix_text = bodyString(body, "prefix");
+    if (std.mem.eql(u8, request.operation, "inventory.route.create")) return .{
+        .id = null,
+        .prefix = model.Cidr.parse(prefix_text orelse return null) catch return null,
+    };
+    if (!std.mem.eql(u8, request.operation, "inventory.route.update")) return null;
+    const id_text = api_request.pathParameter(forwarded.target, "/api/v1/routes/", "") catch return null;
+    const id = model.RouteId.parse(id_text) catch return null;
+    const current = live.findRouteById(id) orelse return null;
+    const prefix = if (prefix_text) |value| model.Cidr.parse(value) catch return null else current.prefix;
+    return .{ .id = id, .prefix = prefix };
+}
+
+fn requestedCidr(request: service_ipc.Request, field: []const u8) ?model.Cidr {
+    return model.Cidr.parse(requestBodyString(request, field) orelse return null) catch null;
+}
+
+fn requestedVnrName(request: service_ipc.Request) ?[]const u8 {
+    if (!std.mem.eql(u8, request.operation, "inventory.vnr.update")) return null;
+    const forwarded = api_request.decode(request.payload) catch return null;
+    return api_request.pathParameter(forwarded.target, "/api/v1/vnrs/", "") catch null;
+}
+
+fn requestBodyString(request: service_ipc.Request, field: []const u8) ?[]const u8 {
+    const forwarded = api_request.decode(request.payload) catch return null;
+    const body = forwarded.body orelse return null;
+    return bodyString(body, field);
+}
+
+fn bodyString(body: std.json.Value, field: []const u8) ?[]const u8 {
+    if (body != .object) return null;
+    const value = body.object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn overlappingRouteMessage(
+    live: *const model.Store,
+    requested: RequestedRouteState,
+    message_buffer: []u8,
+) []const u8 {
+    return for (live.routes.items) |route| {
+        if (requested.id) |id| if (route.id.eql(id)) continue;
+        if (!route.prefix.overlaps(requested.prefix)) continue;
+        break formatMessage(
+            message_buffer,
+            "The range overlaps a route owned by Node \"{s}\".",
+            .{route.node.slice()},
+            "The range overlaps another route.",
+        );
+    } else "The range overlaps another route.";
+}
+
+fn formatMessage(
+    buffer: []u8,
+    comptime format: []const u8,
+    arguments: anytype,
+    fallback: []const u8,
+) []const u8 {
+    return std.fmt.bufPrint(buffer, format, arguments) catch fallback;
+}
+
+fn isNodeMutation(operation: []const u8) bool {
+    return std.mem.eql(u8, operation, "inventory.node.create") or
+        std.mem.eql(u8, operation, "inventory.node.update");
+}
+
+fn isVnrMutation(operation: []const u8) bool {
+    return std.mem.eql(u8, operation, "inventory.vnr.create") or
+        std.mem.eql(u8, operation, "inventory.vnr.update");
+}
+
+fn isRouteMutation(operation: []const u8) bool {
+    return std.mem.eql(u8, operation, "inventory.route.create") or
+        std.mem.eql(u8, operation, "inventory.route.update");
+}
 
 fn failPrecondition(response: *service_server.ResponseSink, etag: []const u8) !void {
     const public = publicError(error.PreconditionFailed);
@@ -1870,10 +2216,14 @@ fn publicError(failure: anyerror) PublicError {
         error.OneTimeResponseAlreadyIssued,
         error.VnrExists,
         error.NodeExists,
+        error.NodeIdInUse,
+        error.PublicKeyInUse,
         error.RouteExists,
+        error.RouteIdInUse,
         error.NodeAlreadyEnrolled,
         error.MaximumNodesExceeded,
         error.NoChanges,
+        error.AddressInUse,
         => .{ .code = .conflict, .message = "resource conflicts with current state" },
         error.IdempotencyConflict => .{
             .code = .idempotency_conflict,
@@ -1883,12 +2233,22 @@ fn publicError(failure: anyerror) PublicError {
             .code = .idempotency_conflict,
             .message = "operation committed but its original response is unavailable",
         },
+        error.VnrInUse => .{
+            .code = .invariant_violation,
+            .message = "VNR must have no Nodes before deletion",
+        },
+        error.NodeHasRoutes => .{
+            .code = .invariant_violation,
+            .message = "Node must own no routes before deletion",
+        },
         error.FinalSuperuserRequired,
         error.VnrOverlap,
         error.RouteOverlap,
         error.RouteOverlapsVnr,
         error.NodeAddressReserved,
         error.NodeAddressOutsideVnr,
+        error.InvalidVnrRange,
+        error.InvalidRouteRange,
         => .{ .code = .invariant_violation, .message = "domain invariant would be violated" },
         error.OperationUnavailable => .{
             .code = .operation_unavailable,
@@ -1909,6 +2269,9 @@ fn publicError(failure: anyerror) PublicError {
         error.InvalidCidr,
         error.InvalidAddress,
         error.InvalidName,
+        error.InvalidVnrPrefix,
+        error.InvalidRoutePrefix,
+        error.InvalidPublicKey,
         error.InvalidEnrollmentState,
         error.InvalidLivenessState,
         error.InvalidRole,
@@ -2772,8 +3135,199 @@ test "public error mapping never exposes internal error names" {
     try std.testing.expectEqual(service_ipc.ErrorCode.invalid_credentials, publicError(error.InvalidCredentials).code);
     try std.testing.expectEqual(service_ipc.ErrorCode.authentication_required, publicError(error.SessionExpired).code);
     try std.testing.expectEqual(service_ipc.ErrorCode.conflict, publicError(error.MaximumNodesExceeded).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.conflict, publicError(error.AddressInUse).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.validation_failed, publicError(error.InvalidVnrPrefix).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.validation_failed, publicError(error.InvalidRoutePrefix).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.invariant_violation, publicError(error.InvalidVnrRange).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.invariant_violation, publicError(error.InvalidRouteRange).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.invariant_violation, publicError(error.VnrInUse).code);
+    try std.testing.expectEqual(service_ipc.ErrorCode.invariant_violation, publicError(error.NodeHasRoutes).code);
     try std.testing.expectEqual(service_ipc.ErrorCode.internal_error, publicError(error.SecretInternalFailure).code);
     try std.testing.expectEqualStrings("internal service error", publicError(error.SecretInternalFailure).message);
+}
+
+test "expected inventory mutation failures never collapse to internal error" {
+    const expected = [_]anyerror{
+        error.InvalidName,
+        error.InvalidVnrPrefix,
+        error.InvalidVnrRange,
+        error.InvalidRoutePrefix,
+        error.InvalidRouteRange,
+        error.VnrExists,
+        error.VnrNotFound,
+        error.VnrOverlap,
+        error.VnrInUse,
+        error.NodeExists,
+        error.NodeIdInUse,
+        error.NodeAlreadyEnrolled,
+        error.InvalidEnrollmentState,
+        error.PublicKeyInUse,
+        error.InvalidPublicKey,
+        error.NodeNotFound,
+        error.NodeAddressOutsideVnr,
+        error.NodeAddressReserved,
+        error.AddressInUse,
+        error.NodeHasRoutes,
+        error.RouteExists,
+        error.RouteIdInUse,
+        error.RouteNotFound,
+        error.RouteOverlap,
+        error.RouteOverlapsVnr,
+    };
+    for (expected) |failure| {
+        try std.testing.expect(publicError(failure).code != .internal_error);
+    }
+}
+
+test "inventory address failures map to stable field violations" {
+    var live = model.Store.init(std.testing.allocator);
+    defer live.deinit();
+    _ = try live.createVnr("core", try model.Cidr.parse("10.42.0.0/24"));
+    try live.createNode(
+        .{ .bytes = .{0x11} ** 16 },
+        "edge-a",
+        "core",
+        try model.Ipv4.parse("10.42.0.2"),
+    );
+
+    const duplicate_payload = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"method\":\"POST\",\"target\":\"/api/v1/nodes\",\"proxyPeer\":\"loopback\",\"body\":{\"name\":\"edge-b\",\"vnrName\":\"core\",\"address\":\"10.42.0.2\"}}",
+        .{},
+    );
+    defer duplicate_payload.deinit();
+    const duplicate_request: service_ipc.Request = .{
+        .version = service_ipc.protocol_version,
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .deadline_unix_ms = 1,
+        .operation = "inventory.node.create",
+        .actor = .{ .kind = .service },
+        .payload = duplicate_payload.value,
+    };
+    var message_buffer: [512]u8 = undefined;
+    const duplicate = publicErrorForRequest(
+        &live,
+        duplicate_request,
+        error.AddressInUse,
+        &message_buffer,
+    );
+    try std.testing.expectEqual(service_ipc.ErrorCode.conflict, duplicate.code);
+    try std.testing.expectEqualStrings("address", duplicate.violation.?.field);
+    try std.testing.expectEqualStrings("address_in_use", duplicate.violation.?.code);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate.violation.?.message, "edge-a") != null);
+
+    const master_payload = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"method\":\"POST\",\"target\":\"/api/v1/nodes\",\"proxyPeer\":\"loopback\",\"body\":{\"name\":\"edge-b\",\"vnrName\":\"core\",\"address\":\"10.42.0.1\"}}",
+        .{},
+    );
+    defer master_payload.deinit();
+    var master_request = duplicate_request;
+    master_request.payload = master_payload.value;
+    const master = publicErrorForRequest(
+        &live,
+        master_request,
+        error.NodeAddressReserved,
+        &message_buffer,
+    );
+    try std.testing.expectEqual(service_ipc.ErrorCode.invariant_violation, master.code);
+    try std.testing.expectEqualStrings("address_reserved_master", master.violation.?.code);
+}
+
+test "inventory CIDR failures use operation-specific stable fields and codes" {
+    var live = model.Store.init(std.testing.allocator);
+    defer live.deinit();
+    const payload = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"method\":\"POST\",\"target\":\"/api/v1/vnrs\",\"proxyPeer\":\"loopback\",\"body\":{\"name\":\"core\",\"cidr\":\"10.42.0.1/24\"}}",
+        .{},
+    );
+    defer payload.deinit();
+    const request: service_ipc.Request = .{
+        .version = service_ipc.protocol_version,
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .deadline_unix_ms = 1,
+        .operation = "inventory.vnr.create",
+        .actor = .{ .kind = .service },
+        .payload = payload.value,
+    };
+    var message_buffer: [512]u8 = undefined;
+    const failure = publicErrorForRequest(&live, request, error.InvalidCidr, &message_buffer);
+    try std.testing.expectEqual(service_ipc.ErrorCode.validation_failed, failure.code);
+    try std.testing.expectEqualStrings("cidr", failure.violation.?.field);
+    try std.testing.expectEqualStrings("noncanonical_ipv4_cidr", failure.violation.?.code);
+}
+
+test "captured and replayed service failures preserve field violations" {
+    const request_id = "0123456789abcdef0123456789abcdef";
+    const violations = [_]service_ipc.FieldViolation{.{
+        .field = "address",
+        .code = "address_in_use",
+        .message = "Address is already assigned.",
+    }};
+    var captured: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer captured.deinit();
+    var capture_sink = try service_server.ResponseSink.init(
+        std.testing.allocator,
+        &captured.writer,
+        request_id,
+    );
+    try capture_sink.failWithViolations(
+        .conflict,
+        "resource conflicts with current state",
+        false,
+        &violations,
+    );
+
+    var forwarded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer forwarded.deinit();
+    var forward_sink = try service_server.ResponseSink.init(
+        std.testing.allocator,
+        &forwarded.writer,
+        request_id,
+    );
+    try forwardCapturedResponse(std.testing.allocator, captured.written(), &forward_sink);
+    var forwarded_reader = std.Io.Reader.fixed(forwarded.written());
+    var forwarded_storage: [service_ipc.maximum_frame_bytes]u8 = undefined;
+    const forwarded_bytes = try service_ipc.readFrame(&forwarded_reader, &forwarded_storage);
+    const forwarded_frame = try service_ipc.decodeResponseFrame(std.testing.allocator, forwarded_bytes);
+    defer forwarded_frame.deinit();
+    try std.testing.expectEqualStrings(
+        "address_in_use",
+        forwarded_frame.value.@"error".?.violations.?[0].code,
+    );
+
+    const summary = try inspectCapturedResponse(std.testing.allocator, captured.written());
+    const replay_body = summary.replay_payload.?;
+    defer std.testing.allocator.free(replay_body);
+    try std.testing.expectEqual(@as(u16, 409), summary.status);
+
+    var replayed: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer replayed.deinit();
+    var replay_sink = try service_server.ResponseSink.init(
+        std.testing.allocator,
+        &replayed.writer,
+        request_id,
+    );
+    try finishIdempotencyReplay(
+        &replay_sink,
+        std.testing.allocator,
+        "inventory.node.create",
+        .{ .status = 409, .body = replay_body, .created_at = 1, .expires_at = 2 },
+    );
+
+    var reader = std.Io.Reader.fixed(replayed.written());
+    var storage: [service_ipc.maximum_frame_bytes]u8 = undefined;
+    const frame_bytes = try service_ipc.readFrame(&reader, &storage);
+    const frame = try service_ipc.decodeResponseFrame(std.testing.allocator, frame_bytes);
+    defer frame.deinit();
+    try std.testing.expectEqualStrings(
+        "address_in_use",
+        frame.value.@"error".?.violations.?[0].code,
+    );
 }
 
 test "access resource ETags are strong exact preconditions" {

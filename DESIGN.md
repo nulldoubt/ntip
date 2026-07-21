@@ -85,6 +85,72 @@ Navigation is permanently visible at supported desktop sizes. Below 1024px the
 application renders an explicit unsupported-size state rather than a compressed
 or partially functional mobile console.
 
+## Segmented Network Inputs and Actionable Errors
+
+IPv4 addresses and CIDRs use one owned, selection-only control composed from
+four Radix-backed `Select` segments. Operators cannot type or paste an address;
+every emitted octet is canonical decimal without leading zeroes. Periods and
+the CIDR slash are inert separators, while the control exposes one group label
+and a distinct accessible label for each octet and the prefix selector.
+
+The option set communicates the network constraint instead of accepting an
+arbitrary string and rejecting it later:
+
+- A fixed octet has exactly one feasible value. Show that value and disable its
+  segment; never hide it or present a false choice.
+- A variable octet lists only values with at least one valid downstream
+  completion. Selecting an upstream octet chooses the lowest compatible
+  downstream completion so the control never enters a fabricated half-state.
+- A partial-octet VNR derives its real host span. For example, a `/20` Node
+  selector admits third-octet values from the VNR's aligned 16-value interval,
+  then filters each later choice against reservations and allocations.
+- Node availability comes from the current topology without enumerating the
+  CIDR. Network, Master, broadcast, and allocated addresses are unavailable;
+  an edited Node's current address remains selectable. A new selection starts
+  at the lowest free address.
+
+CIDR controls apply separate network-boundary rules. VNR prefixes are `/1`
+through `/30`; a new VNR shows `/24` as the prefix but leaves all four octets
+blank. Route prefixes are `/1` through `/32`, and a new route leaves both the
+octets and prefix blank. On a partial boundary such as `/20`, the boundary
+octet offers only aligned multiples of 16 and host-only octets are fixed at
+zero.
+
+Changing a prefix never silently zeroes visible host bits. If an existing
+octet is no longer a canonical network boundary, retain it visibly as a
+disabled, invalid option, set the form value to unavailable, and announce
+`host_bits_set` inline. The operator must explicitly select a valid boundary
+before submission. A retained-invalid value cannot be selected again.
+
+Keyboard behavior follows the owned Radix primitives: Tab reaches each
+variable segment, arrow keys traverse options, Escape closes the popover, and
+focus remains visibly outlined. Fixed segments are skipped because they are
+disabled. `aria-describedby` connects help and field errors to every affected
+trigger; `aria-invalid` marks the exact segment and prefix state. Screen-reader
+announcements describe loading, automatic lowest-free selection, collisions,
+and exhaustion without relying on color. Reduced-motion mode removes
+nonessential timing from popovers, focus changes, and status transitions.
+
+After a failed mutation, preserve the operator's entries, move programmatic
+focus to the error summary, and repeat each structured field violation beside
+its control. Show the response request ID in monospace for support correlation.
+The HTTP status and top-level error code remain authoritative; unknown additive
+violation codes still render their safe message instead of collapsing the
+form.
+
+An `address_in_use` collision is a special recovery path. Refresh topology,
+remove the rejected address from the available set even if the refreshed
+projection briefly lags, choose the next lowest free address, and announce the
+change assertively. Never resubmit automatically: the operator reviews the new
+address and initiates a new mutation with a new idempotency key. If the refresh
+finds no free address, show an exhausted warning and disable submission.
+
+Loading and unavailable topology states replace the Node address control with
+plain status text and disable VNR/address submission. A VNR with no usable host
+shows a specific exhausted state rather than an empty menu. Never invent or
+submit a substitute value while topology is unavailable; an unavailable
+snapshot must not be presented as proof that an address is free.
+
 ## Mock Fidelity Inventory
 
 The implementation must preserve these visible ingredients from the approved
@@ -136,6 +202,14 @@ responses.
   preferences suppress nonessential transition duration. Below 1024 pixels,
   the application displays a clear unsupported-size message instead of a
   compressed administration surface.
+- VNR, Node, and route inventory forms use segmented selection-only IPv4
+  controls. They preserve noncanonical host bits across prefix changes until
+  the operator corrects them, derive Node choices from fresh topology, and
+  focus actionable summaries that retain field violations and request IDs.
+- Concurrent Node-address allocation refreshes topology and proposes the next
+  lowest free address, but requires an explicit review and resubmission.
+  Loading, unavailable, and exhausted address states disable submission and
+  remain screen-reader-visible.
 - Production-build Playwright verifies the light and dark overview, keyboard
   topology/table parity, the 1023/1024 guard, and automated WCAG 2.2 AA checks
   for login and authenticated overview surfaces.
@@ -147,6 +221,9 @@ responses.
 - **Do** make freshness, uncertainty, permission, and pending state explicit.
 - **Do** pair every semantic color with readable text and a second visual cue.
 - **Do** use deterministic layout, stable columns, and familiar form controls.
+- **Do** keep network constraints visible through fixed, variable, invalid,
+  loading, and exhausted segment states.
+- **Do** preserve request IDs and require review after a collision refresh.
 - **Do** use opacity and transform transitions lasting roughly 150 to 200ms.
 - **Do** keep advanced and destructive actions in dedicated secondary flows.
 
@@ -161,5 +238,7 @@ responses.
   controls.
 - **Don't** hide destructive behavior, use vague confirmation copy, or rely on
   color-only status.
+- **Don't** accept free-text IPv4 input, silently normalize host bits, or retry
+  a mutation automatically after an allocation collision.
 - **Don't** use gradient text, nested cards, colored side-stripe borders, or
   layout-property animation.

@@ -6,6 +6,8 @@ import {
   operationalSettingFields,
   renderGeneratedArtifacts,
   stableErrorCodes,
+  stableInventoryViolationCodes,
+  stableInventoryViolationFields,
   trafficStates,
   validateContract,
 } from "../scripts/contract.ts";
@@ -37,6 +39,35 @@ describe("NTIP OpenAPI v1", () => {
     const schemas = components.schemas as Record<string, Record<string, unknown>>;
     const errorCodes = schemas.ErrorCode?.enum as string[];
     expect([...errorCodes].sort()).toEqual([...stableErrorCodes]);
+  });
+
+  test("documents stable inventory violations while allowing additive future values", async () => {
+    const document = await loadContract();
+    const schemas = (document.components as Record<string, Record<string, unknown>>).schemas as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const properties = schemas.FieldViolation!.properties as Record<string, Record<string, unknown>>;
+    const fieldDescription = properties.field!.description as string;
+    const codeDescription = properties.code!.description as string;
+
+    expect(properties.code!.enum).toBeUndefined();
+    for (const field of stableInventoryViolationFields) expect(fieldDescription).toContain(`\`${field}\``);
+    for (const code of stableInventoryViolationCodes) expect(codeDescription).toContain(`\`${code}\``);
+  });
+
+  test("keeps inventory error status and top-level code semantics explicit", async () => {
+    const document = await loadContract();
+    const responses = (document.components as Record<string, Record<string, unknown>>).responses as Record<
+      string,
+      Record<string, unknown>
+    >;
+
+    expect(responses.BadRequest!.description).toContain("HTTP 400");
+    expect(responses.BadRequest!.description).toContain("`validation_failed`");
+    expect(responses.Conflict!.description).toContain("HTTP 409");
+    expect(responses.Conflict!.description).toContain("`invariant_violation`");
+    expect(responses.Conflict!.description).toContain("`conflict`");
   });
 
   test("keeps settings aligned with the runtime and SQLite snapshot", async () => {

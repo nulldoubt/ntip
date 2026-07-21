@@ -10,7 +10,7 @@
 const std = @import("std");
 const api_error = @import("error.zig");
 
-pub const protocol_version: u16 = 1;
+pub const protocol_version: u16 = 2;
 pub const frame_prefix_bytes: usize = 4;
 pub const maximum_frame_bytes: usize = 1024 * 1024;
 pub const maximum_operation_bytes: usize = 96;
@@ -57,6 +57,7 @@ pub const Request = struct {
 /// Stable machine-readable failures shared across the private service
 /// boundary. New values may be appended, but existing spellings are API.
 pub const ErrorCode = api_error.Code;
+pub const FieldViolation = api_error.FieldViolation;
 
 /// Bounded response metadata that is safe to expose as public HTTP headers.
 /// Only metadata required by the stable error contract is accepted.
@@ -75,6 +76,7 @@ pub const ErrorBody = struct {
     message: []const u8,
     retryable: bool = false,
     metadata: ?ErrorMetadata = null,
+    violations: ?[]const FieldViolation = null,
 };
 
 pub fn errorMetadataRequirements(code: ErrorCode) ErrorMetadataRequirements {
@@ -178,6 +180,12 @@ pub fn validateResponseFrame(frame: ResponseFrame) !void {
         if (failure.message.len == 0 or failure.message.len > 512 or !isSafeText(failure.message)) {
             return error.InvalidResponseFrame;
         }
+        api_error.validateEnvelopeBounds(
+            frame.request_id,
+            failure.code,
+            failure.message,
+            failure.violations,
+        ) catch return error.InvalidResponseFrame;
         try validateErrorMetadata(failure);
     }
 }
@@ -292,7 +300,7 @@ test "service IPC length prefix is big endian and strictly bounded" {
 
 test "service IPC request JSON is strict, versioned, and carries preconditions" {
     const bytes =
-        \\{"version":1,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1784500000000,"operation":"inventory.node.update","actor":{"kind":"authenticated","user_id":"11111111111111111111111111111111","session_id":"22222222222222222222222222222222","user_agent":"browser"},"preconditions":{"etag":"\"generation-4\"","idempotency_key":"mutation-7","reauthenticated_at_unix_ms":1784499999000,"confirmation":"node-a"},"payload":{"name":"node-a"}}
+        \\{"version":2,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1784500000000,"operation":"inventory.node.update","actor":{"kind":"authenticated","user_id":"11111111111111111111111111111111","session_id":"22222222222222222222222222222222","user_agent":"browser"},"preconditions":{"etag":"\"generation-4\"","idempotency_key":"mutation-7","reauthenticated_at_unix_ms":1784499999000,"confirmation":"node-a"},"payload":{"name":"node-a"}}
     ;
     const parsed = try decodeRequest(std.testing.allocator, bytes);
     defer parsed.deinit();
@@ -300,14 +308,22 @@ test "service IPC request JSON is strict, versioned, and carries preconditions" 
     try std.testing.expectEqualStrings("mutation-7", parsed.value.preconditions.idempotency_key.?);
 
     const duplicate =
-        \\{"version":1,"version":1,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1,"operation":"health.ready","actor":{"kind":"service"},"payload":{}}
+        \\{"version":2,"version":2,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1,"operation":"health.ready","actor":{"kind":"service"},"payload":{}}
     ;
     try std.testing.expectError(error.InvalidRequestJson, decodeRequest(std.testing.allocator, duplicate));
 
     const unknown =
-        \\{"version":1,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1,"operation":"health.ready","actor":{"kind":"service"},"payload":{},"extra":true}
+        \\{"version":2,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1,"operation":"health.ready","actor":{"kind":"service"},"payload":{},"extra":true}
     ;
     try std.testing.expectError(error.InvalidRequestJson, decodeRequest(std.testing.allocator, unknown));
+
+    const old_version =
+        \\{"version":1,"request_id":"0123456789abcdef0123456789abcdef","deadline_unix_ms":1,"operation":"health.ready","actor":{"kind":"service"},"payload":{}}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedProtocolVersion,
+        decodeRequest(std.testing.allocator, old_version),
+    );
 }
 
 test "service IPC validates actors, identifiers, operations, and object payloads" {
@@ -379,4 +395,63 @@ test "service IPC response errors are stable and terminal" {
     try validateResponseFrame(retryable);
     retryable.@"error".?.metadata.?.retry_after_seconds = 0;
     try std.testing.expectError(error.InvalidResponseFrame, validateResponseFrame(retryable));
+}
+
+test "service IPC v2 errors carry strictly bounded field violations" {
+    const valid = FieldViolation{
+        .field = "address",
+        .code = "address_in_use",
+        .message = "Address is already assigned.",
+    };
+    const violations = [_]FieldViolation{valid};
+    const frame: ResponseFrame = .{
+        .version = protocol_version,
+        .request_id = "0123456789abcdef0123456789abcdef",
+        .sequence = 0,
+        .final = true,
+        .@"error" = .{
+            .code = .conflict,
+            .message = "resource conflicts with current state",
+            .violations = &violations,
+        },
+    };
+    const encoded = try encodeResponseFrame(std.testing.allocator, frame);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"code\":\"address_in_use\"") != null);
+
+    const parsed = try decodeResponseFrame(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    const decoded = parsed.value.@"error".?.violations.?;
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("address", decoded[0].field);
+    try std.testing.expectEqualStrings("address_in_use", decoded[0].code);
+
+    var empty = frame;
+    empty.@"error".?.violations = &.{};
+    try std.testing.expectError(error.InvalidResponseFrame, validateResponseFrame(empty));
+
+    const too_many = [_]FieldViolation{valid} ** (api_error.maximum_violations + 1);
+    var oversized = frame;
+    oversized.@"error".?.violations = &too_many;
+    try std.testing.expectError(error.InvalidResponseFrame, validateResponseFrame(oversized));
+
+    const malformed = [_]FieldViolation{.{
+        .field = "address",
+        .code = "Address-In-Use",
+        .message = "Address is already assigned.",
+    }};
+    var invalid_code = frame;
+    invalid_code.@"error".?.violations = &malformed;
+    try std.testing.expectError(error.InvalidResponseFrame, validateResponseFrame(invalid_code));
+
+    const large = FieldViolation{
+        .field = "\\" ** 256,
+        .code = "bounded_violation",
+        .message = "\\" ** api_error.maximum_message_bytes,
+    };
+    const aggregate = [_]FieldViolation{large} ** api_error.maximum_violations;
+    var aggregate_oversized = frame;
+    aggregate_oversized.@"error".?.violations = &aggregate;
+    try std.testing.expectError(error.InvalidResponseFrame, validateResponseFrame(aggregate_oversized));
 }
