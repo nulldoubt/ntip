@@ -4,6 +4,7 @@ import { loadDashboardRuntimeConfig } from "@ntip/config";
 import type { components } from "@ntip/contracts";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { internalApiHeaders } from "@/lib/server-api-headers";
 
 type ErrorResponse = components["schemas"]["ErrorResponse"];
 
@@ -62,15 +63,8 @@ export interface ApiGetResult<T> {
 }
 
 async function sessionHeaders(): Promise<Headers> {
-  const headers = new Headers({ Accept: "application/json" });
   const session = (await cookies()).get(sessionCookieName)?.value;
-
-  // Never reflect the browser cookie jar wholesale into the privileged loopback hop.
-  if (session !== undefined && !/[;\r\n]/.test(session)) {
-    headers.set("Cookie", `${sessionCookieName}=${session}`);
-  }
-
-  return headers;
+  return internalApiHeaders(session);
 }
 
 export async function apiGetResult<T>(path: `/${string}`): Promise<ApiGetResult<T>> {

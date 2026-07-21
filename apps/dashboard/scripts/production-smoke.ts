@@ -64,6 +64,51 @@ try {
   if (authenticated.status !== 200 || !authenticated.body.includes("berlin-gateway") || !authenticated.body.includes("Runtime state")) {
     throw new Error(`authenticated production RSC render failed (${authenticated.status})`);
   }
+
+  const resetMetrics = await fetch(`${harness.controlOrigin}/metrics/reset`, { method: "POST" });
+  if (resetMetrics.status !== 204) throw new Error(`fixture metric reset failed (${resetMetrics.status})`);
+
+  // Activity renders four page reads alongside the protected layout's
+  // /auth/me read. That exceeds the default four ntip-api workers and is the
+  // production regression for idle keep-alive sockets pinning every worker.
+  const activityStartedAt = performance.now();
+  const activity = await request(`${harness.publicOrigin}/activity`, { headers: { Cookie: cookie } });
+  const activityElapsedMilliseconds = performance.now() - activityStartedAt;
+  if (
+    activity.status !== 200 ||
+    !activity.body.includes("Runtime transitions, Master-originated checks, and immutable operator history.")
+  ) {
+    throw new Error(`five-read production RSC render failed (${activity.status})`);
+  }
+  if (activityElapsedMilliseconds >= 8_000) {
+    throw new Error(`five-read production RSC render reached the backend deadline (${Math.round(activityElapsedMilliseconds)} ms)`);
+  }
+
+  const snapshotResponse = await fetch(`${harness.controlOrigin}/snapshot`, { cache: "no-store" });
+  if (!snapshotResponse.ok) throw new Error(`fixture snapshot failed (${snapshotResponse.status})`);
+  const snapshot = await snapshotResponse.json() as {
+    requests: Array<{ method: string; path: string; headers: Record<string, string> }>;
+  };
+  const expectedActivityReads = new Set([
+    "/api/v1/auth/me",
+    "/api/v1/events?limit=50",
+    "/api/v1/connectivity-checks?limit=50",
+    "/api/v1/audit?limit=50",
+    "/api/v1/nodes?limit=200",
+  ]);
+  const activityReads = snapshot.requests.filter((record) => (
+    record.method === "GET" && expectedActivityReads.has(record.path)
+  ));
+  if (activityReads.length !== expectedActivityReads.size) {
+    throw new Error(`five-read production RSC render emitted ${activityReads.length} expected reads`);
+  }
+  for (const expectedPath of expectedActivityReads) {
+    const matches = activityReads.filter((record) => record.path === expectedPath);
+    if (matches.length !== 1) throw new Error(`production RSC read count for ${expectedPath} was ${matches.length}`);
+    if (matches[0]?.headers.connection !== "close") {
+      throw new Error(`production RSC read did not close its loopback connection: ${expectedPath}`);
+    }
+  }
 } finally {
   const exitCode = await harness.close();
   if (exitCode !== 0 && exitCode !== 143) throw new Error(`Next production server did not terminate cleanly (${exitCode})`);

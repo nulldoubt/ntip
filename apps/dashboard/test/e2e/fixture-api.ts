@@ -324,7 +324,7 @@ async function sanitizedBody(request: Request): Promise<unknown> {
 
 function loggedHeaders(request: Request): Readonly<Record<string, string>> {
   const selected: Record<string, string> = {};
-  for (const name of ["origin", "user-agent", "if-match"]) {
+  for (const name of ["origin", "user-agent", "if-match", "connection"]) {
     const value = request.headers.get(name);
     if (value !== null) selected[name] = value;
   }

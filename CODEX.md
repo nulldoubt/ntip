@@ -10,12 +10,11 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: segmented inventory inputs and actionable management
-  errors are implemented, pass the complete local release gate, and are live
-  on the native x86_64 vps02 Master. Settled-tree backend, contract, dashboard,
-  browser, production-runtime, archive, SBOM, secret-exposure, online-backup,
-  same-origin HTTPS, service, inventory-preservation, and native-execution
-  proofs pass.
+- Current milestone: the segmented inventory/error milestone remains live on
+  native x86_64 vps02. A follow-up fix for pre-existing dashboard-to-API
+  keep-alive worker starvation is implemented and passes unit, typecheck, lint,
+  exact-Bun production smoke, build, and 19/19 browser journeys; its rebuilt
+  dashboard archive and live redeployment remain pending.
 - SQLite schema version: `1`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -25,8 +24,9 @@ security policy, or milestone status.
   removing a public path, operation, or schema shape.
 - Dashboard: Direction A implementation present as a pinned Bun 1.3.14 /
   Next.js 16.2.10 standalone service. The current segmented-input/actionable-
-  error tree passes typecheck, lint, 37/37 unit tests, the 12-route production
-  build, exact-Bun runtime smoke, and 19/19 Playwright journeys.
+  error/connection-lifecycle tree passes typecheck, lint, 40/40 unit tests, the
+  12-route production build, exact-Bun runtime smoke, and 19/19 Playwright
+  journeys.
 - Last verified commit: `d5ae54d2b89f5157472510e0dfc3c4337d5fb639`
   (segmented network inputs and actionable inventory errors)
 - Last verified implementation: commit `d5ae54d2b89f5157472510e0dfc3c4337d5fb639`;
@@ -48,7 +48,7 @@ security policy, or milestone status.
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
 - Proof commands: `zig build check --summary all` (429/429 aggregate tests)
   and `zig build test --summary all` (420/420) pass for the current backend
-  slice; dashboard typecheck, lint, tests (37/37), production build, exact-Bun
+  slice; dashboard typecheck, lint, tests (40/40), production build, exact-Bun
   runtime smoke, and Playwright (19/19) pass. Settled-tree contract validation,
   typecheck, lint, generated-artifact drift, and 13/13 tests pass. The three
   x86_64 release archives pass structure and SBOM checks, and the combined
@@ -185,12 +185,17 @@ read-only with an accessible table equivalent.
 
 The deployed page service binds only to loopback. Initial Server Component
 reads forward only the named session cookie to the loopback API with
-`Cache-Control: no-store`; browser reads and mutations use same-origin
-`/api/v1`. The operator TLS proxy routes pages to the dashboard and `/api/v1`
-directly to `ntip-api`. Next defines no `/api/v1` rewrite or fallback, so a
-proxy routing error fails visibly instead of silently using a build-time API
-destination that can disagree with runtime `api_origin`. The dashboard owns no
-state, database handle, or Unix socket access.
+`Cache-Control: no-store` and `Connection: close`; browser reads and mutations
+use same-origin `/api/v1`. Closing the trusted internal HTTP/1.1 hop prevents
+idle keep-alive sockets from pinning `ntip-api`'s fixed connection-owning
+workers when a Server Component render emits more parallel reads than the
+worker count. The operator TLS proxy routes pages to the dashboard and
+`/api/v1` directly to `ntip-api`; its API upstream must likewise avoid a
+persistent pooled connection per worker in v0.2. Next defines no `/api/v1`
+rewrite or fallback, so a proxy routing error fails visibly instead of
+silently using a build-time API destination that can disagree with runtime
+`api_origin`. The dashboard owns no state, database handle, or Unix socket
+access.
 
 ## Decision Log
 
@@ -218,6 +223,10 @@ state, database handle, or Unix socket access.
   pinned Bun runtime. Its `x86_64-linux`/`aarch64-linux` artifacts use Bun's
   glibc builds while core/API remain static-musl. Release is blocked if the
   exact Bun/Next combination fails production smoke tests.
+- Dashboard Server Component reads explicitly close their direct loopback
+  HTTP/1.1 connection after each response. Raising worker counts or serializing
+  individual pages is not a correctness fix for a worker pool whose idle
+  keep-alive sockets own admission capacity.
 
 ### Implemented
 
@@ -251,6 +260,12 @@ state, database handle, or Unix socket access.
   login redirect. This prevents parallel layout/page rendering from logging a
   child `ApiError`; `/auth/me` remains the authorization source and cookie
   presence alone still grants nothing.
+- The server-only internal API header builder now preserves only JSON Accept
+  and the validated named session cookie while adding `Connection: close`.
+  Unit tests lock the trust-boundary header set, and the pinned-Bun production
+  smoke renders five concurrent Activity reads and verifies that every raw
+  fixture request received the close directive before the eight-second
+  dashboard deadline.
 - Private service IPC advances to v2; its only frame-shape extension is
   optional, strictly bounded field violations on terminal errors. `ntsrv` maps
   domain errors before framing, `ntip-api` validates and forwards the exact
@@ -658,6 +673,20 @@ state, database handle, or Unix socket access.
   SHA-256 fingerprint
   `6F:6F:EF:3E:CB:7B:A6:B6:EE:EF:56:F5:BA:F7:56:36:CD:67:23:0E:05:34:56:39:B7:AA:AC:D8:80:F6:DC:5E`.
 
+### Follow-up deployment pending
+
+- Post-rollout Node creation committed `test01` successfully, but its immediate
+  detail render exposed the pre-existing bounded-worker starvation failure:
+  five parallel Server Component reads competed for four workers whose idle
+  HTTP/1.1 keep-alive sockets remained owned for up to ten seconds. The
+  dashboard surfaced its generic fallback after its eight-second deadline even
+  though the exact Node-detail API read remained healthy at about 60 ms.
+- Pinned Bun 1.3.14 reproduced three eight-second timeouts in the five-read
+  burst. The same burst with `Connection: close` completed all five reads in
+  6-14 ms. The repository fix and on-wire production smoke pass; rebuild,
+  archive validation, dashboard-only deployment, and live Node-detail recovery
+  remain pending.
+
 ### Deferred or out of scope
 
 - SSO, MFA, API tokens, SSE/WebSockets, mobile administration, Node software
@@ -667,6 +696,10 @@ state, database handle, or Unix socket access.
   the narrow interval between persisted `202` completion and in-memory arming.
   The accepted in-process path remains audited, response-ordered, and at-most-
   once; the existing idempotency row prevents re-execution after recovery.
+- Evented idle HTTP connection handling inside `ntip-api`. v0.2 retains its
+  bounded worker-per-connection model and closes dashboard/proxy loopback
+  connections rather than allowing idle keep-alive ownership to consume every
+  worker.
 
 ## Milestones
 
@@ -682,6 +715,8 @@ state, database handle, or Unix socket access.
 - [x] Settled-tree contract, production dashboard, browser, and release-archive
   proof for the segmented-input/actionable-error milestone
 - [x] Live deployment, native x86_64 service, and same-origin verification
+- [x] Dashboard loopback worker-starvation fix and pinned-Bun wire regression
+- [ ] Dashboard-only redeployment and live Node-detail recovery verification
 - [x] Packaging, systemd, CI, documentation, and release evidence
 
 ## Verification Commands
@@ -706,6 +741,7 @@ bun run dashboard:lint
 bun run dashboard:typecheck
 bun run dashboard:test
 bun test ./apps/dashboard/test/unit/segmented-network-input.test.tsx
+bun test ./apps/dashboard/test/unit/server-api-headers.test.ts
 bun run dashboard:build
 bun run dashboard:runtime-smoke
 bun run dashboard:e2e
@@ -734,16 +770,23 @@ Latest evidence:
   contract-conformance coverage.
 - Current integrated dashboard slice: `bun run dashboard:typecheck`,
   `bun run dashboard:lint`, and `bun run dashboard:test` passed; the unit
-  result is 37/37 and includes 14 segmented-network tests for BigInt
+  result is 40/40 and includes 14 segmented-network tests for BigInt
   boundaries, `/20` partial prefixes, `/24` allocation holes, `/30`
   exhaustion, `/16` host/broadcast semantics, retained-invalid host bits,
-  fixed segments, and no parent change callback during render.
+  fixed segments, no parent change callback during render, and three internal
+  header tests for explicit close, anonymous reads, and cookie-delimiter
+  rejection.
 - Settled-tree contract validation, typecheck/lint, generated-artifact drift,
   and 13/13 contract tests pass. The 12-route dashboard production build,
   exact-Bun runtime smoke, and 19/19 Playwright journeys pass on the same tree.
   The core and API x86_64 static-musl archives and dashboard x86_64 glibc
   archive pass contract/SBOM checks; source and all 3,333 archive members pass
   the secret-exposure scan.
+- The current pinned-Bun production smoke renders Activity through the exact
+  standalone launcher, observes the protected layout plus four page reads,
+  requires all five raw fixture requests to carry `Connection: close`, and
+  finishes before the eight-second backend deadline. The same settled tree
+  passes the 12-route build and 19/19 Playwright journeys.
 - Commit `d5ae54d2b89f5157472510e0dfc3c4337d5fb639` was deployed as a matched
   service set on native x86_64 vps02 after the online backup recorded above.
   All management services, the loopback API/dashboard listeners, raw-IP nginx
