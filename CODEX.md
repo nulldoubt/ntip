@@ -10,11 +10,12 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: the segmented inventory/error milestone and the follow-up
-  dashboard-to-API connection-lifecycle fix are live on native x86_64 vps02.
-  The fix passes unit, typecheck, lint, exact-Bun production smoke, build,
-  19/19 browser journeys, native archive/launcher validation, dashboard-only
-  deployment, and authenticated live Node-detail and Activity verification.
+- Current milestone: one-command Node bootstrap architecture and threat model
+  accepted; schema 2, Bootstrap v1, Node-only artifacts, installer/import,
+  dashboard disclosure flow, and live reset are in progress on
+  `feat/node-bootstrap`. The currently deployed vps02 state remains the
+  verified schema-1/OpenAPI-1.0.1 segmented-input build until the complete
+  lockstep artifact set passes staging.
 - SQLite schema version: `1`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -22,6 +23,9 @@ security policy, or milestone status.
 - OpenAPI revision: `1.0.1` (`packages/contracts/openapi/ntip-v1.yaml`, 81
   schemas). This revision fixes inventory-error semantics without adding or
   removing a public path, operation, or schema shape.
+- Target contracts for the active milestone: management OpenAPI `1.1.0` plus
+  a separate cookie-independent Bootstrap v1 contract. Neither target is
+  recorded as implemented until generated drift and Zig conformance pass.
 - Dashboard: Direction A implementation present as a pinned Bun 1.3.14 /
   Next.js 16.2.10 standalone service. The current segmented-input/actionable-
   error/connection-lifecycle tree passes typecheck, lint, 40/40 unit tests, the
@@ -141,6 +145,13 @@ are separate projections; transition events default to 90-day retention and
 connectivity results to 30 days. Audit is append-only and has no automatic
 retention.
 
+Schema 2 adds bootstrap invitations without persisting their short code,
+credential secret, bootstrap root key, or encoded internal credential. A row
+retains the permanently unique public locator, random enrollment handle,
+derivation version, lifecycle timestamps, and bounded throttle state; the
+existing enrollment table retains only its derived Noise PSK. Restore revokes
+all restored unused bootstrap-linked credentials before startup.
+
 ### Configuration
 
 Strict bootstrap files retain listeners, TUN identity, service sockets,
@@ -148,6 +159,11 @@ paths, public HTTPS origin, and HTTP capacity limits. SQLite owns revisioned
 operational settings. MTU, liveness, enrollment lifetime, traffic thresholds,
 and retention apply live; maximum Node capacity applies after restart. A
 rollback always creates a new audited revision.
+
+The schema-2 server bootstrap adds one authoritative externally reachable UDP
+endpoint. The schema-2 API bootstrap adds one validated `sha256//...` SPKI pin
+and a root-owned Node-assets manifest path. HTTP Host, forwarded headers, and
+provider-interface discovery never supply installer or protocol authority.
 
 ### Management contract
 
@@ -167,6 +183,19 @@ another Node uses HTTP 409 with top-level `conflict` and violation code
 is not stable, and clients must preserve unknown additive violation codes.
 OpenAPI 1.0.1 documents those existing public shapes and semantics; it does not
 add a public route, operation, schema shape, or Node wire message.
+
+Management OpenAPI 1.1.0 replaces operator-facing long credential issuance
+with atomic Node bootstrap, invitation generation/replacement/revocation,
+reset-plus-bootstrap, and non-secret bootstrap configuration. `POST /nodes`
+remains an inventory-only Operator path. Invitation disclosures are
+superuser-only, recently reauthenticated, confirmed, and non-replayable.
+
+The separate Bootstrap v1 contract exposes locator-specific shell delivery and
+strict anonymous redemption under `/enrollment`; versioned Node assets are
+served directly by the TLS gateway. Redemption is pinned to the configured
+SPKI, bounded and uniformly failing, and reconstructs the unchanged internal
+`ntip-enroll-v1` credential only in memory. `docs/node-bootstrap.md` is the
+normative accepted design.
 
 Roles are:
 
@@ -199,6 +228,13 @@ silently using a build-time API destination that can disagree with runtime
 `api_origin`. The dashboard owns no state, database handle, or Unix socket
 access.
 
+For superusers, Add Node will reauthenticate first and then create the Node and
+invitation atomically. Its pinned success stage discloses the installation
+command and `XXX-XXX-XXX` code once, prevents accidental dismissal, and must
+revoke successfully before a discard can close. Operators keep inventory-only
+creation with a superuser-handoff state. Node detail replaces credential
+downloads with generate, replace, and reset-plus-generate actions.
+
 ## Decision Log
 
 ### Accepted
@@ -229,6 +265,30 @@ access.
   HTTP/1.1 connection after each response. Raising worker counts or serializing
   individual pages is not a correctness fix for a worker pool whose idle
   keep-alive sockets own admission capacity.
+- New operator-facing enrollment uses an eight-character unambiguous Base32
+  public locator and a separately entered 45-bit `XXX-XXX-XXX` code. It is an
+  HTTPS delivery layer over the existing internal credential and unchanged
+  Node wire protocol; new Node enrollment requires the management HTTPS edge.
+- The database must not store the code, derived credential secret, bootstrap
+  root key, or encoded long credential. A Master-identity-derived versioned
+  HKDF/HMAC construction recreates the credential after online verification;
+  correct redemption is repeatable until enrollment, expiry, or revocation.
+- Raw-IP/self-signed deployments authenticate bootstrap downloads using the
+  configured exact SPKI pin. Every installer curl forces HTTPS and HTTP/1.1,
+  disables curlrc processing, follows no redirects, and has fixed timeouts.
+- Node bootstrap ships deterministic, architecture-specific Node-only archives
+  and a Master-hosted checksummed manifest; Node artifacts must exclude
+  `ntsrv`, Master state, API identities, and server units.
+
+### In progress
+
+- One-command Node bootstrap architecture, lifecycle, disclosure boundaries,
+  installer state classes, public/management contracts, and threat controls are
+  recorded in `docs/node-bootstrap.md` and the architecture/security documents.
+- Implementation advances in six independently verified commits: design and
+  contracts; schema/domain/CLI; IPC/HTTP/configuration/NGINX; Node import and
+  packaging; dashboard; then release/deployment evidence and the authorized
+  fresh vps02 database reset.
 
 ### Implemented
 
@@ -743,6 +803,14 @@ access.
 - [x] Dashboard loopback worker-starvation fix and pinned-Bun wire regression
 - [x] Dashboard-only redeployment and live Node-detail recovery verification
 - [x] Packaging, systemd, CI, documentation, and release evidence
+- [ ] Bootstrap architecture, threat model, management 1.1.0 and Bootstrap v1
+  contracts
+- [ ] SQLite schema 2, bootstrap derivation/lifecycle, and protected CLI output
+- [ ] IPC v2 bootstrap operations, public HTTP, strict configuration, and NGINX
+- [ ] `ntcl bootstrap-import`, Node-only archives, assets manifest, and installer
+- [ ] Dashboard issuance/disclosure/replacement/reset journeys
+- [ ] Full release gate, atomic vps02 deployment, authorized fresh-state reset,
+  and live handoff
 
 ## Verification Commands
 
@@ -770,6 +838,9 @@ bun test ./apps/dashboard/test/unit/server-api-headers.test.ts
 bun run dashboard:build
 bun run dashboard:runtime-smoke
 bun run dashboard:e2e
+python3 scripts/check-node-bootstrap-contract.py
+python3 scripts/check-node-bootstrap-packaging.py
+scripts/check-node-bootstrap-installer.sh
 python3 scripts/check-packaging-contract.py
 python3 scripts/check-vendored-sqlite.py
 python3 scripts/check-secret-exposure.py

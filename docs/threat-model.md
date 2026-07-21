@@ -128,6 +128,24 @@ intended Node. The 24-hour default lifetime, protected transfer, single-use
 atomic consumption, audit record, and explicit reset reduce but do not remove
 that bearer-token risk.
 
+New v0.2 browser-driven enrollment discloses a public eight-character locator
+and a separate 45-bit short code instead of the long credential. The database
+stores neither code nor credential secret. `ntsrv` derives an in-memory root
+from the Master identity, deterministically reconstructs the credential secret
+from the canonical locator, random enrollment handle, and canonical code, and
+compares its derived PSK with the stored enrollment PSK in constant time. This
+prevents a stolen database from becoming an offline code-verification oracle;
+compromise of the live Master identity or process remains sufficient to derive
+an unused invitation.
+
+Correct redemption is repeatable only until expiry, revocation, deletion,
+reset, or protocol consumption. Replacement revokes the predecessor in the
+same transaction. Restoring a database revokes all restored unused bootstrap-
+linked credentials so rollback cannot resurrect a copied setup code. The code,
+root key, derived credential secret, and encoded credential are excluded from
+logs, audit, command arguments, environment variables, browser storage, and
+durable bootstrap rows.
+
 ### Session confidentiality and integrity
 
 Fixed Noise r34 XKpsk1/IK patterns use X25519, ChaCha20-Poly1305, and BLAKE2s.
@@ -191,6 +209,15 @@ Cookies cannot prevent volumetric link saturation, spoofed traffic from a path
 that can receive replies, or CPU exhaustion below the threshold of upstream
 mitigation. Operators remain responsible for host and network rate limiting.
 
+Anonymous HTTPS redemption is separately bounded. NGINX applies a per-peer
+ten-per-minute limit with burst five, `ntip-api` admits at most two concurrent
+redemptions, and `ntsrv` applies a durable per-real-locator ten-failure window
+and 15-minute cooldown. Unknown locators use a fixed-capacity in-memory
+throttle and never allocate SQLite rows. All invalid, unknown, expired,
+revoked, consumed, and locked invitations return the same public failure.
+These controls limit online guessing and state growth; they cannot stop link
+saturation, a distributed source population, or a compromised TLS gateway.
+
 ### Persistence and crash consistency
 
 Strict schema versions and unknown-field rejection prevent ambiguous state.
@@ -253,6 +280,14 @@ second time. Failed-login throttle state uses the same marker boundary and may
 replay only its exact safe error, so retrying one key cannot double-count a
 failure. Successful login and one-time-secret responses are non-replayable.
 
+Bootstrap invitation issuance is likewise non-replayable. Its idempotency row
+retains only a consumed marker, never the locator/code response. Atomic Node
+creation requires a superuser session, recent password reauthentication, exact
+Node-name confirmation, CSRF, Origin, and idempotency checks. Replacement,
+revocation, and reset additionally require the current Node ETag. A lost
+response therefore requires an explicit replacement rather than automatic
+retry or disclosure from durable replay storage.
+
 These controls do not protect a compromised browser, same-origin script, TLS
 proxy, superuser, or live `ntip-api`/`ntsrv` process.
 
@@ -278,6 +313,13 @@ acknowledges it through a dedicated ordered barrier; the next mutation remains
 closed under queue pressure. Capture failure is fail-stop with SQLite as the
 restart recovery source. Audit and committed mutations are never silently
 dropped.
+
+The public bootstrap parser is a distinct strict surface. It is cookie-
+independent, rejects Origin and CORS, transfer encoding, redirects, unknown
+JSON fields, non-JSON media types, and oversized bodies, and emits `no-store`.
+The API obtains the authoritative UDP endpoint and installer SPKI pin only
+from strict root-owned configuration; neither HTTP Host nor forwarded headers
+are authority.
 
 ### Dashboard process and presentation isolation
 
@@ -362,6 +404,16 @@ valid workspace links, removes dangling links, and rejects symlinks or ELF
 application payloads. CI action references, Zig, Bun, frontend packages, SQLite,
 and toolchain downloads remain supply-chain inputs and must be pinned and
 reviewed before a release tag.
+
+Node bootstrap adds deterministic Node-only static-musl archives for x86_64
+and AArch64 plus a checksummed Master-hosted manifest. Those archives exclude
+`ntsrv`, Master state, API identities, and server units. The generated script
+embeds the selected archive digest and exact configured SPKI pin, disables
+curl configuration with `-q`, forces HTTPS and HTTP/1.1, follows no redirects,
+and applies fixed timeouts. HTTP/1.1 is mandatory because CVE-2025-13034
+documented an HTTP/3/GnuTLS pinning bypass when `--insecure` and
+`--pinnedpubkey` were combined. A copied command stops working after the pinned
+certificate key rotates, which is an intentional fail-closed property.
 
 Next emits build-host paths, a host-derived worker count, random Draft Mode
 preview values, and a Server Action encryption key into otherwise identical

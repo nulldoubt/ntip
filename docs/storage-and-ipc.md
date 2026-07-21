@@ -35,16 +35,20 @@ Master `server.json` schema 2 contains only:
 | `listen_port` | nonzero UDP port; default `49152` |
 | `tun_name` | 1–15 safe interface-name bytes; default `ntip0` |
 | `service_socket_path` | absolute, normalized Unix socket path, at most 107 bytes |
+| `public_udp_endpoint` | canonical externally reachable `host:port`; required |
 
 Inner MTU, liveness thresholds, enrollment lifetime, traffic thresholds,
 retention, and maximum Node capacity do not belong in `server.json`. They are
 revisioned settings in SQLite. Supplying an old operational field is an error,
 not an override.
 
-API `api.json` schema 1 contains the canonical loopback bind address and port,
+API `api.json` schema 2 contains the canonical loopback bind address and port,
 the same service socket path, one exact lowercase public HTTPS origin, worker
-count, and maximum connection count. A hostname, wildcard, or routable bind is
-rejected. Security policy and database paths are not configurable here.
+count, maximum connection count, validated `bootstrap_spki_pin`, and absolute
+root-owned `bootstrap_manifest_path`. A hostname, wildcard, or routable bind is
+rejected. Security policy and database paths are not configurable here. The
+public UDP endpoint, HTTPS origin, pin, and manifest path are explicit
+deployment authority and are never inferred from Host or forwarded headers.
 
 Node `client.json` remains schema 1 with `master`, `node`,
 `master_public_key`, `tun_name`, and `inner_mtu`. `ntcl config` derives the
@@ -293,3 +297,17 @@ Production Argon2 runs on the single bounded password worker with copied,
 wiped inputs; while that worker runs, the owner advances protocol-critical
 runtime and persistence work at most every 100 ms without accepting a nested
 management request or retaining a SQLite transaction.
+
+IPC protocol v2 also carries bootstrap issuance, replacement, revocation, and
+anonymous redemption operations. Bootstrap responses remain bounded typed
+objects. Issuance responses are marked non-replayable before they cross the
+socket; neither the idempotency repository nor an IPC error may retain or echo
+the code after the terminal response has been attempted.
+
+SQLite schema 2 adds the bootstrap locator/handle/lifecycle/throttle table.
+The short code, bootstrap root key, derived credential secret, and encoded long
+credential are forbidden columns. Node creation plus invitation, replacement,
+reset plus invitation, revocation, first successful redemption, and protocol
+consumption update bootstrap/enrollment/audit state in one owner transaction.
+Restore revokes every restored unused bootstrap-linked enrollment after
+integrity and semantic validation and before service startup.

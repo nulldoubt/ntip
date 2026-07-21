@@ -169,6 +169,22 @@ inputs are copied and wiped, and the owner advances protocol-critical work at
 The dashboard is the only promised v0.2 API consumer. API tokens and external
 automation compatibility are out of scope.
 
+OpenAPI revision 1.1.0 adds the authenticated one-command bootstrap management
+operations while retaining `POST /nodes` as the replayable inventory-only
+Operator path. Invitation issuance is superuser-only, recently
+reauthenticated, confirmed, and non-replayable; an undelivered disclosure must
+be replaced explicitly. The long enrollment-credential route is removed from
+the operator contract, while the internal credential parser and Node wire
+exchange remain compatible.
+
+The cookie-independent Bootstrap v1 contract is deliberately separate from
+`/api/v1`. NGINX routes `GET /enrollment/{bootstrapId}` and
+`POST /enrollment/v1/redeem` to `ntip-api`, and serves immutable versioned Node
+archives from `/enrollment/assets/`. The API never derives installer authority
+from Host or forwarded headers: strict configuration supplies the exact HTTPS
+origin, SPKI pin, manifest path, and authoritative external UDP endpoint.
+`docs/node-bootstrap.md` is the normative lifecycle and disclosure design.
+
 ## Dashboard runtime
 
 The dashboard is a Next.js 16.2.10 App Router application built and run with
@@ -308,6 +324,13 @@ loopback-only IPv4/IPv6. It deliberately omits `MemoryDenyWriteExecute=yes`
 because Bun's JavaScriptCore requires executable JIT mappings. Exact-Bun
 production start and same-origin Playwright remain mandatory release gates;
 there is no Node.js fallback.
+
+Bootstrap adds a fourth, Master-hosted assets package. It contains deterministic
+Node-only x86_64 and AArch64 static-musl archives plus a checksummed manifest.
+Each Node archive contains `ntcl`, the Node unit, strict sample configuration,
+Node-only installer/uninstaller, documentation, checksums, and SBOM, and must
+not contain `ntsrv`, API/dashboard identities, Master configuration, or server
+units. NGINX serves only versioned assets from the validated manifest.
 
 ## Verification obligations
 

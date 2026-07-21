@@ -242,8 +242,10 @@ operator worker and has no direct path to SQLite or local IPC.
 flowchart LR
     browser["Browser"] -->|"same-origin HTTPS pages"| proxy["Operator TLS proxy"]
     browser -->|"same-origin HTTPS /api/v1"| proxy
+    nodeadmin["Node administrator"] -->|"pinned HTTPS /enrollment"| proxy
     proxy -->|"loopback pages"| dashboard["ntip-dashboard"]
     proxy -->|"loopback API"| api["ntip-api"]
+    proxy -->|"immutable Node archives"| assets["root-owned bootstrap assets"]
     dashboard -->|"server-only initial reads over loopback"| api
     api -->|"typed Unix IPC"| operator["ntsrv operator worker"]
 ```
@@ -255,6 +257,13 @@ poll and mutate same-origin `/api/v1`, where the existing HTTP and application
 controls remain authoritative. There is no Next API rewrite: the runtime
 `api_origin` serves only Server Components, while the TLS proxy is the sole
 browser `/api/v1` router. A proxy error therefore remains visible.
+
+The same TLS edge also owns one-command Node bootstrap. It routes strict
+locator-specific script generation and anonymous redemption to `ntip-api`,
+while serving versioned, manifest-validated Node-only archives directly. The
+installer authenticates the exact configured SPKI key and never derives its
+Master UDP endpoint, origin, pin, or asset path from the request Host or
+forwarded headers. See [One-command Node bootstrap](node-bootstrap.md).
 
 One shared scheduler bounds background reads to two. Hidden/offline pages pause,
 failed reads back off, and the last committed display remains visibly stale.
