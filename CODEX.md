@@ -28,11 +28,10 @@ security policy, or milestone status.
   Next.js 16.2.10 standalone service. The bootstrap disclosure tree passes
   typecheck, lint, 46/46 unit tests, the production build, exact-Bun runtime
   smoke, and 26/26 Playwright journeys.
-- Last verified commit: `79b585383deb8c55e14ae9279bfb22ec98da3397`
-  (accepted one-command bootstrap design). The implementation evidence below
-  is for this feature changeset and must be replaced with its commit identity
-  in the immediate verification follow-up before live rollout is complete.
-- Last verified implementation: current `feat/node-bootstrap` feature changeset;
+- Last verified commit: `668fc732063fc8a2055f5a80910f9609398756f6`
+  (`feat: add one-command node bootstrap`).
+- Last verified implementation: commit
+  `668fc732063fc8a2055f5a80910f9609398756f6`;
   schema-2 invitation persistence/derivation/throttling, atomic inventory and
   one-time issuance, public redemption and generated pinned installer, strict
   bootstrap import, Node-only/bootstrap-assets packaging, configuration and
