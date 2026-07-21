@@ -10,11 +10,11 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: the segmented inventory/error milestone remains live on
-  native x86_64 vps02. A follow-up fix for pre-existing dashboard-to-API
-  keep-alive worker starvation is implemented and passes unit, typecheck, lint,
-  exact-Bun production smoke, build, and 19/19 browser journeys; its rebuilt
-  dashboard archive and live redeployment remain pending.
+- Current milestone: the segmented inventory/error milestone and the follow-up
+  dashboard-to-API connection-lifecycle fix are live on native x86_64 vps02.
+  The fix passes unit, typecheck, lint, exact-Bun production smoke, build,
+  19/19 browser journeys, native archive/launcher validation, dashboard-only
+  deployment, and authenticated live Node-detail and Activity verification.
 - SQLite schema version: `1`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -27,12 +27,14 @@ security policy, or milestone status.
   error/connection-lifecycle tree passes typecheck, lint, 40/40 unit tests, the
   12-route production build, exact-Bun runtime smoke, and 19/19 Playwright
   journeys.
-- Last verified commit: `d5ae54d2b89f5157472510e0dfc3c4337d5fb639`
-  (segmented network inputs and actionable inventory errors)
-- Last verified implementation: commit `d5ae54d2b89f5157472510e0dfc3c4337d5fb639`;
-  selection-only segmented VNR/Node/route inputs, allocation-aware Node
-  completion, actionable bounded inventory violations, private service IPC v2,
-  OpenAPI 1.0.1, shared browser error handling, and the prior
+- Last verified commit: `afaf7357c6c29a96568fe4fad10eb8c215b62c47`
+  (dashboard API worker-starvation fix)
+- Last verified implementation: commit `afaf7357c6c29a96568fe4fad10eb8c215b62c47`;
+  explicit closure of dashboard-owned loopback HTTP/1.1 connections with an
+  exact-Bun on-wire regression, plus selection-only segmented VNR/Node/route
+  inputs, allocation-aware Node completion, actionable bounded inventory
+  violations, private service IPC v2, OpenAPI 1.0.1, shared browser error
+  handling, and the prior
   live/offline SQLite Master cutover, DB-free
   `ntip-api`, embedded contract, authenticated auth/inventory/security and
   operations dispatch, both live admin sockets, encrypted-path connectivity
@@ -647,6 +649,12 @@ access.
   root-owned recovery copy is
   `/var/backups/ntip/ntip-backup-1784666973-8a181b2e63c2e33e.sqlite3`, SHA-256
   `b074851c0490f05902d4d9344ef484bf6f0bedae639ff952126b4826d9a87398`.
+- The dashboard-only follow-up used a second online backup after the operator
+  created `test01`. The root-owned recovery copy is
+  `/var/backups/ntip/ntip-backup-1784668490-ddf87adff6d68a87.sqlite3`, SHA-256
+  `50eafda95beb12db0416129cde8ef96b8ea6669c4a860ae3345679cf6749ee6e`.
+  `PRAGMA integrity_check` returned `ok`; schema version 1, generation 4, and
+  all three Node rows were verified from the read-only backup before install.
 - Native x86_64 `ntsrv`, `ntip-api`, and dashboard artifacts were installed as
   one matched `0.2.0-dev` set. `ntsrv`, `ntip-api`, `ntip-dashboard`, and nginx
   are active; the Zig binaries match the validated archive payloads and remain
@@ -673,7 +681,7 @@ access.
   SHA-256 fingerprint
   `6F:6F:EF:3E:CB:7B:A6:B6:EE:EF:56:F5:BA:F7:56:36:CD:67:23:0E:05:34:56:39:B7:AA:AC:D8:80:F6:DC:5E`.
 
-### Follow-up deployment pending
+### Follow-up live verification
 
 - Post-rollout Node creation committed `test01` successfully, but its immediate
   detail render exposed the pre-existing bounded-worker starvation failure:
@@ -683,9 +691,26 @@ access.
   though the exact Node-detail API read remained healthy at about 60 ms.
 - Pinned Bun 1.3.14 reproduced three eight-second timeouts in the five-read
   burst. The same burst with `Connection: close` completed all five reads in
-  6-14 ms. The repository fix and on-wire production smoke pass; rebuild,
-  archive validation, dashboard-only deployment, and live Node-detail recovery
-  remain pending.
+  6-14 ms. Commit `afaf7357c6c29a96568fe4fad10eb8c215b62c47`
+  closes every dashboard-owned internal connection after its response. Its
+  native x86_64 archive has SHA-256
+  `dcbaa0230b749055649670ce67aa68bd48974d8c084f04403064939f2d0e1a86`
+  and passed payload/SBOM consistency, pinned-Bun launcher execution, preview-
+  cookie rejection, installer isolation, and source/archive secret scans.
+- Only `ntip-dashboard` was stopped and replaced. The root-only rollback
+  snapshot is `/var/backups/ntip/ntip-dashboard-pre-afaf7357.tar.gz`, SHA-256
+  `06de65817ce2a0211ad0e76a851453a2385b9ba6e34415df3adfd053105eaf75`.
+  `ntsrv`, `ntip-api`, and nginx were not restarted. After deployment, all four
+  services were active, readiness passed locally and through raw-IP HTTPS, and
+  the listeners remained UDP 49152 on IPv4/IPv6, API 127.0.0.1:8787,
+  dashboard 127.0.0.1:3000, and nginx 10.9.16.169:443.
+- An authenticated built-in-browser pass rendered `test01` without the
+  management-data fallback in 159 ms and rendered the five-read Activity page
+  without the fallback in 118 ms. A final fresh `test01` detail render also
+  passed and was left open for operator testing. Dashboard and API journals
+  contain no warning-or-higher entries from the verification. Inventory is
+  unchanged at generation 4 with `primary`, `test01` (`10.10.1.4`),
+  `ubuntu110` (`10.10.1.3`), and `vps01` (`10.10.1.2`).
 
 ### Deferred or out of scope
 
@@ -716,7 +741,7 @@ access.
   proof for the segmented-input/actionable-error milestone
 - [x] Live deployment, native x86_64 service, and same-origin verification
 - [x] Dashboard loopback worker-starvation fix and pinned-Bun wire regression
-- [ ] Dashboard-only redeployment and live Node-detail recovery verification
+- [x] Dashboard-only redeployment and live Node-detail recovery verification
 - [x] Packaging, systemd, CI, documentation, and release evidence
 
 ## Verification Commands
@@ -787,6 +812,14 @@ Latest evidence:
   requires all five raw fixture requests to carry `Connection: close`, and
   finishes before the eight-second backend deadline. The same settled tree
   passes the 12-route build and 19/19 Playwright journeys.
+- Commit `afaf7357c6c29a96568fe4fad10eb8c215b62c47` was rebuilt from a clean
+  source snapshot on native x86_64 vps02 with pinned Bun 1.3.14. The 3,289-file
+  dashboard archive passed native packaged-launcher execution, preview-cookie
+  rejection, payload/SBOM consistency, installer isolation, and the combined
+  source/archive secret scan. A dashboard-only install after the generation-4
+  online backup preserved all services and inventory. Authenticated live
+  `test01` and Activity renders completed without the fallback in 159 ms and
+  118 ms respectively; a final fresh `test01` render also passed.
 - Commit `d5ae54d2b89f5157472510e0dfc3c4337d5fb639` was deployed as a matched
   service set on native x86_64 vps02 after the online backup recorded above.
   All management services, the loopback API/dashboard listeners, raw-IP nginx
