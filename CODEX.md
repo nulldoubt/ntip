@@ -13,10 +13,11 @@ security policy, or milestone status.
 - Current milestone: the one-command Node bootstrap implementation,
   dashboard-owned plain-HTTP gateway, native Linux package proof, and the
   explicitly authorized fresh vps02 schema-2 deployment are complete on
-  `feat/node-bootstrap`. The commit-pinned demonstration installer is staged
-  in `ntip-site`; repository publication, anonymous Pangolin routing, and the
-  operator-driven Node enrollment recording remain. The stable v0.2.0 release
-  stays gated by its separate evidence policy.
+  `feat/node-bootstrap`. The repository and commit-pinned demonstration
+  installer are published, both public Pangolin resources are anonymous, and
+  the exact showcase command completed two fresh-host installation cycles on
+  `test02`. The operator-driven Node enrollment recording remains. The stable
+  v0.2.0 release stays gated by its separate evidence policy.
 - SQLite schema version: `2`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -59,7 +60,10 @@ security policy, or milestone status.
   byte-for-byte core/API/Node/bootstrap/dashboard reproducibility, systemd
   hardening, and the fresh live schema-2 deployment pass on vps02. AArch64
   runtime execution, the 24-hour soak, independent review, interoperability,
-  and benchmark evidence remain separate release gates.
+  and benchmark evidence remain separate release gates. Anonymous public
+  showcase/management routing, immutable preview delivery, and a fresh-host
+  install/reinstall from the exact public one-line command also pass on
+  x86_64 `test02`.
 
 ## Current State
 
@@ -294,10 +298,10 @@ downloads with generate, replace, and reset-plus-generate actions.
 
 ### In progress
 
-- Publish the verified repository and commit-pinned demonstration artifacts,
-  then verify that the public showcase and demo enrollment paths bypass the
-  outer Pangolin login. The operator-driven invitation test on vps01 and
-  ubuntu110 follows; their current installations remain untouched.
+- Run the operator-driven invitation test on vps01 and ubuntu110; their
+  current installations remain untouched. Repository publication,
+  commit-pinned demonstration artifacts, anonymous showcase/management
+  routing, and the standalone server-installer proof are complete.
 - Accumulate the independent evidence required by the stable v0.2.0 release
   policy. Do not turn the development preview into a nominal stable tag or
   weaken `REQUIRE_PUBLIC_RELEASE=1` while any required gate is absent.
@@ -877,13 +881,44 @@ downloads with generate, replace, and reset-plus-generate actions.
   configuration remain recoverable and byte-identical. Newt reaches
   `http://172.30.2.1:443/login` from its own container namespace, and the raw
   provider address returns the login page over plain HTTP.
-- Pangolin still returns its own authentication `302` for both
-  `demo.ntip.alkhatib.online` and `ntip.alkhatib.online`. Until the operator
-  removes that outer policy, management requests never reach NTIP and the
-  cookie-independent `/enrollment/*` and showcase installer paths cannot work.
-  UFW also still permits 443/tcp globally as instructed, so binding cleartext
-  HTTP on all interfaces exposes the provider-NAT path; production deployment
-  should restrict that listener to the external proxy's source path.
+- Platform SSO is disabled for both `demo.ntip.alkhatib.online` and
+  `ntip.alkhatib.online`. The demo resource terminates public TLS and forwards
+  to Newt's plain-HTTP `http://172.30.2.1:443` target; public `/login` and
+  `/api/v1/health/ready` both return 200. The API exact public origin remains
+  `https://demo.ntip.alkhatib.online`, so no hostname allow-list exception was
+  introduced. UFW still permits 443/tcp globally as instructed, so the raw
+  provider-NAT path remains cleartext HTTP and should be source-restricted for
+  production deployment.
+
+### Public installer verification
+
+- The anonymous showcase serves `/demo/install.sh` with `no-store` and the
+  commit-pinned archive directory with one-year immutable caching. The public
+  installer SHA-256 is
+  `1a675a8c9f1a0837b0991c1399e8ad27e84bae2d0c378841ec6cb1ffc585184f`;
+  its downloaded x86_64 core archive hashes to
+  `590e0124e5d5268fdfb6cf0c0ee6e18b7bb078056aacf6ef5d4dd0e8e5e394ac`,
+  exactly matching the embedded manifest. Shell syntax and ShellCheck pass on
+  the public bytes.
+- The exact public command
+  `curl -fsSL https://ntip.alkhatib.online/demo/install.sh | sudo sh` completed
+  on the previously clean x86_64 Ubuntu/systemd VM `test02`. Its existing-edge
+  prerequisite was supplied by a LAN-only, locally trusted NGINX endpoint at
+  `https://10.2.40.49:8443`, forwarding to the installed plain-HTTP gateway on
+  port 443. The authoritative Node endpoint is `10.2.40.49:49152`.
+- A first successful install was removed with all four packaged uninstallers;
+  their intentionally preserved test-only state, configuration, service
+  accounts, and groups were then explicitly deleted. A second fresh install
+  also completed, proving the public delivery and clean-host path twice. The
+  temporary sudo PTY override and prompt harness were removed afterward.
+- On the retained second install, `ntsrv`, `ntip-api`, `ntip-dashboard`, and
+  the LAN TLS edge are active and enabled. Local and proxied readiness report
+  schema 2, OpenAPI reports management 1.1.0, generation and Node count are
+  zero, `ntip0` exists, UDP 49152 is bound on IPv4/IPv6, API remains on
+  `127.0.0.1:8787`, and authenticated login plus `/auth/me` return 200. The
+  generated administrator credential is retained only for this test at
+  `/root/ntip-test-admin.password`, mode `0600`; the public test certificate is
+  copied to `/Users/alkhatib/Desktop/ntip-test02.crt` and expires 2026-07-29.
 
 ### Deferred or out of scope
 
@@ -930,7 +965,9 @@ downloads with generate, replace, and reset-plus-generate actions.
 - [x] Dashboard-owned plain-HTTP gateway and portable directory-handle tests
 - [x] Native artifact reproducibility, atomic vps02 deployment, authorized
   fresh-state reset, NGINX removal, and local/Newt live handoff
-- [ ] Anonymous public proxy routing and operator-driven Node bootstrap proof
+- [x] Anonymous public proxy routing, immutable preview delivery, and exact
+  one-line server-installer proof on clean `test02`
+- [ ] Operator-driven Node bootstrap proof on vps01 and ubuntu110
 - [ ] Stable v0.2.0 evidence gate, signed publication, and release handoff
 
 ## Verification Commands
@@ -1043,9 +1080,11 @@ Latest evidence:
   a matched fresh schema-2 service set. Local gateway/API readiness, OpenAPI
   1.1.0, empty generation-0 inventory, administrator authentication,
   manifest-authenticated Node asset delivery, UDP 49152, Newt bridge access,
-  NGINX package removal, and retained identity/lock material passed. Public TLS
-  requests remain intercepted by the operator's outer Pangolin login and are
-  not claimed as end-to-end enrollment proof.
+  NGINX package removal, and retained identity/lock material passed. Pangolin
+  now forwards the anonymous public TLS origin to the plain-HTTP Newt target;
+  public login and readiness pass. The commit-pinned showcase installer also
+  completed twice on clean x86_64 `test02` with the exact public command, but
+  operator-driven Node enrollment remains a separate pending proof.
 
 The remaining evidence in this section records the previously verified
 implementation unless a bullet explicitly identifies the current working-tree
