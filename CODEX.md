@@ -31,15 +31,16 @@ security policy, or milestone status.
   listener; the updated 52-test unit tree, production build, exact-Bun runtime
   smoke, and 26/26 Playwright journeys pass. Native package execution remains
   part of Linux staging.
-- Last verified commit: `668fc732063fc8a2055f5a80910f9609398756f6`
-  (`feat: add one-command node bootstrap`).
+- Last verified commit: `ba06060efc1c43c552a522f235070c700b8d5d82`
+  (`feat: expose dashboard through bounded HTTP gateway`).
 - Last verified implementation: commit
-  `668fc732063fc8a2055f5a80910f9609398756f6`;
-  schema-2 invitation persistence/derivation/throttling, atomic inventory and
-  one-time issuance, public redemption and generated pinned installer, strict
-  bootstrap import, Node-only/bootstrap-assets packaging, configuration and
-  NGINX contracts, management/dashboard flows, consumed-marker idempotency,
-  restore/consume invalidation, and unchanged Node wire enrollment.
+  `ba06060efc1c43c552a522f235070c700b8d5d82`; it includes schema-2 invitation
+  persistence/derivation/throttling, atomic inventory and one-time issuance,
+  public redemption and generated pinned installer, strict bootstrap import,
+  Node-only/bootstrap-assets packaging, management/dashboard flows,
+  consumed-marker idempotency, restore/consume invalidation, the bounded
+  whole-origin dashboard gateway, Linux-portable directory handling, and
+  unchanged Node wire enrollment.
 - Migration 0001 SHA-256:
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
 - Migration 0002 SHA-256:
