@@ -178,6 +178,21 @@ credential can still enroll; v0.2 management never prints or downloads that
 long credential. Report suspected vulnerabilities privately as described in
 [SECURITY.md](SECURITY.md).
 
+## Built with Codex
+
+NTIP v0.2 was developed as a close human–AI collaboration with OpenAI Codex.
+Codex helped translate the project goals into architecture, implement the Zig
+management plane and SQLite repository, build the HTTP/API and dashboard
+layers, design the one-command enrollment flow, write contracts and
+documentation, diagnose regressions, and exercise the test and release
+tooling.
+
+The maintainer supplied the original problem, made the product and security
+decisions, reviewed the resulting behavior, and retained control of
+credentials, infrastructure, deployment, and release approval. Live-system
+work was performed only under that explicit direction; operational ownership
+remains human.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
