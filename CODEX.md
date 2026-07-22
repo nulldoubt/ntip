@@ -906,10 +906,11 @@ downloads with generate, replace, and reset-plus-generate actions.
 
 - The anonymous showcase serves `/demo/install.sh` with `no-store` and the
   commit-pinned archive directory with one-year immutable caching. The public
-  installer SHA-256 is
-  `1a675a8c9f1a0837b0991c1399e8ad27e84bae2d0c378841ec6cb1ffc585184f`;
+  channel now points to source commit
+  `f3fa1235e510253bc5c5d497bbcfec9912876949`; installer SHA-256 is
+  `dc8f405dc3a3e9827c72a7c4fa913a39fff18fcc909ad7d52b265e2b465af73e`;
   its downloaded x86_64 core archive hashes to
-  `590e0124e5d5268fdfb6cf0c0ee6e18b7bb078056aacf6ef5d4dd0e8e5e394ac`,
+  `bdc5e1076ab150f6283355847a68e40bafd7ca737970242ebd05f001773d3b42`,
   exactly matching the embedded manifest. Shell syntax and ShellCheck pass on
   the public bytes.
 - The exact public command
@@ -940,6 +941,15 @@ downloads with generate, replace, and reset-plus-generate actions.
   `86d1b6fcbf5a425fe7f3556708e76e64552112af8f2dc95ae16cb9f44e7761d9`,
   with the previous binary retained at
   `/var/backups/ntip/ntip-api-pre-f3fa123`.
+- Showcase commit `4d1b26ecd8bc58384a5355de45a7f59a41b8953e` publishes a complete replacement
+  preview set built from that source commit. Native x86 execution, both-target
+  archive/SBOM contracts, checksums, installer tests, lint, typecheck, secret
+  scan, production build, and production smoke pass. The public x86_64 API
+  archive SHA-256 is
+  `0d5612241820a348cdca95564a587964d0233b073a69cd08a03123850dd7fed2`;
+  extracting its binary and the public bootstrap-assets template confirms the
+  corrected runtime origin guard. The redeployed public channel, demo login,
+  and demo readiness all return 200.
 - The exact dashboard-generated command then installed the Node-only package
   on the previously clean x86_64 Ubuntu host `test01`, prompted for the secret
   only through `/dev/tty`, redeemed through the pinned HTTPS endpoint, and
