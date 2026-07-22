@@ -51,7 +51,7 @@ security policy, or milestone status.
   validation, generated drift, typecheck, and 20/20 tests pass. Dashboard
   typecheck, lint, 52/52 unit tests, production build, exact-Bun runtime smoke,
   and 26/26 Playwright journeys pass. Packaging/configuration, source secret
-  scan, installer, bootstrap-assets install, optional NGINX-reference syntax,
+  scan, installer, bootstrap-assets install, external-proxy separation,
   gateway/package contract, workflow YAML, shell syntax, and ShellCheck gates
   pass. Clean release reproducibility, architecture-matched package execution,
   and live deployment remain Linux staging evidence, not claims of this local
@@ -243,6 +243,10 @@ downloads with generate, replace, and reset-plus-generate actions.
 - Route that TLS origin as a whole to the dashboard-owned bounded plain-HTTP
   gateway on `0.0.0.0:443`; keep `ntip-api` loopback-only and remove the live
   host's local NGINX dependency.
+- Keep reverse-proxy configuration outside NTIP release artifacts. The
+  bootstrap-assets package carries immutable Node archives, their manifest,
+  and documentation only; an external TLS edge must forward the complete
+  public origin to the gateway without path rewriting.
 - Master-only SQLite migration; Node-local persistence stays as-is.
 - Filesystem protection plus online backup and verified offline restore; no
   SQLCipher.
@@ -321,7 +325,9 @@ downloads with generate, replace, and reset-plus-generate actions.
   marker only after authenticated protocol enrollment completes.
 - Deterministic x86_64/AArch64 Node-only static-musl packages exclude Master/API
   state and units. A separate bootstrap-assets package supplies both archives
-  and a root-owned checksummed manifest. The generated installer disables
+  and a root-owned checksummed manifest. It carries no same-host reverse-proxy
+  configuration; the operator-owned external TLS edge forwards the complete
+  origin to the dashboard gateway. The generated installer disables
   inherited tracing/startup hooks, forces pinned HTTPS over HTTP/1.1 with no
   redirects and fixed timeouts, verifies archive size/digest/shape, prompts
   only on `/dev/tty`, pipes redemption directly to `ntcl`, preserves pending
@@ -643,6 +649,12 @@ downloads with generate, replace, and reset-plus-generate actions.
   Ambient Linux/container `HOSTNAME` values cannot alter the listener. The
   launcher separately binds Next to a private ephemeral loopback port before
   starting the public gateway.
+- Native systemd CI probes the installed schema-2 dashboard through its
+  packaged gateway at `127.0.0.1:443`; port 3000 is not a public or packaged
+  readiness endpoint.
+- GitHub CI targets pushes and pull requests to `master`; signed release tags
+  must resolve to `origin/master`, and publication retains the protected
+  `production-beta` environment plus every existing evidence gate.
 - Delivery now has a pinned-Bun dashboard CI job and a v0.2 release guard that
   requires lint, typecheck, unit tests, exact-Bun production build/start smoke,
   and same-origin HTTPS Playwright. There is no Node.js runtime fallback.
@@ -890,7 +902,6 @@ scripts/check-node-bootstrap-installer.sh
 python3 scripts/check-bootstrap-assets.py "$(scripts/check-version.sh)" \
   dist/bootstrap-assets.json dist
 scripts/check-bootstrap-assets-install.sh
-scripts/check-nginx-bootstrap-config.sh
 python3 scripts/check-packaging-contract.py
 python3 scripts/check-vendored-sqlite.py
 python3 scripts/check-secret-exposure.py
@@ -927,6 +938,14 @@ Latest evidence:
   fixed segments, no parent change callback during render, and three internal
   header tests for explicit close, anonymous reads, and cookie-delimiter
   rejection.
+- Current external-proxy/release-alignment slice:
+  `python3 scripts/check-packaging-contract.py`,
+  `scripts/check-bootstrap-assets-install.sh`, shell syntax, ShellCheck,
+  workflow-YAML parsing, and `git diff --check` pass. A repository-wide audit
+  finds no remaining packaged-dashboard readiness probe on port 3000, stale
+  same-host proxy artifact/check, `origin/main` release ancestry, or `main`
+  CI branch filter. Native installed-service execution on 443 remains part of
+  the pending Linux CI/live evidence rather than a macOS claim.
 - Management 1.1.0 and Bootstrap 1.0.0 validation, typecheck, generated drift,
   and 20/20 contract tests pass. The dashboard production build, exact-Bun
   runtime smoke, and 26/26 Playwright journeys pass on the same tree, including
@@ -934,7 +953,7 @@ Latest evidence:
   recovery, consumed-marker replay, replacement, revocation, reset, stale
   intent/config races, operator handoff, accessibility, and existing inventory
   scenarios. Packaging/configuration, source secret, installer, asset install,
-  dashboard-gateway, optional NGINX-reference, workflow YAML, shell syntax,
+  dashboard-gateway, external-proxy separation, workflow YAML, shell syntax,
   and ShellCheck gates pass.
 - The current pinned-Bun production smoke renders Activity through the exact
   standalone launcher, observes the protected layout plus four page reads,

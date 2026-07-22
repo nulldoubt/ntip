@@ -57,5 +57,5 @@ do
     fi
 done
 
-echo "NTIP bootstrap manifest, immutable assets, and optional proxy example removed."
+echo "NTIP bootstrap manifest, immutable assets, and documentation removed."
 echo "Operator-owned reverse-proxy configuration was not changed."

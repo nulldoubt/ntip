@@ -53,9 +53,8 @@ package_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 manifest=$package_root/bootstrap-assets.json
 asset_source=$package_root/assets
 validator=$package_root/scripts/check-bootstrap-assets.py
-nginx_example=$package_root/packaging/nginx/ntip.conf.example
 
-for path in "$manifest" "$validator" "$nginx_example"; do
+for path in "$manifest" "$validator"; do
     if [ ! -f "$path" ] || [ -L "$path" ]; then
         echo "bootstrap-assets package file is missing or unsafe: $path" >&2
         exit 1
@@ -170,8 +169,6 @@ else
     trap - EXIT INT TERM HUP
 fi
 
-install_file root root 0644 "$nginx_example" \
-    /usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example
 if [ -f "$package_root/docs/node-bootstrap.md" ] && [ ! -L "$package_root/docs/node-bootstrap.md" ]; then
     install_file root root 0644 "$package_root/docs/node-bootstrap.md" \
         /usr/share/doc/ntip-bootstrap-assets/node-bootstrap.md
@@ -185,5 +182,5 @@ if [ "$staging" -eq 1 ]; then
     echo "NTIP bootstrap assets staged under DESTDIR=$destdir."
 else
     echo "NTIP bootstrap assets $version installed."
-    echo "The dashboard gateway serves these assets; no reverse-proxy configuration was changed."
+    echo "The dashboard gateway serves these assets; configure the external TLS proxy separately."
 fi

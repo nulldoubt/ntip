@@ -106,11 +106,12 @@ Packaging emits four architecture-matched artifacts per architecture: the core
 `ntip-dashboard-v...`, and the Node-only `ntip-node-v...` archive. One
 architecture-neutral `ntip-bootstrap-assets-v...` Master package contains both
 Node-only archives, their checksum/SBOM sidecars, the strict manifest, the
-installer template, and the operator-owned NGINX example. The API installer
+installer template, and bootstrap documentation. The API installer
 verifies its version against the installed core and receives no SQLite or
 state-directory access. The bootstrap-assets installer validates both Node
-archives and installs the manifest required by `ntip-api`; it does not enable
-NGINX. The dashboard installer requires matching installed core and API
+archives and installs the manifest required by `ntip-api`; reverse-proxy
+configuration remains entirely operator-owned. The dashboard installer
+requires matching installed core and API
 versions and bundles Bun 1.3.14 with architecture-neutral Next standalone
 output.
 
@@ -137,7 +138,6 @@ export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
 scripts/check-clean-release-reproducibility.sh "$(scripts/check-version.sh)"
 scripts/check-installer-isolation.sh dist/*.tar.gz
 scripts/check-bootstrap-assets-install.sh
-scripts/check-nginx-bootstrap-config.sh
 ```
 
 The static-musl clean-build script exports the committed tree into two different
@@ -148,8 +148,9 @@ bootstrap-assets archive, manifests, and checksum sidecars byte-for-byte. Only
 one verified result is copied into the repository's `zig-out/release` and
 `dist` directories. Installer-isolation checks reject Master/API material in a
 Node package and exercise installation/removal of the real bootstrap-assets
-archive. The NGINX check parses the packaged example with an ephemeral test
-certificate.
+archive. Installed-system smoke probes the schema-2 dashboard gateway on its
+packaged plain-HTTP port, while public TLS and forwarding policy remain an
+external deployment concern.
 
 The dashboard has a separate two-build archive check:
 

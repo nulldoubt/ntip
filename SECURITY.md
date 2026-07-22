@@ -79,8 +79,10 @@ pre-release phase.
   `.node` modules, and ELF files outside the separately validated Bun runtime.
   Verify Node-only archives separately: they must contain `ntcl` but no Master,
   API, dashboard, server configuration, or server unit. Verify the combined
-  bootstrap-assets manifest and packaged NGINX configuration before enabling
-  new-Node enrollment.
+  bootstrap-assets manifest before enabling new-Node enrollment. Independently
+  review the operator-owned TLS proxy and firewall policy: the proxy must
+  forward the complete public origin to the dashboard gateway, and the plain-
+  HTTP listener must not be generally reachable.
 
 ## Cryptography policy
 

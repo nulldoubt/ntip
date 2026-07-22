@@ -49,7 +49,6 @@ for archive in "$@"; do
             DESTDIR=$root "$install_script"
             test -f "$root/etc/ntip/bootstrap-assets.json"
             test -d "$root/usr/share/ntip/bootstrap-assets"
-            test -f "$root/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example"
             test "$(find "$root/usr/share/ntip/bootstrap-assets" -maxdepth 1 -type f -name 'ntip-node-v*-linux-musl.tar.gz' | wc -l | tr -d ' ')" = 2
             test ! -e "$root/usr/bin/ntsrv"
             test ! -e "$root/usr/bin/ntcl"

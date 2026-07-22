@@ -178,23 +178,10 @@ def validate(repo: Path) -> None:
         "API must not start without the root-owned bootstrap manifest",
     )
 
-    nginx = (repo / "packaging/nginx/ntip.conf.example").read_text(encoding="utf-8")
-    for contract in {
-        "limit_req_zone $binary_remote_addr zone=ntip_enrollment_redeem:1m rate=10r/m;",
-        "location = /enrollment/v1/redeem",
-        "client_max_body_size 128;",
-        "limit_req zone=ntip_enrollment_redeem burst=5 nodelay;",
-        "proxy_request_buffering off;",
-        "proxy_buffering off;",
-        "proxy_cache off;",
-        "access_log off;",
-        "alias /usr/share/ntip/bootstrap-assets/$1;",
-        'add_header Cache-Control "public, max-age=31536000, immutable";',
-        "location ^~ /api/v1/",
-        "proxy_pass http://127.0.0.1:3000;",
-    }:
-        require(contract in nginx, f"NGINX bootstrap example lacks contract: {contract}")
-    require("$http_x_forwarded_for" not in nginx, "NGINX must not trust a forwarded socket peer")
+    require(
+        not (repo / "packaging/nginx/ntip.conf.example").exists(),
+        "same-host NGINX configuration must not ship beside the dashboard gateway",
+    )
 
     bootstrap_installer = (repo / "scripts/install-bootstrap-assets.sh").read_text(encoding="utf-8")
     for contract in {
@@ -203,7 +190,7 @@ def validate(repo: Path) -> None:
         "install_file root root 0644 \"$source\" \"/usr/share/ntip/bootstrap-assets/$name\"",
         "install -o root -g ntip-api -m 0640 \"$manifest\" \"$manifest_tmp\"",
         "mv -f \"$manifest_tmp\" /etc/ntip/bootstrap-assets.json",
-        "/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example",
+        "configure the external TLS proxy separately",
     }:
         require(contract in bootstrap_installer, f"bootstrap-assets installer lacks contract: {contract}")
     bootstrap_packager = (repo / "scripts/package-bootstrap-assets.sh").read_text(encoding="utf-8")
@@ -211,7 +198,6 @@ def validate(repo: Path) -> None:
         "scripts/install-bootstrap-assets.sh",
         "scripts/uninstall-bootstrap-assets.sh",
         "scripts/check-bootstrap-assets.py",
-        "packaging/nginx/ntip.conf.example",
     }:
         require(package_path in bootstrap_packager, f"bootstrap-assets package omits {package_path}")
     for line in {

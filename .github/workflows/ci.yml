@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -144,7 +145,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils file jq nginx openssl python3-venv
+          sudo apt-get install -y binutils file jq python3-venv
       - run: zig build cross
       - name: Two clean reproducible release builds and archives
         run: |
@@ -159,8 +160,6 @@ jobs:
             | tee artifacts/secret-exposure.txt
           ./scripts/check-bootstrap-assets-install.sh \
             | tee artifacts/bootstrap-assets-install.txt
-          ./scripts/check-nginx-bootstrap-config.sh \
-            | tee artifacts/nginx-bootstrap-config.txt
       - name: Validate SPDX with the official SPDX Python tools
         run: |
           python3 -m venv "$RUNNER_TEMP/spdx-tools"
@@ -285,7 +284,7 @@ jobs:
           sudo systemctl start ntip-dashboard.service
           dashboard_ready=0
           for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:3000/login >/dev/null 2>&1; then
+            if curl --fail --silent http://127.0.0.1:443/login >/dev/null 2>&1; then
               dashboard_ready=1
               break
             fi
@@ -410,7 +409,7 @@ jobs:
           sudo systemctl start ntip-dashboard.service
           dashboard_ready=0
           for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:3000/login >/dev/null 2>&1; then
+            if curl --fail --silent http://127.0.0.1:443/login >/dev/null 2>&1; then
               dashboard_ready=1
               break
             fi

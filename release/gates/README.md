@@ -39,10 +39,11 @@ An approved record is required to be internally release-ready even in
 shape-only mode. Duplicate JSON keys, duplicate/missing/extra gate names,
 unknown schema fields, wrong types, and a version mismatch fail closed.
 
-Changing a record is a security-sensitive review action. The GitHub `release`
-environment must also require a human reviewer. Release tags must be signed,
+Changing a record is a security-sensitive review action. The GitHub
+`production-beta` environment must also require a human reviewer. Release tags
+must be signed,
 annotated tags whose GitHub tag-object verification is `valid`, resolve
-directly to a commit, and point to a commit on `origin/main`.
+directly to a commit, and point to a commit on `origin/master`.
 
 Release validation/building runs with read-only repository permissions and a
 checkout that does not persist credentials. The downstream publication job is
@@ -54,8 +55,9 @@ read-only jobs, so their network-fetched dependencies cannot modify the build
 workspace or execute with publication authority.
 
 CI archive reproducibility, packaged-binary execution, SPDX validation,
-isolated installer tests, bootstrap-assets/NGINX validation, and
-`systemd-analyze security` reports are mechanical evidence only. Automation
+isolated installer tests, bootstrap-assets validation, installed dashboard-
+gateway probing, and `systemd-analyze security` reports are mechanical
+evidence only. Automation
 never edits these records or changes `passed`,
 `evidence`, or `approved`. In particular, a systemd exposure score and green CI
 do not substitute for a 24-hour soak, benchmark report, native rollout record,
@@ -70,6 +72,8 @@ build, checked standalone-launcher smoke, and Playwright scripts all pass.
 Architecture-matched archive validation also starts the packaged JSON launcher
 and probes its preview-cookie guard. The same clean-build gate validates both
 Node-only static-musl archives, the combined bootstrap-assets archive and
-manifest, Node installer isolation, and the packaged NGINX configuration.
+manifest, and Node installer isolation. The external TLS proxy remains outside
+the release artifact and must forward the whole origin to the configured
+plain-HTTP dashboard gateway.
 Development version `0.2.0-dev` is intentionally not treated as a release
 candidate.

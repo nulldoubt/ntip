@@ -54,7 +54,7 @@ passwd/group alias.
 
 Install the same-version Master bootstrap-assets package next. It contains both
 Node CPU architectures, their checksum and SBOM sidecars, a strict manifest,
-and an optional NGINX reference example; it never enables or rewrites NGINX:
+and bootstrap documentation. It never installs or rewrites a reverse proxy:
 
 ```sh
 sha256sum --check ntip-bootstrap-assets-vVERSION.tar.gz.sha256
@@ -64,9 +64,11 @@ sudo ntip-bootstrap-assets-vVERSION/scripts/install-bootstrap-assets.sh
 
 The installer places immutable versioned files under
 `/usr/share/ntip/bootstrap-assets`, the API-readable manifest at
-`/etc/ntip/bootstrap-assets.json`, and the proxy example under
+`/etc/ntip/bootstrap-assets.json`, and supporting documentation under
 `/usr/share/doc/ntip-bootstrap-assets`. Keep old immutable Node archives while
-an invitation that names them may remain valid.
+an invitation that names them may remain valid. Configure the external TLS
+proxy independently so it forwards the complete HTTPS origin, without path
+rewriting, to the dashboard gateway's plain-HTTP listener.
 
 Install the optional dashboard only after the same-version core, API, and
 bootstrap-assets packages:
@@ -181,7 +183,7 @@ different owner or group.
   ntip-node-vVERSION-*.tar.gz               0644 root:root
   *.tar.gz.sha256 / *.spdx.json             0644 root:root
 /usr/share/doc/ntip-bootstrap-assets/
-  ntip-nginx.conf.example                   0644 root:root
+  node-bootstrap.md                         0644 root:root
 
 /usr/lib/ntip-dashboard/runtime/bun         0755 root:root
 /usr/lib/ntip-dashboard/app/                read-only root:root

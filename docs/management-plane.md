@@ -300,8 +300,10 @@ remain operator decisions. Component SBOMs distinguish the SQLite-bearing core
 from the DB-free API. Node-only static-musl archives contain `ntcl` and no
 Master/API material. One combined bootstrap-assets package carries both Node
 architectures, their checksums/SBOMs, the strict manifest, installer template,
-and an optional reviewed NGINX reference example. Release checks compare both architectures,
-bootstrap package, manifest, and both clean builds byte-for-byte.
+and bootstrap documentation. It deliberately carries no same-host reverse-
+proxy configuration because the external TLS edge is operator-owned. Release
+checks compare both architectures, bootstrap package, manifest, and both clean
+builds byte-for-byte.
 
 The dashboard is a third, separately installable architecture-matched artifact:
 `ntip-dashboard-vVERSION-x86_64-linux.tar.gz` or

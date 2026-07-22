@@ -44,7 +44,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils jq nginx openssl unzip
+          sudo apt-get install -y binutils jq unzip
       - name: Select and validate version
         id: version
         env:
@@ -76,7 +76,7 @@ jobs:
             test "$(jq -r '.tag' <<<"$tag_json")" = "$GITHUB_REF_NAME"
             release_commit=$(jq -r '.object.sha' <<<"$tag_json")
             test "$release_commit" = "$(git rev-parse "$GITHUB_REF_NAME^{}")"
-            git merge-base --is-ancestor "$release_commit" origin/main
+            git merge-base --is-ancestor "$release_commit" origin/master
           else
             tag_sha=
             release_commit=$GITHUB_SHA
@@ -115,7 +115,6 @@ jobs:
           ./scripts/check-dashboard-release-reproducibility.sh \
             "${{ steps.version.outputs.version }}"
           ./scripts/check-bootstrap-assets-install.sh
-          ./scripts/check-nginx-bootstrap-config.sh
       - name: Verify isolated installer lifecycle and aggregate checksums
         run: |
           ./scripts/check-installer-isolation.sh dist/*.tar.gz

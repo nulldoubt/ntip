@@ -85,7 +85,6 @@ trap 'rm -rf "$work"' EXIT INT TERM HUP
 install -d -m 0755 \
     "$stage/assets" \
     "$stage/docs" \
-    "$stage/packaging/nginx" \
     "$stage/scripts"
 
 jq -n \
@@ -116,8 +115,6 @@ install -m 0755 "$repo_root/scripts/uninstall-bootstrap-assets.sh" \
     "$stage/scripts/uninstall-bootstrap-assets.sh"
 install -m 0755 "$repo_root/scripts/check-bootstrap-assets.py" \
     "$stage/scripts/check-bootstrap-assets.py"
-install -m 0644 "$repo_root/packaging/nginx/ntip.conf.example" \
-    "$stage/packaging/nginx/ntip.conf.example"
 install -m 0644 "$repo_root/docs/node-bootstrap.md" "$stage/docs/node-bootstrap.md"
 install -m 0644 "$repo_root/LICENSE" "$stage/LICENSE"
 

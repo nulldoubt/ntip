@@ -16,13 +16,11 @@ package=$work/ntip-bootstrap-assets-v0.2.0-test
 root=$work/root
 install -d -m 0755 \
     "$package/assets" \
-    "$package/packaging/nginx" \
     "$package/scripts" \
     "$root"
 install -m 0755 "$repo_root/scripts/install-bootstrap-assets.sh" "$package/scripts/"
 install -m 0755 "$repo_root/scripts/uninstall-bootstrap-assets.sh" "$package/scripts/"
 install -m 0755 "$repo_root/scripts/check-bootstrap-assets.py" "$package/scripts/"
-install -m 0644 "$repo_root/packaging/nginx/ntip.conf.example" "$package/packaging/nginx/"
 
 version=0.2.0-test
 x86=ntip-node-v$version-x86_64-linux-musl.tar.gz
@@ -54,8 +52,6 @@ for name in \
 do
     cmp "$package/assets/$name" "$root/usr/share/ntip/bootstrap-assets/$name"
 done
-cmp "$package/packaging/nginx/ntip.conf.example" \
-    "$root/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example"
 test ! -e "$root/etc/nginx"
 python3 - "$root" <<'PY'
 import os, pathlib, stat, sys
@@ -63,7 +59,6 @@ root = pathlib.Path(sys.argv[1])
 expected = {
     "etc/ntip/bootstrap-assets.json": 0o640,
     "usr/share/ntip/bootstrap-assets": 0o755,
-    "usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example": 0o644,
 }
 for relative, mode in expected.items():
     actual = stat.S_IMODE(os.stat(root / relative).st_mode)
@@ -76,4 +71,3 @@ test ! -e "$root/etc/ntip/bootstrap-assets.json"
 test ! -e "$root/usr/share/ntip/bootstrap-assets"
 test ! -e "$root/usr/share/doc/ntip-bootstrap-assets"
 echo "bootstrap_assets_install=passed"
-
