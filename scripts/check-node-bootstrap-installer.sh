@@ -113,4 +113,55 @@ do
     }
 done
 
+# Parse checks alone cannot prove that Bash's ERE dialect accepts the exact
+# validated origins embedded by ntip-api. Render every token, remove only the
+# final mutation entry point, source the definitions, and execute the generated
+# constant guard against representative DNS, IPv4, and bracketed IPv6 origins.
+runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/ntip-bootstrap-origin.XXXXXX")
+trap 'rm -rf -- "$runtime_dir"' 0 HUP INT TERM
+runtime_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+render_runtime_installer() {
+    runtime_origin=$1
+    runtime_output=$2
+    sed \
+        -e 's|@NTIP_BOOTSTRAP_ID@|ABCDEFGH|g' \
+        -e "s|@NTIP_PUBLIC_HTTPS_ORIGIN@|$runtime_origin|g" \
+        -e 's|@NTIP_BOOTSTRAP_SPKI_PIN@|sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=|g' \
+        -e 's|@NTIP_NODE_VERSION@|0.2.0-dev|g' \
+        -e 's|@NTIP_X86_64_ARCHIVE_PATH@|/enrollment/assets/ntip-node-v0.2.0-dev-x86_64-linux-musl.tar.gz|g' \
+        -e "s|@NTIP_X86_64_ARCHIVE_SHA256@|$runtime_digest|g" \
+        -e 's|@NTIP_X86_64_ARCHIVE_SIZE@|1024|g' \
+        -e 's|@NTIP_AARCH64_ARCHIVE_PATH@|/enrollment/assets/ntip-node-v0.2.0-dev-aarch64-linux-musl.tar.gz|g' \
+        -e "s|@NTIP_AARCH64_ARCHIVE_SHA256@|$runtime_digest|g" \
+        -e 's|@NTIP_AARCH64_ARCHIVE_SIZE@|1024|g' \
+        "$template" | sed '$d' >"$runtime_output"
+}
+
+for runtime_origin in \
+    https://ntip.example.test \
+    https://ntip.example.test:8443 \
+    https://10.2.40.49:8443 \
+    'https://[::1]:8443'
+do
+    runtime_fixture=$runtime_dir/valid.sh
+    render_runtime_installer "$runtime_origin" "$runtime_fixture"
+    bash -c '. "$1"; validate_generated_constants' ntip-origin-check "$runtime_fixture"
+done
+
+for runtime_origin in \
+    http://ntip.example.test \
+    https://ntip.example.test/path \
+    https://user@ntip.example.test
+do
+    runtime_fixture=$runtime_dir/invalid.sh
+    render_runtime_installer "$runtime_origin" "$runtime_fixture"
+    if bash -c '. "$1"; validate_generated_constants' ntip-origin-check "$runtime_fixture" \
+        >/dev/null 2>&1
+    then
+        echo "bootstrap installer accepted invalid generated origin: $runtime_origin" >&2
+        exit 1
+    fi
+done
+
 echo "node_bootstrap_installer_contract=passed"

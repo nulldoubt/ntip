@@ -250,6 +250,7 @@ test "service socket path rejects ambiguous components" {
 test "public origin is an exact lowercase HTTPS origin without a path" {
     try validatePublicHttpsOrigin("https://ntip.example.test");
     try validatePublicHttpsOrigin("https://ntip.example.test:8443");
+    try validatePublicHttpsOrigin("https://10.2.40.49:8443");
     try validatePublicHttpsOrigin("https://[::1]:8443");
     try std.testing.expectError(error.InvalidPublicOrigin, validatePublicHttpsOrigin("http://ntip.example.test"));
     try std.testing.expectError(error.InvalidPublicOrigin, validatePublicHttpsOrigin("https://NTIP.example.test"));

@@ -64,7 +64,12 @@ install_dependencies() {
 validate_generated_constants() {
     [[ "$bootstrap_id" =~ ^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$ ]] || \
         fail "generated bootstrap ID is invalid"
-    local origin_pattern='^https://[a-z0-9.:\[\]-]+$'
+    # The API configuration parser has already validated the canonical host
+    # and port. Repeat the security boundary here with a Bash-compatible ERE
+    # so a corrupted generated script cannot turn the origin into shell or URL
+    # syntax. Literal brackets must live outside the character classes: the
+    # previous escaped-bracket class matched no valid origin in Bash.
+    local origin_pattern='^https://([a-z0-9.-]+|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$'
     [[ "$public_origin" =~ $origin_pattern ]] || fail "generated HTTPS origin is invalid"
     [[ "$spki_pin" =~ ^sha256//[A-Za-z0-9+/]{43}=$ ]] || fail "generated SPKI pin is invalid"
     [[ "$node_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$ ]] || \

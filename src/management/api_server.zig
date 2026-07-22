@@ -2457,7 +2457,7 @@ test "public installer is locator specific pinned complete and mutation last" {
     var fake: FakeBackend = .{};
     const document = FixedDocument{ .bytes = "{}" };
     const handler: Handler = .{
-        .public_https_origin = "https://192.0.2.1",
+        .public_https_origin = "https://10.2.40.49:8443",
         .bootstrap_spki_pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         .bootstrap_manifest = test_bootstrap_manifest,
         .openapi = OpenApiProvider.fromFixedDocument(&document),
@@ -2476,6 +2476,11 @@ test "public installer is locator specific pinned complete and mutation last" {
     try std.testing.expectEqual(http.Status.ok, response.status);
     try std.testing.expectEqualStrings("text/x-shellscript; charset=utf-8", response.content_type);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "readonly bootstrap_id='ABCDEFGH'") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        response.body,
+        "readonly public_origin='https://10.2.40.49:8443'",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "readonly spki_pin='sha256//AAAAAAAA") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, test_bootstrap_archives[0].sha256) != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "@NTIP_") == null);

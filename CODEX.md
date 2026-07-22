@@ -16,8 +16,10 @@ security policy, or milestone status.
   `feat/node-bootstrap`. The repository and commit-pinned demonstration
   installer are published, both public Pangolin resources are anonymous, and
   the exact showcase command completed two fresh-host installation cycles on
-  `test02`. The operator-driven Node enrollment recording remains. The stable
-  v0.2.0 release stays gated by its separate evidence policy.
+  `test02`. A generated-installer origin-validation correction for DNS, IPv4,
+  non-default ports, and bracketed IPv6 is verified and the operator-driven
+  Node enrollment recording is in progress. The stable v0.2.0 release stays
+  gated by its separate evidence policy.
 - SQLite schema version: `2`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -63,7 +65,9 @@ security policy, or milestone status.
   and benchmark evidence remain separate release gates. Anonymous public
   showcase/management routing, immutable preview delivery, and a fresh-host
   install/reinstall from the exact public one-line command also pass on
-  x86_64 `test02`.
+  x86_64 `test02`. The generated-installer executable origin matrix passes for
+  DNS, IPv4 with `:8443`, and bracketed IPv6, and rejects HTTP, paths, and
+  userinfo within the same 47/47 check graph.
 
 ## Current State
 
@@ -308,6 +312,13 @@ downloads with generate, replace, and reset-plus-generate actions.
 
 ### Implemented
 
+- Generated Node installers now revalidate the API-authoritative HTTPS origin
+  with a Bash-compatible ERE for DNS, IPv4, optional non-default ports, and
+  bracketed IPv6. The previous escaped-bracket character class rejected every
+  valid origin before redemption. The shell contract now renders every token,
+  suppresses only the final `main` call, and executes the real constant guard
+  against valid and invalid origin matrices; Zig config and rendering tests
+  retain the exact `https://10.2.40.49:8443` regression case.
 - Schema 2 adds permanently unique public bootstrap locators, random enrollment
   handles, derivation/lifecycle timestamps, first-redemption state, and bounded
   real-locator throttle state. The short code, credential secret, bootstrap
