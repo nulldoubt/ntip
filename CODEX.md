@@ -17,9 +17,9 @@ security policy, or milestone status.
   installer are published, both public Pangolin resources are anonymous, and
   the exact showcase command completed two fresh-host installation cycles on
   `test02`. A generated-installer origin-validation correction for DNS, IPv4,
-  non-default ports, and bracketed IPv6 is verified and the operator-driven
-  Node enrollment recording is in progress. The stable v0.2.0 release stays
-  gated by its separate evidence policy.
+  non-default ports, and bracketed IPv6 is deployed; the exact generated
+  command enrolled `test01` and passed bidirectional DATA plus reconnect proof.
+  The stable v0.2.0 release stays gated by its separate evidence policy.
 - SQLite schema version: `2`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -35,17 +35,18 @@ security policy, or milestone status.
   listener; the updated 52-test unit tree, production build, exact-Bun runtime
   smoke, and 26/26 Playwright journeys pass. Native packaged-launcher
   execution also passes on x86_64 Linux.
-- Last verified commit: `dd89ba7bf20ee43656274b57442226dc8b189306`
-  (`build: align releases with external TLS gateway`).
+- Last verified commit: `f3fa1235e510253bc5c5d497bbcfec9912876949`
+  (`fix: accept valid bootstrap HTTPS origins`).
 - Last verified implementation: commit
-  `dd89ba7bf20ee43656274b57442226dc8b189306`; it includes schema-2 invitation
+  `f3fa1235e510253bc5c5d497bbcfec9912876949`; it includes schema-2 invitation
   persistence/derivation/throttling, atomic inventory and one-time issuance,
   public redemption and generated pinned installer, strict bootstrap import,
   Node-only/bootstrap-assets packaging, management/dashboard flows,
   consumed-marker idempotency, restore/consume invalidation, the bounded
   whole-origin dashboard gateway, Linux-portable directory handling, and
   unchanged Node wire enrollment, master-branch CI/release alignment, and
-  external-proxy-only packaging with no same-host NGINX artifact.
+  external-proxy-only packaging with no same-host NGINX artifact, plus the
+  executable generated-origin regression and its live Node-enrollment fix.
 - Migration 0001 SHA-256:
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
 - Migration 0002 SHA-256:
@@ -930,6 +931,25 @@ downloads with generate, replace, and reset-plus-generate actions.
   generated administrator credential is retained only for this test at
   `/root/ntip-test-admin.password`, mode `0600`; the public test certificate is
   copied to `/Users/alkhatib/Desktop/ntip-test02.crt` and expires 2026-07-29.
+- Commit `f3fa1235e510253bc5c5d497bbcfec9912876949` corrected the generated
+  installer's Bash origin guard after the live `https://10.2.40.49:8443`
+  invitation exposed that the previous escaped-bracket ERE rejected every
+  valid origin. The 47/47 check graph and 452/452 tests pass, including an
+  executable DNS/IPv4/IPv6 origin matrix. Only `ntip-api` was replaced on
+  `test02`; its static x86_64 binary SHA-256 is
+  `86d1b6fcbf5a425fe7f3556708e76e64552112af8f2dc95ae16cb9f44e7761d9`,
+  with the previous binary retained at
+  `/var/backups/ntip/ntip-api-pre-f3fa123`.
+- The exact dashboard-generated command then installed the Node-only package
+  on the previously clean x86_64 Ubuntu host `test01`, prompted for the secret
+  only through `/dev/tty`, redeemed through the pinned HTTPS endpoint, and
+  completed the unchanged protocol enrollment. Node `node01` is online at
+  `10.10.1.100/32`; `ntcl` is active and enabled, and the Master inventory is
+  generation 3 with one Node. Five ICMP packets passed in each direction
+  between `10.10.1.100` and Master `10.10.1.1` with zero loss. A subsequent
+  `ntcl` restart returned online and another three probes passed with zero
+  loss. The consumed `bootstrap.id` is absent, and neither Node state nor the
+  `ntcl` journal contains a short-code-shaped value.
 
 ### Deferred or out of scope
 
@@ -978,6 +998,8 @@ downloads with generate, replace, and reset-plus-generate actions.
   fresh-state reset, NGINX removal, and local/Newt live handoff
 - [x] Anonymous public proxy routing, immutable preview delivery, and exact
   one-line server-installer proof on clean `test02`
+- [x] Exact generated-command enrollment, bidirectional DATA, and reconnect
+  proof on clean `test01`
 - [ ] Operator-driven Node bootstrap proof on vps01 and ubuntu110
 - [ ] Stable v0.2.0 evidence gate, signed publication, and release handoff
 
