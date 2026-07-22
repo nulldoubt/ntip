@@ -44,28 +44,39 @@ describe("dashboard runtime configuration", () => {
 
   test("accepts only the complete strict dashboard bootstrap object", () => {
     expect(parseDashboardBootstrap({
-      schema_version: 1,
-      bind_address: "127.0.0.1",
-      port: 3000,
+      schema_version: 2,
+      bind_address: "0.0.0.0",
+      port: 443,
       api_origin: "http://127.0.0.1:8787",
+      bootstrap_assets_root: "/usr/share/ntip/bootstrap-assets",
     })).toEqual({
-      schemaVersion: 1,
-      bindAddress: "127.0.0.1",
-      port: 3000,
+      schemaVersion: 2,
+      bindAddress: "0.0.0.0",
+      port: 443,
       apiOrigin: "http://127.0.0.1:8787",
+      bootstrapAssetsRoot: "/usr/share/ntip/bootstrap-assets",
     });
     expect(() => parseDashboardBootstrap({
-      schema_version: 1,
-      bind_address: "0.0.0.0",
-      port: 3000,
-      api_origin: "http://127.0.0.1:8787",
-    })).toThrow("loopback");
-    expect(() => parseDashboardBootstrap({
-      schema_version: 1,
+      schema_version: 2,
       bind_address: "127.0.0.1",
-      port: 3000,
+      port: 443,
       api_origin: "http://127.0.0.1:8787",
+      bootstrap_assets_root: "/usr/share/ntip/bootstrap-assets",
+    })).toThrow("0.0.0.0");
+    expect(() => parseDashboardBootstrap({
+      schema_version: 2,
+      bind_address: "0.0.0.0",
+      port: 443,
+      api_origin: "http://127.0.0.1:8787",
+      bootstrap_assets_root: "/usr/share/ntip/bootstrap-assets",
       public_origin: "https://ntip.example.invalid",
     })).toThrow("missing or unknown");
+    expect(() => parseDashboardBootstrap({
+      schema_version: 2,
+      bind_address: "0.0.0.0",
+      port: 443,
+      api_origin: "http://127.0.0.1:8787",
+      bootstrap_assets_root: "/tmp/ntip-assets",
+    })).toThrow("bootstrap_assets_root");
   });
 });

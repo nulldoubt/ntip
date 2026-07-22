@@ -57,6 +57,5 @@ do
     fi
 done
 
-echo "NTIP bootstrap manifest, immutable assets, and packaged NGINX example removed."
-echo "Operator-owned enabled NGINX configuration was not changed."
-
+echo "NTIP bootstrap manifest, immutable assets, and optional proxy example removed."
+echo "Operator-owned reverse-proxy configuration was not changed."

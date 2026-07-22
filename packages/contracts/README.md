@@ -6,7 +6,7 @@ this surface as a general-purpose external automation API.
 
 `openapi/ntip-bootstrap-v1.yaml` is the separate, cookie-independent public
 Node bootstrap contract. It covers only generated installer scripts, strict
-invitation redemption, and NGINX-owned immutable release assets. It must never
+invitation redemption, and dashboard-gateway-owned immutable release assets. It must never
 inherit the management session or same-origin mutation model.
 
 Generation produces JSON, TypeScript schemas, and `openapi-fetch` clients for

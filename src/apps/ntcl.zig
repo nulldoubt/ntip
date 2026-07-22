@@ -162,7 +162,12 @@ fn bootstrapImport(
 }
 
 fn validateFreshStateDirectory(dir: std.Io.Dir, io: std.Io) !void {
-    var iterator = dir.iterate();
+    var iterable_dir = try dir.openDir(io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer iterable_dir.close(io);
+    var iterator = iterable_dir.iterateAssumeFirstIteration();
     while (try iterator.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, "state.lock")) continue;
         return error.AlreadyBootstrapped;
@@ -171,7 +176,12 @@ fn validateFreshStateDirectory(dir: std.Io.Dir, io: std.Io) !void {
 
 fn validateResumeStateDirectory(dir: std.Io.Dir, io: std.Io) !void {
     var found_state = false;
-    var iterator = dir.iterate();
+    var iterable_dir = try dir.openDir(io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer iterable_dir.close(io);
+    var iterator = iterable_dir.iterateAssumeFirstIteration();
     while (try iterator.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, "state.lock") or
             std.mem.eql(u8, entry.name, ntip.state.client_bootstrap.marker_file) or

@@ -41,8 +41,9 @@ Node administrator
        -> consume PSK and invalidate invitation atomically
 ```
 
-NGINX terminates TLS and serves immutable, versioned Node archives. It routes
-script generation and redemption to the loopback-only API. The copied command
+An operator-managed reverse proxy terminates TLS and forwards the whole origin
+to the dashboard gateway. The gateway serves immutable, versioned Node archives
+and routes script generation and redemption to the loopback-only API. The copied command
 pins the configured leaf-key SPKI while also using `--insecure` so a raw-IP,
 self-signed deployment can authenticate the exact intended key. Every curl
 invocation forces HTTP/1.1 because the HTTP/3/GnuTLS combination described in
@@ -127,7 +128,7 @@ management OpenAPI document:
   program for that public locator;
 - `POST /enrollment/v1/redeem` accepts only strict JSON containing
   `bootstrapId` and `secretCode`; and
-- `GET /enrollment/assets/{versioned-file}` is an NGINX-owned immutable static
+- `GET /enrollment/assets/{versioned-file}` is a dashboard-gateway-owned immutable static
   asset path.
 
 Redemption returns strict JSON containing the bundle schema version, locator,
@@ -138,7 +139,7 @@ transfer encoding, unknown fields, oversized bodies, and non-JSON media types.
 Unknown, invalid, expired, revoked, consumed, or locked invitations have one
 indistinguishable public error envelope.
 
-Admission is bounded at every layer: NGINX permits ten redemption requests per
+Admission is bounded at every layer: the dashboard gateway permits ten redemption requests per
 minute per socket peer with burst five; `ntip-api` admits at most two anonymous
 redemptions; `ntsrv` permits ten failed attempts per real locator within 15
 minutes and then applies a 15-minute cooldown. Unknown locators use a bounded
@@ -189,16 +190,12 @@ the strict manifest as `/etc/ntip/bootstrap-assets.json` owned by
 versioned payloads during an upgrade so an already-disclosed, still-valid
 command does not lose its immutable download target.
 
-The package also installs
-`/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example`. Copy and adapt
-that example inside NGINX's `http {}` context; the installer deliberately does
-not enable it or guess a TLS certificate, public address, or provider
-interface. The example routes only canonical eight-character installer paths
-and versioned asset basenames, bounds redemption bodies to 128 bytes, accepts
-only fixed-length `application/json` POSTs, strips cookies and forwarded
-identity headers, disables redemption buffering/caching/access logging, and
-applies the socket-peer rate of ten requests per minute with burst five. Its
-existing `/api/v1` and dashboard proxy blocks remain unchanged.
+The dashboard reads those immutable files through its fixed
+`bootstrap_assets_root`; it never reads the API manifest or writes the assets.
+The external TLS reverse proxy forwards every path unchanged to the dashboard
+gateway, which owns the strict locator, redemption, API, and asset routing.
+Restrict the plain-HTTP gateway listener to the trusted proxy at the host or
+provider firewall.
 
 ## Dashboard disclosure lifecycle
 

@@ -185,5 +185,5 @@ if [ "$staging" -eq 1 ]; then
     echo "NTIP bootstrap assets staged under DESTDIR=$destdir."
 else
     echo "NTIP bootstrap assets $version installed."
-    echo "Copy and adapt /usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example; no NGINX configuration was enabled automatically."
+    echo "The dashboard gateway serves these assets; no reverse-proxy configuration was changed."
 fi

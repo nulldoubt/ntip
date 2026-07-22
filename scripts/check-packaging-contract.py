@@ -120,20 +120,30 @@ def validate(repo: Path) -> None:
     dashboard = load_object(repo / "packaging/config/dashboard.json")
     require_exact(
         dashboard,
-        {"schema_version", "bind_address", "port", "api_origin"},
+        {
+            "schema_version",
+            "bind_address",
+            "port",
+            "api_origin",
+            "bootstrap_assets_root",
+        },
         "dashboard bootstrap",
     )
     require(
-        type(dashboard["schema_version"]) is int and dashboard["schema_version"] == 1,
-        "dashboard schema must be 1",
+        type(dashboard["schema_version"]) is int and dashboard["schema_version"] == 2,
+        "dashboard schema must be 2",
     )
     require(
-        dashboard["bind_address"] == "127.0.0.1" and dashboard["port"] == 3000,
-        "dashboard must bind to loopback:3000",
+        dashboard["bind_address"] == "0.0.0.0" and dashboard["port"] == 443,
+        "dashboard gateway must bind plain HTTP on 0.0.0.0:443",
     )
     require(
         dashboard["api_origin"] == f'http://{api["bind_address"]}:{api["port"]}',
         "dashboard must use the loopback API sample",
+    )
+    require(
+        dashboard["bootstrap_assets_root"] == "/usr/share/ntip/bootstrap-assets",
+        "dashboard bootstrap-assets root differs",
     )
 
     master_unit = unit_lines(repo / "packaging/systemd/ntsrv.service")
@@ -209,12 +219,10 @@ def validate(repo: Path) -> None:
         "Group=ntip-dashboard",
         "ExecStart=/usr/lib/ntip-dashboard/runtime/bun run --no-env-file /usr/lib/ntip-dashboard/app/launcher.ts --config /etc/ntip/dashboard.json",
         "Environment=BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
-        "CapabilityBoundingSet=",
-        "AmbientCapabilities=",
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+        "AmbientCapabilities=CAP_NET_BIND_SERVICE",
         "InaccessiblePaths=/var/lib/ntip /run/ntip /run/ntip-api",
-        "ReadOnlyPaths=/etc/ntip/dashboard.json /usr/lib/ntip-dashboard",
-        "IPAddressDeny=any",
-        "IPAddressAllow=localhost",
+        "ReadOnlyPaths=/etc/ntip/dashboard.json /usr/lib/ntip-dashboard /usr/share/ntip/bootstrap-assets",
         "RestrictAddressFamilies=AF_INET AF_INET6",
     }:
         require(line in dashboard_unit, f"dashboard unit is missing confinement: {line}")
@@ -225,6 +233,10 @@ def validate(repo: Path) -> None:
     require(
         "MemoryDenyWriteExecute=yes" not in dashboard_unit,
         "dashboard unit must retain JavaScriptCore JIT mappings",
+    )
+    require(
+        "ConditionPathExists=/usr/share/ntip/bootstrap-assets" in dashboard_unit,
+        "dashboard gateway must not start without immutable bootstrap assets",
     )
 
     backup_service = repo / "packaging/examples/systemd/ntip-online-backup.service"
@@ -330,7 +342,7 @@ def main() -> int:
         return 1
     print(
         "packaging_contract=passed server_schema=2 api_loopback=true "
-        "dashboard_loopback=true api_state_access=denied dashboard_state_access=denied"
+        "dashboard_gateway=0.0.0.0:443 api_state_access=denied dashboard_state_access=denied"
     )
     return 0
 

@@ -35,6 +35,7 @@ def main() -> int:
         return fail(f"not a directory: {root}")
     for required in (
         "launcher.ts",
+        "http-gateway.ts",
         "apps/dashboard/server.js",
         "apps/dashboard/.next/static",
         "node_modules/@ntip/config/src/index.ts",

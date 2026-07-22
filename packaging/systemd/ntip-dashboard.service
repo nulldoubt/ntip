@@ -5,6 +5,7 @@ Wants=ntip-api.service
 After=network.target ntip-api.service
 ConditionPathExists=/etc/ntip/dashboard.json
 ConditionPathExists=/usr/lib/ntip-dashboard/app/launcher.ts
+ConditionPathExists=/usr/share/ntip/bootstrap-assets
 
 [Service]
 Type=simple
@@ -23,13 +24,14 @@ Environment=NODE_ENV=production
 Environment=BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
 
 # The dashboard owns no state and cannot reach the Master database or either
-# Unix socket. JavaScriptCore requires executable JIT mappings, so this unit
-# deliberately does not enable MemoryDenyWriteExecute.
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Unix socket. CAP_NET_BIND_SERVICE permits the configured low-port public HTTP
+# listener. JavaScriptCore requires executable JIT mappings,
+# so this unit deliberately does not enable MemoryDenyWriteExecute.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 InaccessiblePaths=/var/lib/ntip /run/ntip /run/ntip-api
-ReadOnlyPaths=/etc/ntip/dashboard.json /usr/lib/ntip-dashboard
+ReadOnlyPaths=/etc/ntip/dashboard.json /usr/lib/ntip-dashboard /usr/share/ntip/bootstrap-assets
 
 ProtectSystem=strict
 ProtectHome=yes
@@ -44,8 +46,6 @@ ProtectKernelTunables=yes
 ProtectProc=invisible
 ProcSubset=pid
 RestrictAddressFamilies=AF_INET AF_INET6
-IPAddressDeny=any
-IPAddressAllow=localhost
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

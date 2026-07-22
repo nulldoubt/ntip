@@ -157,7 +157,16 @@ fn databaseStat(state_dir: std.Io.Dir, io: std.Io) !?std.Io.File.Stat {
 }
 
 fn makePrivate(tmp: *std.testing.TmpDir) !void {
-    try tmp.dir.setPermissions(std.testing.io, .fromMode(private_directory_mode));
+    try setTestDirectoryPermissions(tmp.dir, private_directory_mode);
+}
+
+fn setTestDirectoryPermissions(dir: std.Io.Dir, mode: std.posix.mode_t) !void {
+    var permission_dir = try dir.openDir(std.testing.io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer permission_dir.close(std.testing.io);
+    try permission_dir.setPermissions(std.testing.io, .fromMode(mode));
 }
 
 test "legacy Master files fail closed and are never modified" {
@@ -253,7 +262,7 @@ test "repository creates a private migrated database" {
 test "insecure database and state directory permissions are rejected" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o755));
+    try setTestDirectoryPermissions(tmp.dir, 0o755);
     try std.testing.expectError(
         error.InsecureStateDirectoryPermissions,
         validateStateDirectory(tmp.dir, std.testing.io),

@@ -134,6 +134,7 @@ for archive in "$@"; do
             DESTDIR=$root "$install_script"
             test -x "$root/usr/lib/ntip-dashboard/runtime/bun"
             test -f "$root/usr/lib/ntip-dashboard/app/launcher.ts"
+            test -f "$root/usr/lib/ntip-dashboard/app/http-gateway.ts"
             test -f "$root/usr/lib/ntip-dashboard/app/apps/dashboard/server.js"
             test -f "$root/usr/lib/systemd/system/ntip-dashboard.service"
             test -f "$root/etc/ntip/dashboard.json"
@@ -145,16 +146,17 @@ for archive in "$@"; do
             test ! -e "$root/run/ntip-api"
             cmp "$package_root/runtime/bun" "$root/usr/lib/ntip-dashboard/runtime/bun"
             cmp "$package_root/app/launcher.ts" "$root/usr/lib/ntip-dashboard/app/launcher.ts"
+            cmp "$package_root/app/http-gateway.ts" "$root/usr/lib/ntip-dashboard/app/http-gateway.ts"
             cmp "$package_root/packaging/systemd/ntip-dashboard.service" \
                 "$root/usr/lib/systemd/system/ntip-dashboard.service"
             grep -Fxq 'User=ntip-dashboard' "$root/usr/lib/systemd/system/ntip-dashboard.service"
             grep -Fxq 'Group=ntip-dashboard' "$root/usr/lib/systemd/system/ntip-dashboard.service"
-            grep -Fxq 'CapabilityBoundingSet=' "$root/usr/lib/systemd/system/ntip-dashboard.service"
-            grep -Fxq 'AmbientCapabilities=' "$root/usr/lib/systemd/system/ntip-dashboard.service"
+            grep -Fxq 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' "$root/usr/lib/systemd/system/ntip-dashboard.service"
+            grep -Fxq 'AmbientCapabilities=CAP_NET_BIND_SERVICE' "$root/usr/lib/systemd/system/ntip-dashboard.service"
             grep -Fxq 'InaccessiblePaths=/var/lib/ntip /run/ntip /run/ntip-api' \
                 "$root/usr/lib/systemd/system/ntip-dashboard.service"
-            grep -Fxq 'IPAddressDeny=any' "$root/usr/lib/systemd/system/ntip-dashboard.service"
-            grep -Fxq 'IPAddressAllow=localhost' "$root/usr/lib/systemd/system/ntip-dashboard.service"
+            grep -Fxq 'ReadOnlyPaths=/etc/ntip/dashboard.json /usr/lib/ntip-dashboard /usr/share/ntip/bootstrap-assets' \
+                "$root/usr/lib/systemd/system/ntip-dashboard.service"
             grep -Fq 'dashboard Bun runtime does not match this Linux architecture' "$install_script"
             grep -Fq 'dashboard package must bundle Bun 1.3.14 exactly' "$install_script"
             if grep -Fxq 'MemoryDenyWriteExecute=yes' "$root/usr/lib/systemd/system/ntip-dashboard.service"; then

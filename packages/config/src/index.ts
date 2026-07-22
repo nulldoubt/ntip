@@ -6,10 +6,11 @@ export type DashboardRuntimeConfig = Readonly<{
 }>;
 
 export type DashboardBootstrapConfig = Readonly<{
-  schemaVersion: 1;
-  bindAddress: "127.0.0.1" | "::1";
+  schemaVersion: 2;
+  bindAddress: "0.0.0.0";
   port: number;
   apiOrigin: string;
+  bootstrapAssetsRoot: "/usr/share/ntip/bootstrap-assets";
 }>;
 
 const loopbackHosts = new Set(["127.0.0.1", "[::1]"]);
@@ -87,16 +88,22 @@ export function parseDashboardBootstrap(value: unknown): DashboardBootstrapConfi
     throw new Error("dashboard configuration must be a JSON object");
   }
   const object = value as Record<string, unknown>;
-  const expected = ["api_origin", "bind_address", "port", "schema_version"] as const;
+  const expected = [
+    "api_origin",
+    "bind_address",
+    "bootstrap_assets_root",
+    "port",
+    "schema_version",
+  ] as const;
   const actual = Object.keys(object).sort();
   if (actual.length !== expected.length || expected.some((key, index) => actual[index] !== key)) {
     throw new Error("dashboard configuration contains missing or unknown fields");
   }
-  if (object.schema_version !== 1) {
-    throw new Error("dashboard schema_version must be 1");
+  if (object.schema_version !== 2) {
+    throw new Error("dashboard schema_version must be 2");
   }
-  if (object.bind_address !== "127.0.0.1" && object.bind_address !== "::1") {
-    throw new Error("dashboard bind_address must be loopback");
+  if (object.bind_address !== "0.0.0.0") {
+    throw new Error("dashboard bind_address must be 0.0.0.0");
   }
   if (!Number.isInteger(object.port) || (object.port as number) < 1 || (object.port as number) > 65_535) {
     throw new Error("dashboard port must be an integer from 1 through 65535");
@@ -104,10 +111,16 @@ export function parseDashboardBootstrap(value: unknown): DashboardBootstrapConfi
   if (typeof object.api_origin !== "string") {
     throw new Error("dashboard api_origin must be a string");
   }
+  if (object.bootstrap_assets_root !== "/usr/share/ntip/bootstrap-assets") {
+    throw new Error(
+      "dashboard bootstrap_assets_root must be /usr/share/ntip/bootstrap-assets",
+    );
+  }
   return {
-    schemaVersion: 1,
-    bindAddress: object.bind_address,
+    schemaVersion: 2,
+    bindAddress: "0.0.0.0",
     port: object.port as number,
     apiOrigin: parseLoopbackHttpOrigin(object.api_origin),
+    bootstrapAssetsRoot: "/usr/share/ntip/bootstrap-assets",
   };
 }

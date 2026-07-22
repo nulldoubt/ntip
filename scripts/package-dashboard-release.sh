@@ -147,6 +147,7 @@ if [ -d "$repo_root/apps/dashboard/public" ]; then
     cp -R "$repo_root/apps/dashboard/public/." "$stage/app/apps/dashboard/public/"
 fi
 install -m 0644 "$repo_root/apps/dashboard/scripts/launcher.ts" "$stage/app/launcher.ts"
+install -m 0644 "$repo_root/apps/dashboard/scripts/http-gateway.ts" "$stage/app/http-gateway.ts"
 install -d -m 0755 "$stage/app/node_modules/@ntip/config/src"
 install -m 0644 "$repo_root/packages/config/package.json" \
     "$stage/app/node_modules/@ntip/config/package.json"

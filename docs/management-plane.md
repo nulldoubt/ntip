@@ -2,14 +2,14 @@
 
 - **Status:** Implemented development architecture; verification is tracked in `CODEX.md`
 - **Audience:** NTIP developers, reviewers, release engineers, and operators
-- **Last updated:** 2026-07-20
+- **Last updated:** 2026-07-22
 
 ## Purpose
 
 NTIP v0.2 adds browser administration without moving protocol authority or
 database access out of `ntsrv`. The management plane is a local, bounded path
-from an operator-managed TLS proxy to an unprivileged HTTP process and then to
-one serialized application worker inside the Master.
+from an operator-managed TLS reverse proxy to the unprivileged dashboard HTTP
+gateway, then to one serialized application worker inside the Master.
 
 QAWS is an architectural reference only. NTIP independently implements its
 bounded parsing, admission control, event-loop, keep-alive, deadline, and
@@ -18,8 +18,9 @@ partial-write patterns and has no QAWS source or package dependency.
 ```mermaid
 flowchart LR
     browser["Operator browser"] -->|"HTTPS, same origin"| proxy["Operator TLS proxy"]
-    proxy -->|"pages"| dashboard["Bun + Next.js dashboard"]
-    proxy -->|"/api/v1 over loopback"| api["ntip-api, unprivileged and DB-free"]
+    proxy -->|"plain HTTP, every path"| dashboard["Bun gateway + Next.js dashboard"]
+    dashboard -->|"API and bootstrap over loopback"| api["ntip-api, unprivileged and DB-free"]
+    dashboard -->|"validated immutable files"| assets["root-owned bootstrap assets"]
     api -->|"typed, bounded Unix IPC"| worker["ntsrv operator worker"]
     cli["Local human CLI"] -->|"existing CLI-shaped Unix IPC"| worker
     worker --> db["ntip.sqlite3, sole live owner"]
@@ -38,8 +39,8 @@ durable mutation decisions remain behind `/api/v1` and the service IPC.
 | `ntsrv` operator worker | SQLite connection, migrations, inventory, users, sessions, audit, settings, application serialization | Browser HTTP parsing, TLS |
 | `ntsrv` control/data plane | Wire protocol, live associations, TUN/UDP, immutable runtime projections | SQLite handles, web sessions |
 | `ntip-api` | Loopback HTTP/1.1, cookie/Origin/CSRF enforcement, HTTP-to-service DTO mapping, response streaming | SQLite, protocol keys, TUN/UDP |
-| Dashboard | Authenticated user experience, server-only loopback reads, bounded polling | Trust decisions based on cookie presence, durable secrets/state, direct IPC |
-| TLS proxy | Public HTTPS termination and same-origin routing | Client identity forwarding as an authorization source |
+| Dashboard gateway | Authenticated user experience, same-origin HTTP routing, immutable asset reads, server-only loopback API access, bounded polling | Trust decisions based on cookie presence, durable secrets/state, direct IPC, TLS termination |
+| TLS reverse proxy | Public HTTPS termination and whole-origin forwarding | Path-specific NTIP routing, client identity forwarding as an authorization source |
 
 `ntsrv` authenticates the `ntip-api` Unix peer with `SO_PEERCRED`. The API
 ignores forwarded client-IP headers; audit records the authenticated actor,
@@ -178,7 +179,7 @@ the operator contract, while the internal credential parser and Node wire
 exchange remain compatible.
 
 The cookie-independent Bootstrap v1 contract is deliberately separate from
-`/api/v1`. NGINX routes `GET /enrollment/{bootstrapId}` and
+`/api/v1`. The dashboard gateway routes `GET /enrollment/{bootstrapId}` and
 `POST /enrollment/v1/redeem` to `ntip-api`, and serves immutable versioned Node
 archives from `/enrollment/assets/`. The API never derives installer authority
 from Host or forwarded headers: strict configuration supplies the exact HTTPS
@@ -196,23 +197,23 @@ mutations, so the browser never learns or bypasses the internal API origin.
 Any protected Server Component read redirects on an authoritative API `401`,
 preventing parallel layout/page rendering from emitting child-request errors;
 `/auth/me`, not cookie presence, remains the authorization decision.
-Next defines no `/api/v1` rewrite. The TLS proxy is the sole browser API router,
-and a missing route fails visibly rather than falling back to a build-time
-destination that could disagree with runtime `api_origin`.
+Next defines no `/api/v1` rewrite. The packaged Bun gateway is the sole browser
+API router, and a missing route fails visibly rather than falling back to a
+build-time destination that could disagree with runtime `api_origin`.
 
 The production proxy split is exact:
 
 ```text
-https://ntip.example.com/*       -> http://127.0.0.1:3000/*
-https://ntip.example.com/api/v1  -> http://127.0.0.1:8787/api/v1
+https://ntip.example.com/* -> http://MASTER_ADDRESS:443/* -> dashboard gateway
 ```
 
 `/etc/ntip/dashboard.json` is a strict, maximum-64-KiB bootstrap object with
-only `schema_version`, loopback `bind_address`, `port`, and a loopback HTTP
-`api_origin`. The launcher rejects missing, empty, oversized, malformed,
-unknown-field, non-loopback, and invalid-port configurations before importing
-the standalone server. The API's separate `public_https_origin` remains the
-authority for exact browser Origin checks.
+only schema version 2, `0.0.0.0` `bind_address`, `port`, a loopback HTTP
+`api_origin`, and the fixed root-owned `bootstrap_assets_root`. The launcher
+rejects missing, empty, oversized, malformed, unknown-field, alternate-bind,
+invalid-port, and alternate-root configurations before starting Next on an
+ephemeral loopback port and the public plain-HTTP gateway. The API's separate
+`public_https_origin` remains the authority for exact browser Origin checks.
 
 One global scheduler admits at most two background reads. Overview, topology,
 Node runtime, and active-check views refresh every 10 seconds; event/audit
@@ -299,7 +300,7 @@ remain operator decisions. Component SBOMs distinguish the SQLite-bearing core
 from the DB-free API. Node-only static-musl archives contain `ntcl` and no
 Master/API material. One combined bootstrap-assets package carries both Node
 architectures, their checksums/SBOMs, the strict manifest, installer template,
-and reviewed NGINX example. Release checks compare both architectures,
+and an optional reviewed NGINX reference example. Release checks compare both architectures,
 bootstrap package, manifest, and both clean builds byte-for-byte.
 
 The dashboard is a third, separately installable architecture-matched artifact:
@@ -322,10 +323,10 @@ application objects so the only target-specific executable is the separately
 validated Bun runtime.
 
 The `ntip-dashboard` identity has no supplementary groups and is numerically
-distinct from `ntip` and `ntip-api`. Its unit has empty capability sets, no
-writable persistent path, read-only configuration/application trees,
-`InaccessiblePaths` covering Master state and both socket directories, and
-loopback-only IPv4/IPv6. It deliberately omits `MemoryDenyWriteExecute=yes`
+distinct from `ntip` and `ntip-api`. Its unit grants only
+`CAP_NET_BIND_SERVICE`, has no writable persistent path, keeps configuration,
+application, and bootstrap-assets trees read-only, and uses `InaccessiblePaths`
+for Master state and both socket directories. It deliberately omits `MemoryDenyWriteExecute=yes`
 because Bun's JavaScriptCore requires executable JIT mappings. Exact-Bun
 production start and same-origin Playwright remain mandatory release gates;
 there is no Node.js fallback.
@@ -335,7 +336,7 @@ Node-only x86_64 and AArch64 static-musl archives plus a checksummed manifest.
 Each Node archive contains `ntcl`, the Node unit, strict sample configuration,
 Node-only installer/uninstaller, documentation, checksums, and SBOM, and must
 not contain `ntsrv`, API/dashboard identities, Master configuration, or server
-units. NGINX serves only versioned assets from the validated manifest.
+units. The dashboard gateway serves only versioned assets from the validated manifest.
 
 ## Verification obligations
 

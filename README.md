@@ -38,20 +38,20 @@ as before. The clean break applies only to Master persistence and management:
 - an unprivileged, DB-free `ntip-api` serves bounded HTTP/1.1 on
   loopback and reaches `ntsrv` through a peer-authenticated typed Unix socket;
 - OpenAPI under `packages/contracts` is the canonical dashboard contract;
-- an optional Next.js App Router dashboard runs as a separate loopback-only
-  Bun service and owns no database, state directory, or Unix socket access.
+- an optional Next.js App Router dashboard runs behind a small Bun HTTP gateway
+  and owns no database, state directory, or Unix socket access.
 
-Production deployment requires an operator-managed same-origin HTTPS proxy.
-Route pages to `ntip-dashboard` on loopback; route `/api/v1`, generated
-installer scripts, and anonymous redemption directly to `ntip-api`; and serve
-versioned Node-only archives from the root-owned bootstrap-assets directory.
-Do not expose either loopback listener. Initial dashboard reads run server-side
-against the loopback API; browser reads and mutations stay on same-origin
-`/api/v1`. Authentication and authorization remain authoritative inside
-`ntsrv`. Next has no `/api/v1` fallback rewrite: an absent or incorrect proxy
-route fails visibly instead of using a build-time destination. The API, assets,
-and HTTPS edge are mandatory for provisioning a new Node even when the
-dashboard itself is not installed.
+Production deployment requires an operator-managed same-origin HTTPS reverse
+proxy. It forwards one origin to the dashboard gateway's plain-HTTP listener;
+the gateway routes `/api/v1` plus bootstrap script/redemption to the loopback
+API, serves only validated versioned Node archives from the root-owned
+bootstrap-assets directory, and sends page requests to an internal ephemeral
+Next listener. Do not expose `ntip-api`. Restrict the gateway port at the host
+or provider firewall to the trusted reverse proxy: it provides no TLS itself.
+Initial dashboard reads run server-side against the loopback API; browser reads
+and mutations stay on same-origin `/api/v1`. Authentication and authorization
+remain authoritative inside `ntsrv`. The API, assets, dashboard gateway, and
+external HTTPS edge are mandatory for provisioning a new Node.
 
 Layer 2, IPv6 VNRs, HA Masters, direct Node-to-Node transport, Windows/macOS
 runtime support, AF_XDP, kernel modules, and built-in firewall/NAT policy are
@@ -99,9 +99,10 @@ bun run dashboard:e2e
 ```
 
 `dashboard:dev` and `dashboard:build` execute Next with `bun --bun`.
-`dashboard:start` validates loopback runtime configuration and imports the
-generated standalone `server.js` directly under Bun. The separately packaged
-service uses the same standalone entry through its strict JSON launcher.
+`dashboard:start` validates its development-only loopback runtime configuration
+and imports the generated standalone `server.js` directly under Bun. The
+separately packaged service validates schema-2 JSON, starts Next on a private
+ephemeral loopback port, and exposes the bounded plain-HTTP gateway.
 Playwright exercises the browser through the same HTTPS origin and proxy split
 used in production.
 

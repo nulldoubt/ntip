@@ -177,10 +177,10 @@ service identities. The API and HTTPS/bootstrap-assets edge are required to
 provision new Nodes, although an established protocol-only deployment can run
 without the management HTTP tier. The API has no capabilities or
 state-directory access and can use only its typed Unix socket plus loopback IP.
-The dashboard has no capabilities,
-supplementary groups, writable state, or access to either socket directory; it
-can use only loopback IPv4/IPv6 and its read-only configuration/application
-tree. Bun's JavaScriptCore JIT requires executable mappings, so the dashboard
+The dashboard has only `CAP_NET_BIND_SERVICE`, no supplementary groups,
+writable state, or access to either socket directory; it uses public IPv4 for
+the plain-HTTP gateway and loopback for its internal Next/API traffic, with
+read-only configuration, application, and bootstrap-assets trees. Bun's JavaScriptCore JIT requires executable mappings, so the dashboard
 unit deliberately omits `MemoryDenyWriteExecute=yes` while retaining the other
 confinement controls.
 
@@ -243,13 +243,11 @@ operator worker and has no direct path to SQLite or local IPC.
 
 ```mermaid
 flowchart LR
-    browser["Browser"] -->|"same-origin HTTPS pages"| proxy["Operator TLS proxy"]
-    browser -->|"same-origin HTTPS /api/v1"| proxy
+    browser["Browser"] -->|"same-origin HTTPS"| proxy["Operator TLS reverse proxy"]
     nodeadmin["Node administrator"] -->|"pinned HTTPS /enrollment"| proxy
-    proxy -->|"loopback pages"| dashboard["ntip-dashboard"]
-    proxy -->|"loopback API"| api["ntip-api"]
-    proxy -->|"immutable Node archives"| assets["root-owned bootstrap assets"]
-    dashboard -->|"server-only initial reads over loopback"| api
+    proxy -->|"plain HTTP, whole origin"| dashboard["ntip-dashboard gateway"]
+    dashboard -->|"loopback API and bootstrap"| api["ntip-api"]
+    dashboard -->|"immutable Node archives"| assets["root-owned bootstrap assets"]
     api -->|"typed Unix IPC"| operator["ntsrv operator worker"]
 ```
 
@@ -258,11 +256,12 @@ presence of a browser cookie does not authorize a page. Server Components
 forward only the named session cookie and disable caching. Client Components
 poll and mutate same-origin `/api/v1`, where the existing HTTP and application
 controls remain authoritative. There is no Next API rewrite: the runtime
-`api_origin` serves only Server Components, while the TLS proxy is the sole
-browser `/api/v1` router. A proxy error therefore remains visible.
+`api_origin` is consumed by the server-side page layer and bounded Bun gateway,
+while that gateway is the sole browser `/api/v1` router. A routing error
+therefore remains visible.
 
-The same TLS edge also owns one-command Node bootstrap. It routes strict
-locator-specific script generation and anonymous redemption to `ntip-api`,
+The same dashboard gateway also owns one-command Node bootstrap behind the TLS
+edge. It routes strict locator-specific script generation and anonymous redemption to `ntip-api`,
 while serving versioned, manifest-validated Node-only archives directly. The
 installer authenticates the exact configured SPKI key and never derives its
 Master UDP endpoint, origin, pin, or asset path from the request Host or

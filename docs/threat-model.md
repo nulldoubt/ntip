@@ -8,7 +8,8 @@ enrolled Nodes over an untrusted UDP network. It also protects local managed
 state against partial writes and accidental cross-user administration.
 
 This model covers the v0.1-compatible userspace Linux protocol and the v0.2
-management-plane extension: local IPC, SQLite state, loopback HTTP, browser
+management-plane extension: local IPC, SQLite state, loopback API HTTP, the
+public plain-HTTP dashboard gateway, browser
 sessions, dashboard deployment, files, TUN interface, direct `iproute2`
 invocation, packaging, and update artifacts. It does not claim to secure a
 compromised kernel, root account, daemon process, Node private key, Master state
@@ -39,9 +40,9 @@ infrastructure topology and should be minimized.
 flowchart LR
     operator["Authorized local operator"] -->|"root or ntip-admin IPC"| daemon["ntsrv"]
     browser["Operator browser"] -->|"HTTPS"| proxy["Operator TLS proxy"]
-    proxy -->|"loopback pages"| dashboard["unprivileged ntip-dashboard"]
-    proxy -->|"loopback /api/v1"| api["unprivileged ntip-api"]
-    dashboard -->|"server-only loopback reads"| api
+    proxy -->|"plain HTTP, whole origin"| dashboard["unprivileged dashboard gateway"]
+    dashboard -->|"loopback API/bootstrap"| api["unprivileged ntip-api"]
+    dashboard -->|"read-only validated assets"| assets["bootstrap assets"]
     api -->|"SO_PEERCRED + typed IPC"| daemon
     files["0600 state and secrets"] <--> daemon
     daemon <--> tun["Linux TUN and IP stack"]
@@ -56,10 +57,14 @@ unauthenticated UDP senders, remote workloads, and all pre-authentication packet
 contents are untrusted. An enrolled Node is authenticated but is not trusted to
 source addresses outside its assigned `/32` and owned routed prefixes.
 
-The v0.2 browser boundary adds an operator-managed TLS proxy, an unprivileged
-dashboard, and an unprivileged loopback-only `ntip-api`. The proxy is trusted to
-terminate the configured public HTTPS origin and route `/api/v1` locally, but
-forwarded identity or client-IP headers are untrusted. `ntip-api` is trusted to
+The v0.2 browser boundary adds an operator-managed TLS reverse proxy, an
+unprivileged dashboard gateway, and an unprivileged loopback-only `ntip-api`.
+The proxy is trusted to terminate the configured public HTTPS origin and
+forward the whole origin to the gateway, but forwarded identity or client-IP
+headers are untrusted. It must preserve the public Host and browser Origin so
+the API can enforce the exact configured external HTTPS origin. The gateway is
+trusted for bounded path routing and read-only static asset selection, not
+authorization. `ntip-api` is trusted to
 enforce bounded HTTP framing and browser controls; it is not trusted with a
 database handle. `ntsrv` accepts the service socket only from the configured
 dedicated UID verified with Linux peer credentials. The dashboard is trusted
@@ -214,7 +219,7 @@ Cookies cannot prevent volumetric link saturation, spoofed traffic from a path
 that can receive replies, or CPU exhaustion below the threshold of upstream
 mitigation. Operators remain responsible for host and network rate limiting.
 
-Anonymous HTTPS redemption is separately bounded. NGINX applies a per-peer
+Anonymous HTTPS redemption is separately bounded. The dashboard gateway applies a per-peer
 ten-per-minute limit with burst five, `ntip-api` admits at most two concurrent
 redemptions, and `ntsrv` applies a durable per-real-locator ten-failure window
 and 15-minute cooldown. Unknown locators use a fixed-capacity in-memory
@@ -328,8 +333,9 @@ are authority.
 
 ### Dashboard process and presentation isolation
 
-The dashboard binds only to canonical loopback and parses a strict bootstrap
-containing no credentials. Server Components send initial authenticated reads
+The dashboard gateway binds the configured `0.0.0.0` plain-HTTP port and parses
+a strict bootstrap containing no credentials. It starts Next on an ephemeral
+canonical loopback port. Server Components send initial authenticated reads
 to the loopback API with `no-store` and forward only the named session cookie;
 Client Components use same-origin `/api/v1`. Protected layouts call
 `/auth/me`, so cookie presence cannot independently grant access. Every
@@ -337,7 +343,7 @@ mutation remains subject to the API and `ntsrv` session, Origin, CSRF, RBAC,
 ETag, idempotency, reauthentication, and confirmation checks.
 
 The dashboard has no build-time `/api/v1` rewrite. Its runtime `api_origin` is
-used only for server-side reads, and the trusted TLS proxy is the sole browser
+used by its server-side reads and bounded Bun gateway, which is the sole browser
 API router. Misrouting therefore fails visibly instead of silently selecting a
 stale build-time destination.
 
@@ -347,14 +353,17 @@ visibly stale. This limits accidental request amplification and misleading
 blank states, but does not make stale data authoritative. Operators must heed
 the displayed freshness and request errors before acting.
 
-The packaged `ntip-dashboard` user has no supplementary groups or capabilities.
-Systemd makes `/var/lib/ntip`, `/run/ntip`, and `/run/ntip-api` inaccessible,
-makes configuration and application trees read-only, and permits localhost
-IPv4/IPv6 only. `MemoryDenyWriteExecute=yes` is intentionally absent because
+The packaged `ntip-dashboard` user has no supplementary groups. Its only
+capability is `CAP_NET_BIND_SERVICE` for the low plain-HTTP gateway port.
+Systemd makes `/var/lib/ntip`, `/run/ntip`, and `/run/ntip-api` inaccessible
+and makes configuration, application, and bootstrap-assets trees read-only.
+Because the gateway binds `0.0.0.0`, operators must firewall it to their trusted
+TLS reverse proxy; direct public traffic is cleartext and outside the security
+model. `MemoryDenyWriteExecute=yes` is intentionally absent because
 Bun's JavaScriptCore requires executable JIT mappings. A JIT/runtime exploit
-therefore remains a residual process-compromise risk, contained by the empty
-capability set, dedicated identity, inaccessible state/sockets, read-only
-payload, and network restrictions. Compromise of the same-origin page service
+therefore remains a residual process-compromise risk, contained by the single
+bind-service capability, dedicated identity, inaccessible state/sockets,
+read-only payload, and operator firewall. Compromise of the same-origin page service
 can still abuse a live operator session through browser-visible capabilities;
 the model does not claim to secure a compromised same-origin application.
 

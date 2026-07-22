@@ -10,11 +10,12 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: the one-command Node bootstrap implementation is locally
-  complete and verified on `feat/node-bootstrap`; matched Linux artifact
-  staging, the explicitly authorized fresh vps02 database reset, and live
-  handoff remain. The currently deployed vps02 state is still the verified
-  schema-1/OpenAPI-1.0.1 segmented-input build until that atomic rollout.
+- Current milestone: the one-command Node bootstrap implementation and the
+  dashboard-owned plain-HTTP gateway are locally complete on
+  `feat/node-bootstrap`. Native Linux verification/package staging, the
+  explicitly authorized fresh vps02 database reset, and live handoff follow.
+  The currently deployed vps02 state is still the schema-1/OpenAPI-1.0.1
+  segmented-input build until that atomic rollout.
 - SQLite schema version: `2`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -25,9 +26,11 @@ security policy, or milestone status.
   (`packages/contracts/openapi/ntip-bootstrap-v1.yaml`, 3 paths, 3 operations,
   15 schemas). Both generated contract families pass drift and conformance.
 - Dashboard: Direction A implementation present as a pinned Bun 1.3.14 /
-  Next.js 16.2.10 standalone service. The bootstrap disclosure tree passes
-  typecheck, lint, 46/46 unit tests, the production build, exact-Bun runtime
-  smoke, and 26/26 Playwright journeys.
+  Next.js 16.2.10 standalone service. Its packaged runtime now owns a bounded
+  whole-origin plain-HTTP gateway in front of a private ephemeral Next
+  listener; the updated 52-test unit tree, production build, exact-Bun runtime
+  smoke, and 26/26 Playwright journeys pass. Native package execution remains
+  part of Linux staging.
 - Last verified commit: `668fc732063fc8a2055f5a80910f9609398756f6`
   (`feat: add one-command node bootstrap`).
 - Last verified implementation: commit
@@ -45,12 +48,13 @@ security policy, or milestone status.
   452/452 aggregate tests, including both static-musl cross targets;
   `zig build test --summary all` passes 443/443. Management/Bootstrap contract
   validation, generated drift, typecheck, and 20/20 tests pass. Dashboard
-  typecheck, lint, 46/46 unit tests, production build, exact-Bun runtime smoke,
+  typecheck, lint, 52/52 unit tests, production build, exact-Bun runtime smoke,
   and 26/26 Playwright journeys pass. Packaging/configuration, source secret
-  scan, installer, bootstrap-assets install, NGINX syntax/contract, workflow
-  YAML, shell syntax, and ShellCheck gates pass. Clean release reproducibility,
-  architecture-matched package execution, and live deployment remain Linux
-  staging evidence, not claims of this local macOS pass.
+  scan, installer, bootstrap-assets install, optional NGINX-reference syntax,
+  gateway/package contract, workflow YAML, shell syntax, and ShellCheck gates
+  pass. Clean release reproducibility, architecture-matched package execution,
+  and live deployment remain Linux staging evidence, not claims of this local
+  macOS pass.
 
 ## Current State
 
@@ -95,17 +99,21 @@ package.
 
 ```text
 Browser
-  -> operator-managed same-origin TLS proxy
-       -> Bun/Next.js dashboard for pages
-       -> loopback-only ntip-api for /api/v1
-            -> peer-authenticated typed Unix socket
-                 -> ntsrv operator worker
-                      -> SQLite and bounded runtime queues
+  -> operator-managed same-origin TLS reverse proxy
+       -> plain HTTP ntip-dashboard gateway on 0.0.0.0:443
+            +-> private ephemeral Next.js listener for pages
+            +-> root-owned immutable Node assets
+            `-> loopback-only ntip-api for /api/v1 and bootstrap
+                  -> peer-authenticated typed Unix socket
+                       -> ntsrv operator worker
+                            -> SQLite and bounded runtime queues
 ```
 
 - `ntsrv` is the sole live SQLite owner and remains the protocol authority.
 - `ntip-api` is an unprivileged, DB-free Zig HTTP service.
-- `ntip-dashboard` is a separately packaged Bun system service.
+- `ntip-dashboard` is a separately packaged Bun system service. Its gateway is
+  the only externally routed NTIP HTTP listener; it performs bounded routing
+  and immutable asset selection but never authorization or TLS termination.
 - The private typed service socket is a lockstep-deployed implementation
   boundary. Its v2 response frame may carry bounded field violations from
   `ntsrv` to `ntip-api`; v1 frames fail closed instead of being reinterpreted.
@@ -176,11 +184,12 @@ remains an inventory-only Operator path. Invitation disclosures are
 superuser-only, recently reauthenticated, confirmed, and non-replayable.
 
 The separate Bootstrap v1 contract exposes locator-specific shell delivery and
-strict anonymous redemption under `/enrollment`; versioned Node assets are
-served directly by the TLS gateway. Redemption is pinned to the configured
-SPKI, bounded and uniformly failing, and reconstructs the unchanged internal
-`ntip-enroll-v1` credential only in memory. `docs/node-bootstrap.md` is the
-normative accepted design.
+strict anonymous redemption under `/enrollment`; the dashboard gateway serves
+allowlisted versioned Node assets from its root-owned read-only tree. The
+external TLS reverse proxy forwards the whole origin unchanged. Redemption is
+pinned to that HTTPS edge's configured SPKI, bounded and uniformly failing,
+and reconstructs the unchanged internal `ntip-enroll-v1` credential only in
+memory. `docs/node-bootstrap.md` is the normative accepted design.
 
 Roles are:
 
@@ -199,19 +208,20 @@ tinted neutrals, an oxidized-copper accent, Geist Sans/Mono, compact tables,
 quiet motion, and no decorative imagery. The topology is deterministic and
 read-only with an accessible table equivalent.
 
-The deployed page service binds only to loopback. Initial Server Component
-reads forward only the named session cookie to the loopback API with
-`Cache-Control: no-store` and `Connection: close`; browser reads and mutations
-use same-origin `/api/v1`. Closing the trusted internal HTTP/1.1 hop prevents
-idle keep-alive sockets from pinning `ntip-api`'s fixed connection-owning
-workers when a Server Component render emits more parallel reads than the
-worker count. The operator TLS proxy routes pages to the dashboard and
-`/api/v1` directly to `ntip-api`; its API upstream must likewise avoid a
-persistent pooled connection per worker in v0.2. Next defines no `/api/v1`
-rewrite or fallback, so a proxy routing error fails visibly instead of
-silently using a build-time API destination that can disagree with runtime
-`api_origin`. The dashboard owns no state, database handle, or Unix socket
-access.
+The packaged dashboard starts Next on an ephemeral loopback port and binds one
+bounded plain-HTTP gateway to `0.0.0.0:443`. An operator-managed TLS reverse
+proxy forwards the complete public origin to that listener without path
+rewriting. The gateway routes `/api/v1` and strict bootstrap requests to the
+loopback API, serves only allowlisted regular Node-asset files, and sends all
+remaining requests to Next. Initial Server Component reads forward only the
+named session cookie to the loopback API with `Cache-Control: no-store` and
+`Connection: close`; browser reads and mutations use same-origin `/api/v1`.
+The gateway also closes its API upstream hop so idle keep-alive sockets cannot
+pin `ntip-api`'s fixed connection-owning workers. Next still defines no
+`/api/v1` rewrite or fallback. The gateway performs no authentication decision
+and owns no durable state, database handle, secret manifest, or Unix socket
+access. The cleartext listener must be firewall-restricted to the trusted
+reverse-proxy path.
 
 For superusers, Add Node will reauthenticate first and then create the Node and
 invitation atomically. Its pinned success stage discloses the installation
@@ -229,6 +239,9 @@ downloads with generate, replace, and reset-plus-generate actions.
 - Preserve the Zig layout and v0.1 wire compatibility.
 - Separate `ntip-api` and Next.js/Bun system services behind a same-origin TLS
   proxy.
+- Route that TLS origin as a whole to the dashboard-owned bounded plain-HTTP
+  gateway on `0.0.0.0:443`; keep `ntip-api` loopback-only and remove the live
+  host's local NGINX dependency.
 - Master-only SQLite migration; Node-local persistence stays as-is.
 - Filesystem protection plus online backup and verified offline restore; no
   SQLCipher.
@@ -267,9 +280,11 @@ downloads with generate, replace, and reset-plus-generate actions.
 
 ### In progress
 
-- Build and validate the matched native x86_64 service/dashboard artifacts and
-  both static-musl Node archives on Linux, then stage every binary,
-  configuration, manifest, asset, and NGINX change before touching live state.
+- Verify the dashboard gateway and Linux directory-handle fix, then build and
+  validate matched native x86_64 service/dashboard artifacts and both
+  static-musl Node archives on Linux. Stage every binary, configuration,
+  manifest, asset, external-proxy endpoint, and NGINX removal before touching
+  live state.
 - Atomically deploy schema 2 on vps02, perform only the explicitly authorized
   database-file reset, bootstrap the initial administrator, verify empty
   inventory and the public pinned installer path, and leave vps01/ubuntu110
@@ -291,7 +306,7 @@ downloads with generate, replace, and reset-plus-generate actions.
   generate/replace/revoke/reset operations and non-secret installer
   configuration while preserving inventory-only Operator creation. Bootstrap
   v1 separately defines cookie-independent shell delivery, strict anonymous
-  redemption, and immutable NGINX-owned assets. Both generated TypeScript
+  redemption, and immutable dashboard-gateway-owned assets. Both generated TypeScript
   contract families and Zig conformance gates pass.
 - `server.json` schema 2 requires the authoritative public UDP endpoint;
   `api.json` schema 2 requires the exact HTTPS SPKI pin and root-owned assets
@@ -343,9 +358,10 @@ downloads with generate, replace, and reset-plus-generate actions.
   and retains a visibly stale last-known-good projection. The read-only
   topology deterministically lays out Master/VNR/Node/route relationships and
   provides filters, pan/zoom, an inspector, and an accessible table equivalent.
-- The dashboard's strict runtime `api_origin` is consumed only by server-side
-  initial reads. Browser `/api/v1` has no Next rewrite; the operator TLS proxy
-  is the sole router for that path and misconfiguration remains fail-visible.
+- The dashboard's strict runtime `api_origin` is consumed by server-side
+  initial reads and its bounded gateway. Browser `/api/v1` has no Next rewrite;
+  the gateway is the sole router for that path and misconfiguration remains
+  fail-visible.
 - Every protected Server Component read treats an authoritative API `401` as a
   login redirect. This prevents parallel layout/page rendering from logging a
   child `ApiError`; `/auth/me` remains the authorization source and cookie
@@ -613,17 +629,19 @@ downloads with generate, replace, and reset-plus-generate actions.
   its architecture-matched pinned Bun 1.3.14 runtime, architecture-neutral
   Next standalone output, strict bootstrap, isolated identity, systemd unit,
   component SBOM, checksum, installer, and uninstaller. Its unit owns no state
-  or socket access and permits loopback IP only; JavaScriptCore's JIT is the
-  documented reason it omits `MemoryDenyWriteExecute=yes`. Native AArch64 glibc
+  or socket access, keeps configuration/application/assets read-only, and
+  grants only `CAP_NET_BIND_SERVICE` for the low plain-HTTP port;
+  JavaScriptCore's JIT is the documented reason it omits
+  `MemoryDenyWriteExecute=yes`. Native AArch64 glibc
   archive/SBOM/Bun execution and isolated installer lifecycle are verified.
   The x86_64 runtime, strict launcher, preview guard, and installer lifecycle
   also pass in an AMD64 Ubuntu container on the ARM development host; native
   x86_64 hardware and privileged service lifecycle evidence remain pending.
-- Dashboard runtime parsing uses the namespaced
-  `NTIP_DASHBOARD_LISTEN_HOST` variable populated by the strict launcher;
-  ambient Linux/container `HOSTNAME` values cannot alter or prevent its
-  loopback-only bind. The launcher separately sets Next's framework-level
-  `HOSTNAME` immediately before importing the standalone server.
+- Dashboard runtime parsing uses strict schema 2 for an exact `0.0.0.0`
+  gateway bind, low port, loopback API origin, and fixed root-owned asset path.
+  Ambient Linux/container `HOSTNAME` values cannot alter the listener. The
+  launcher separately binds Next to a private ephemeral loopback port before
+  starting the public gateway.
 - Delivery now has a pinned-Bun dashboard CI job and a v0.2 release guard that
   requires lint, typecheck, unit tests, exact-Bun production build/start smoke,
   and same-origin HTTPS Playwright. There is no Node.js runtime fallback.
@@ -834,9 +852,10 @@ downloads with generate, replace, and reset-plus-generate actions.
 - [x] Bootstrap architecture, threat model, management 1.1.0 and Bootstrap v1
   contracts
 - [x] SQLite schema 2, bootstrap derivation/lifecycle, and protected CLI output
-- [x] IPC v2 bootstrap operations, public HTTP, strict configuration, and NGINX
+- [x] IPC v2 bootstrap operations, public HTTP, and strict configuration
 - [x] `ntcl bootstrap-import`, Node-only archives, assets manifest, and installer
 - [x] Dashboard issuance/disclosure/replacement/reset journeys
+- [x] Dashboard-owned plain-HTTP gateway and portable directory-handle tests
 - [ ] Full release gate, atomic vps02 deployment, authorized fresh-state reset,
   and live handoff
 
@@ -898,9 +917,10 @@ Latest evidence:
   integration, formatting, version consistency, and both musl cross targets.
 - Current integrated dashboard slice: `bun run dashboard:typecheck`,
   `bun run dashboard:lint`, and `bun run dashboard:test` passed; the unit
-  result is 46/46 and includes strict bootstrap response/config parsing,
+  result is 52/52 and includes strict bootstrap response/config parsing,
   pinned-command construction, no automatic one-time retry, manual-copy
-  fallback, plus 14 segmented-network tests for BigInt
+  fallback, six bounded HTTP gateway/asset/rate-limit tests, plus 14
+  segmented-network tests for BigInt
   boundaries, `/20` partial prefixes, `/24` allocation holes, `/30`
   exhaustion, `/16` host/broadcast semantics, retained-invalid host bits,
   fixed segments, no parent change callback during render, and three internal
@@ -913,7 +933,8 @@ Latest evidence:
   recovery, consumed-marker replay, replacement, revocation, reset, stale
   intent/config races, operator handoff, accessibility, and existing inventory
   scenarios. Packaging/configuration, source secret, installer, asset install,
-  NGINX, workflow YAML, shell syntax, and ShellCheck gates pass.
+  dashboard-gateway, optional NGINX-reference, workflow YAML, shell syntax,
+  and ShellCheck gates pass.
 - The current pinned-Bun production smoke renders Activity through the exact
   standalone launcher, observes the protected layout plus four page reads,
   requires all five raw fixture requests to carry `Connection: close`, and

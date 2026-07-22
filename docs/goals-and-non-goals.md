@@ -55,14 +55,14 @@ priority over throughput claims or a broad automation surface.
 ### Give operators a focused dashboard
 
 - Serve authenticated Next.js App Router pages under pinned Bun from a
-  separately installed, unprivileged loopback service.
+  separately installed, unprivileged plain-HTTP gateway behind external TLS.
 - Cover overview, VNRs, Nodes, topology, activity, users, sessions, and
   settings with role-aware workflows against real API contracts.
 - Provide deterministic topology plus an accessible table, bounded polling,
   visible stale state, keyboard operation, reduced motion, and WCAG 2.2 AA
   behavior.
-- Treat the TLS proxy as the sole browser router for `/api/v1`; the dashboard
-  never embeds a second browser API destination.
+- Treat the dashboard gateway as the sole browser router for `/api/v1`; the
+  external TLS proxy forwards the whole origin without NTIP-specific routing.
 - Use that same HTTPS edge for pinned one-command Node bootstrap: strict
   installer/redeem routes reach the API and immutable Node-only archives come
   from the root-owned bootstrap-assets directory.
@@ -126,7 +126,7 @@ A v0.2 release tag is permitted only when all of the following are true:
 5. Core, API, optional dashboard, Node-only, and combined bootstrap-assets
    artifacts validate on native x86_64 and AArch64 Linux, including checksums,
    exact SBOM coverage, installer lifecycle, static/dynamic linkage policy,
-   NGINX syntax, and systemd isolation.
+   gateway routing, and systemd isolation.
 6. Two clean source roots produce byte-identical release artifacts for each
    architecture and component.
 7. No unresolved critical or high-severity security finding remains, and the

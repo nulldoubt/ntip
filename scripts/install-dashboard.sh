@@ -79,7 +79,7 @@ remove_tree_one_file_system() {
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 package_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 
-for required in runtime/bun app/launcher.ts app/apps/dashboard/server.js VERSION \
+for required in runtime/bun app/launcher.ts app/http-gateway.ts app/apps/dashboard/server.js VERSION \
     packaging/config/dashboard.json packaging/systemd/ntip-dashboard.service; do
     if [ ! -f "$package_root/$required" ]; then
         echo "dashboard package is incomplete: $required" >&2
@@ -235,7 +235,7 @@ install_file root root 0644 \
 
 if [ "$staging" -eq 0 ]; then
     systemctl daemon-reload
-    echo "NTIP dashboard installed but not started. Configure the same-origin TLS proxy before enabling ntip-dashboard.service."
+    echo "NTIP dashboard installed but not started. Restrict its plain-HTTP gateway to the same-origin TLS reverse proxy before enabling ntip-dashboard.service."
 else
     echo "NTIP dashboard installation staged under DESTDIR=$destdir; no accounts or services were changed."
 fi

@@ -145,10 +145,11 @@ def native_launcher_smoke(payload: dict[str, bytes], preview_mode_id: str) -> No
         configuration.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
-                    "bind_address": "127.0.0.1",
+                    "schema_version": 2,
+                    "bind_address": "0.0.0.0",
                     "port": port,
                     "api_origin": "http://127.0.0.1:8787",
+                    "bootstrap_assets_root": "/usr/share/ntip/bootstrap-assets",
                 }
             ),
             encoding="utf-8",
@@ -416,6 +417,7 @@ def main() -> int:
         )
         required_application = {
             "app/launcher.ts",
+            "app/http-gateway.ts",
             "app/apps/dashboard/server.js",
             "app/apps/dashboard/.next/server/middleware.js",
             "app/node_modules/@ntip/config/package.json",
@@ -461,6 +463,7 @@ def main() -> int:
 
         source_pairs = {
             "app/launcher.ts": repo_root / "apps/dashboard/scripts/launcher.ts",
+            "app/http-gateway.ts": repo_root / "apps/dashboard/scripts/http-gateway.ts",
             "app/node_modules/@ntip/config/package.json": repo_root / "packages/config/package.json",
             "app/node_modules/@ntip/config/src/index.ts": repo_root / "packages/config/src/index.ts",
             "packaging/config/dashboard.json": repo_root / "packaging/config/dashboard.json",

@@ -59,14 +59,14 @@ bun run dashboard:e2e
 ```
 
 Initial reads are Server Components using the loopback-only API origin and
-`no-store`; browser reads and mutations use same-origin `/api/v1`. The
-runtime `api_origin` is server-only and Next defines no `/api/v1` rewrite;
-browser API routing belongs exclusively to the TLS proxy. The production build
+`no-store`; browser reads and mutations use same-origin `/api/v1`. Next defines
+no `/api/v1` rewrite; the packaged Bun gateway owns browser API, bootstrap, and
+immutable-asset routing behind the operator's whole-origin TLS reverse proxy. The production build
 uses `output: "standalone"`. `dashboard:runtime-smoke` must
 start that output through the same checked launcher as `dashboard:start`, and
 Playwright must exercise the production page/API split through one HTTPS
-origin. Native archive validation separately starts the packaged strict-JSON
-launcher and probes `/login`. `check-dashboard-release-gate.py` requires every
+origin. Native archive validation separately starts the schema-2 packaged
+gateway launcher and probes `/login`. `check-dashboard-release-gate.py` requires every
 bounded verification command for a v0.2 release and rejects any
 build/start/smoke script that introduces a Node, npm, npx, pnpm, or yarn
 runtime fallback.
@@ -245,10 +245,12 @@ document are also fetched over loopback. The smoke stops both units and verifies
 TUN plus human/typed-socket teardown. Static unit analysis alone cannot
 establish those runtime facts.
 
-The dashboard unit has no capabilities, writable state path, supplementary
-groups, or access to either Unix-socket directory. It permits only loopback
-IPv4/IPv6 and reads only its strict bootstrap plus the installed application.
-It intentionally omits `MemoryDenyWriteExecute=yes` because Bun's
+The dashboard unit has no writable state path, supplementary groups, or access
+to either Unix-socket directory. Its sole capability is
+`CAP_NET_BIND_SERVICE`; it reads only its strict bootstrap, installed
+application, and immutable bootstrap-assets tree. The public plain-HTTP bind
+must be firewalled to the external TLS reverse proxy. It intentionally omits
+`MemoryDenyWriteExecute=yes` because Bun's
 JavaScriptCore needs executable JIT mappings. Native Linux service evidence
 must confirm that the remaining sandbox stays intact and that the page service
 cannot reach Master state or sockets.

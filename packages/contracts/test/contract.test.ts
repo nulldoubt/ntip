@@ -200,12 +200,12 @@ describe("NTIP public Bootstrap v1 OpenAPI", () => {
     expect(unavailable.message!.const).toBe("Bootstrap invitation is unavailable.");
   });
 
-  test("documents generated shell and NGINX-owned immutable assets", async () => {
+  test("documents generated shell and dashboard-gateway-owned immutable assets", async () => {
     const document = await loadBootstrapContract();
     const paths = document.paths as Record<string, Record<string, Record<string, unknown>>>;
     const installer = paths["/enrollment/{bootstrapId}"]!.get!;
     const installerResponses = installer.responses as Record<string, Record<string, unknown>>;
     expect(Object.keys(installerResponses["200"]!.content as object)).toEqual(["text/x-shellscript"]);
-    expect(paths["/enrollment/assets/{versioned-file}"]!.get!["x-ntip-owner"]).toBe("nginx");
+    expect(paths["/enrollment/assets/{versioned-file}"]!.get!["x-ntip-owner"]).toBe("dashboard-gateway");
   });
 });

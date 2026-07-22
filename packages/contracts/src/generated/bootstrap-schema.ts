@@ -38,7 +38,7 @@ export interface paths {
         };
         /**
          * Download an immutable versioned Node-only release asset
-         * @description This path is served directly by NGINX and never enters an API worker.
+         * @description This path is served directly by the dashboard gateway and never enters an API worker.
          */
         readonly get: operations["getBootstrapAsset"];
         readonly put?: never;

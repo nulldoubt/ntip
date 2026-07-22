@@ -156,11 +156,11 @@
       "get": {
         "operationId": "getBootstrapAsset",
         "summary": "Download an immutable versioned Node-only release asset",
-        "description": "This path is served directly by NGINX and never enters an API worker.",
+        "description": "This path is served directly by the dashboard gateway and never enters an API worker.",
         "tags": [
           "Bootstrap assets"
         ],
-        "x-ntip-owner": "nginx",
+        "x-ntip-owner": "dashboard-gateway",
         "x-ntip-cookie-independent": true,
         "x-ntip-cors": "disabled",
         "x-ntip-redirects": "forbidden",

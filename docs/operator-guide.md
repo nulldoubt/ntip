@@ -43,7 +43,7 @@ sudo ./scripts/install-api.sh
 
 It installs only `ntip-api`, `/etc/ntip/api.json`, and its hardened unit. It
 does not install or access Master state. New Node provisioning also requires
-the matching bootstrap-assets package and a configured HTTPS edge; the API
+the matching bootstrap-assets package, dashboard gateway, and HTTPS edge; the API
 unit deliberately will not start without its strict manifest. The core package
 creates the dedicated UID/GID because `ntsrv` must authenticate that exact UID
 with `SO_PEERCRED`.
@@ -54,7 +54,7 @@ passwd/group alias.
 
 Install the same-version Master bootstrap-assets package next. It contains both
 Node CPU architectures, their checksum and SBOM sidecars, a strict manifest,
-and an NGINX example; it never enables or rewrites NGINX:
+and an optional NGINX reference example; it never enables or rewrites NGINX:
 
 ```sh
 sha256sum --check ntip-bootstrap-assets-vVERSION.tar.gz.sha256
@@ -80,9 +80,10 @@ The dashboard package contains the architecture-matched Bun 1.3.14 runtime,
 Next standalone application, `/etc/ntip/dashboard.json`, documentation, and
 `ntip-dashboard.service`. It requires exact core/API/dashboard version equality
 and creates an isolated `ntip-dashboard` identity with no supplementary groups.
-It is installed but never enabled automatically. Configure the same-origin TLS
-proxy before starting it. Do not substitute either loopback listener for a
-public HTTPS endpoint.
+It is installed but never enabled automatically. Its schema-2 sample binds a
+plain-HTTP gateway on `0.0.0.0:443`; place that listener behind the configured
+same-origin HTTPS reverse proxy and restrict access to the proxy at the host or
+provider firewall. The gateway is not a TLS endpoint.
 
 Core, API, and Node-only archives use static-musl `x86_64-linux-musl` or
 `aarch64-linux-musl` targets. The bootstrap-assets package contains both
@@ -381,10 +382,11 @@ journalctl -u ntsrv
 ```
 
 Prepare the public TLS certificate before configuring the API. Derive its SPKI
-pin from the exact certificate/key pair NGINX will serve:
+pin from the exact certificate the external reverse proxy will serve (the
+private key is not needed on the Master):
 
 ```sh
-openssl x509 -in /etc/nginx/ntip/ntip.crt -pubkey -noout \
+openssl x509 -in /path/to/public-certificate.crt -pubkey -noout \
   | openssl pkey -pubin -outform DER \
   | openssl dgst -sha256 -binary \
   | openssl base64 -A
@@ -430,55 +432,55 @@ Liveness proves only that the HTTP process responds. Readiness also requires
 the typed `ntsrv` service socket. A missing Master returns `503`; `ntip-api`
 never opens SQLite as a fallback.
 
-Configure the dashboard's separate strict bootstrap. It accepts only these four
-fields, and both the listener and internal API must remain on loopback:
+Configure the dashboard's separate strict bootstrap. Its public listener is
+plain HTTP; only the internal API remains on loopback. The bootstrap-assets root
+is fixed and root-owned:
 
 ```json
 {
-  "schema_version": 1,
-  "bind_address": "127.0.0.1",
-  "port": 3000,
-  "api_origin": "http://127.0.0.1:8787"
+  "schema_version": 2,
+  "bind_address": "0.0.0.0",
+  "port": 443,
+  "api_origin": "http://127.0.0.1:8787",
+  "bootstrap_assets_root": "/usr/share/ntip/bootstrap-assets"
 }
 ```
 
-Terminate public TLS in an operator-managed proxy. Begin with the packaged
-`/usr/share/doc/ntip-bootstrap-assets/ntip-nginx.conf.example` and adapt its
-listen address, certificate paths, and public server name. It gives the
-strict installer/redeem/static locations higher priority than the dashboard,
-bounds and rate-limits anonymous redemption, disables its buffering/cache/log,
-and serves only manifest-shaped immutable asset basenames.
-
-Give `/api/v1` priority and send it directly to `127.0.0.1:8787`; send page
-routes to `127.0.0.1:3000`. The browser-facing scheme, host, and optional port
-must equal `public_https_origin` exactly. Disable CORS, do not expose either
-loopback port, and do not use forwarded identity or client-IP headers for
-authorization or audit. The dashboard has no `/api/v1` fallback rewrite; a
-missing or lower-priority proxy route fails visibly at the page service.
+Terminate public TLS in an operator-managed reverse proxy and forward the
+entire origin without path rewriting to the dashboard gateway. The
+browser-facing scheme, host, and optional port must equal
+`public_https_origin` exactly. The gateway gives strict
+installer/redeem/static routes priority over pages, bounds anonymous
+redemption, proxies API traffic only to canonical loopback, and serves only
+manifest-shaped immutable asset basenames. Do not expose `ntip-api`, and do not
+use forwarded identity or client-IP headers for authorization or audit.
+Preserve the original HTTP `Host` header and do not rewrite the browser's
+`Origin`; the API compares the latter to the exact external HTTPS origin even
+though the hop from the reverse proxy to the gateway is plain HTTP.
 
 ```text
-https://ntip.example.com/enrollment/v1/redeem -> http://127.0.0.1:8787
-https://ntip.example.com/enrollment/LOCATOR   -> http://127.0.0.1:8787
-https://ntip.example.com/enrollment/assets/*  -> /usr/share/ntip/bootstrap-assets
-https://ntip.example.com/api/v1/*              -> http://127.0.0.1:8787/api/v1/*
-https://ntip.example.com/*                     -> http://127.0.0.1:3000/*
+https://ntip.example.com/* -> http://MASTER_ADDRESS:443/* -> ntip-dashboard gateway
 ```
 
-Start the dashboard only after the API is ready and the proxy is configured:
+Allow inbound TCP 443 only from the reverse proxy's address. Port 80 may be
+used instead by changing `port`; never send credentials or enrollment traffic
+to that cleartext listener except across a trusted private path. Start the
+dashboard only after the API is ready and the proxy is configured:
 
 ```sh
 systemctl enable --now ntip-dashboard
 systemctl status ntip-dashboard
-curl --fail http://127.0.0.1:3000/login >/dev/null
+curl --fail http://127.0.0.1:443/login >/dev/null
 journalctl -u ntip-dashboard
 ```
 
 Initial authenticated page reads travel from the dashboard to the API through
 `api_origin`; browser polling and mutations travel to same-origin `/api/v1`.
 The page service owns no database, state directory, or Unix socket access. Its
-systemd sandbox permits only loopback IP and read-only config/application
-trees. It intentionally omits `MemoryDenyWriteExecute=yes` because Bun's
-JavaScriptCore needs executable JIT mappings; all capability sets remain empty.
+systemd sandbox keeps config, application, and bootstrap assets read-only and
+grants only `CAP_NET_BIND_SERVICE` for the low gateway port. It intentionally
+omits `MemoryDenyWriteExecute=yes` because Bun's JavaScriptCore needs executable
+JIT mappings.
 
 On a Node host, enable only `ntcl`:
 

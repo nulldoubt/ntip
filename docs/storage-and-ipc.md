@@ -52,6 +52,14 @@ rejected. Security policy and database paths are not configurable here. The
 public UDP endpoint, HTTPS origin, pin, and manifest path are explicit
 deployment authority and are never inferred from Host or forwarded headers.
 
+Dashboard `dashboard.json` schema 2 contains the exact public plain-HTTP bind
+`0.0.0.0`, a nonzero port (the packaged sample uses `443`), canonical loopback
+`api_origin`, and fixed `/usr/share/ntip/bootstrap-assets` root. The dashboard
+gateway starts the Next service on an ephemeral loopback port, proxies bounded
+API/bootstrap requests to `ntip-api`, and reads only validated immutable asset
+basenames. It has no database or Unix-socket authority. Operators must restrict
+the cleartext listener to their trusted external TLS reverse proxy.
+
 Node `client.json` remains schema 1 with `master`, `node`,
 `master_public_key`, `tun_name`, and `inner_mtu`. The primary v0.2 path is
 `ntcl bootstrap-import --stdin`: it validates the strict redemption bundle,

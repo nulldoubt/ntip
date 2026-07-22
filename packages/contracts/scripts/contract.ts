@@ -507,7 +507,7 @@ export async function validateBootstrapContract(): Promise<ContractSummary> {
     objectAt(paths["/enrollment/assets/{versioned-file}"], "asset path").get,
     "asset operation",
   );
-  assertEqual(asset["x-ntip-owner"], "nginx", "bootstrap asset owner");
+  assertEqual(asset["x-ntip-owner"], "dashboard-gateway", "bootstrap asset owner");
 
   return {
     pathCount: actualPaths.length,

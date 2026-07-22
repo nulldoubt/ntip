@@ -504,7 +504,16 @@ fn inheritDirectoryOwner(dir: std.Io.Dir, file: std.Io.File) !void {
 }
 
 fn makePrivate(dir: std.Io.Dir) !void {
-    try dir.setPermissions(std.testing.io, .fromMode(private_directory_mode));
+    try setTestDirectoryPermissions(dir, private_directory_mode);
+}
+
+fn setTestDirectoryPermissions(dir: std.Io.Dir, mode: std.posix.mode_t) !void {
+    var permission_dir = try dir.openDir(std.testing.io, ".", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer permission_dir.close(std.testing.io);
+    try permission_dir.setPermissions(std.testing.io, .fromMode(mode));
 }
 
 fn testRestoreAudit(seed: u8) RestoreAudit {
@@ -1129,7 +1138,7 @@ test "maintenance rejects insecure directories and source permissions" {
     );
     try expectCounts(allocator, io, state_tmp.dir, database_file, "current", 1);
 
-    try source_tmp.dir.setPermissions(io, .fromMode(0o755));
+    try setTestDirectoryPermissions(source_tmp.dir, 0o755);
     try std.testing.expectError(
         error.InsecureDirectoryPermissions,
         restoreStopped(

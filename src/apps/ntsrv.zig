@@ -395,18 +395,22 @@ fn validateCommand(command: Command) !void {
 test "offline VNR mutation is durable and SQLite-readable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/server", .{tmp.sub_path});
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "server" });
     defer std.testing.allocator.free(state_path);
+    const runtime_path = try std.fs.path.join(std.testing.allocator, &.{ root, "run" });
+    defer std.testing.allocator.free(runtime_path);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err.deinit();
-    const create_args = [_][]const u8{ "--state-dir", state_path, "vnr", "create", "vnr0", "10.1.0.0/24" };
+    const create_args = [_][]const u8{ "--state-dir", state_path, "--runtime-dir", runtime_path, "vnr", "create", "vnr0", "10.1.0.0/24" };
     try std.testing.expectEqual(ExitCode.success, try run(std.testing.allocator, std.testing.io, &create_args, &out.writer, &err.writer));
 
     var json_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer json_out.deinit();
-    const list_args = [_][]const u8{ "--state-dir", state_path, "vnr", "list", "--json" };
+    const list_args = [_][]const u8{ "--state-dir", state_path, "--runtime-dir", runtime_path, "vnr", "list", "--json" };
     try std.testing.expectEqual(ExitCode.success, try run(std.testing.allocator, std.testing.io, &list_args, &json_out.writer, &err.writer));
     try std.testing.expect(std.mem.indexOf(u8, json_out.written(), "\"name\":\"vnr0\"") != null);
 }
@@ -414,12 +418,12 @@ test "offline VNR mutation is durable and SQLite-readable" {
 test "offline Master rejects legacy JSON without modifying it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        ".zig-cache/tmp/{s}/server",
-        .{tmp.sub_path},
-    );
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "server" });
     defer std.testing.allocator.free(state_path);
+    const runtime_path = try std.fs.path.join(std.testing.allocator, &.{ root, "run" });
+    defer std.testing.allocator.free(runtime_path);
     var state_dir = try ntip.cli.runner.openPrivateDirectory(std.testing.io, state_path);
     defer state_dir.close(std.testing.io);
     const legacy_bytes = "{\"schema_version\":1,\"generation\":0,\"vnrs\":[],\"nodes\":[],\"routes\":[]}";
@@ -433,7 +437,7 @@ test "offline Master rejects legacy JSON without modifying it" {
     defer out.deinit();
     var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err.deinit();
-    const args = [_][]const u8{ "--state-dir", state_path, "status", "--json" };
+    const args = [_][]const u8{ "--state-dir", state_path, "--runtime-dir", runtime_path, "status", "--json" };
     try std.testing.expectEqual(
         ExitCode.usage_or_config,
         try run(std.testing.allocator, std.testing.io, &args, &out.writer, &err.writer),
@@ -462,12 +466,14 @@ test "offline bootstrap output preflight failure leaves node and enrollment stat
     defer std.testing.allocator.free(state_path);
     const credential_path = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "node01.enroll" });
     defer std.testing.allocator.free(credential_path);
+    const runtime_path = try std.fs.path.join(std.testing.allocator, &.{ root, "run" });
+    defer std.testing.allocator.free(runtime_path);
 
     var setup_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer setup_out.deinit();
     var setup_err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer setup_err.deinit();
-    const vnr_args = [_][]const u8{ "--state-dir", state_path, "vnr", "create", "vnr0", "10.1.0.0/24" };
+    const vnr_args = [_][]const u8{ "--state-dir", state_path, "--runtime-dir", runtime_path, "vnr", "create", "vnr0", "10.1.0.0/24" };
     try std.testing.expectEqual(
         ExitCode.success,
         try run(std.testing.allocator, std.testing.io, &vnr_args, &setup_out.writer, &setup_err.writer),
@@ -480,6 +486,8 @@ test "offline bootstrap output preflight failure leaves node and enrollment stat
     const create_args = [_][]const u8{
         "--state-dir",
         state_path,
+        "--runtime-dir",
+        runtime_path,
         "node",
         "create",
         "node01",
@@ -531,12 +539,14 @@ test "offline bootstrap output success is private and contains no internal crede
     defer std.testing.allocator.free(state_path);
     const bootstrap_path = try std.fs.path.join(std.testing.allocator, &.{ state_path, "node01-bootstrap.json" });
     defer std.testing.allocator.free(bootstrap_path);
+    const runtime_path = try std.fs.path.join(std.testing.allocator, &.{ root, "run" });
+    defer std.testing.allocator.free(runtime_path);
 
     var setup_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer setup_out.deinit();
     var setup_err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer setup_err.deinit();
-    const vnr_args = [_][]const u8{ "--state-dir", state_path, "vnr", "create", "vnr0", "10.1.0.0/24" };
+    const vnr_args = [_][]const u8{ "--state-dir", state_path, "--runtime-dir", runtime_path, "vnr", "create", "vnr0", "10.1.0.0/24" };
     try std.testing.expectEqual(
         ExitCode.success,
         try run(std.testing.allocator, std.testing.io, &vnr_args, &setup_out.writer, &setup_err.writer),
@@ -549,6 +559,8 @@ test "offline bootstrap output success is private and contains no internal crede
     const create_args = [_][]const u8{
         "--state-dir",
         state_path,
+        "--runtime-dir",
+        runtime_path,
         "node",
         "create",
         "node01",
