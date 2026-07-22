@@ -10,12 +10,13 @@ security policy, or milestone status.
 
 - Base commit: `612fec4`
 - Development version: `0.2.0-dev`
-- Current milestone: the one-command Node bootstrap implementation and the
-  dashboard-owned plain-HTTP gateway are locally complete on
-  `feat/node-bootstrap`. Native Linux verification/package staging, the
-  explicitly authorized fresh vps02 database reset, and live handoff follow.
-  The currently deployed vps02 state is still the schema-1/OpenAPI-1.0.1
-  segmented-input build until that atomic rollout.
+- Current milestone: the one-command Node bootstrap implementation,
+  dashboard-owned plain-HTTP gateway, native Linux package proof, and the
+  explicitly authorized fresh vps02 schema-2 deployment are complete on
+  `feat/node-bootstrap`. The commit-pinned demonstration installer is staged
+  in `ntip-site`; repository publication, anonymous Pangolin routing, and the
+  operator-driven Node enrollment recording remain. The stable v0.2.0 release
+  stays gated by its separate evidence policy.
 - SQLite schema version: `2`
 - Management API: canonical contract, hardened transport, auth/inventory/
   security/enrollment/diagnostics/operations/settings/read-model adapters and
@@ -29,18 +30,19 @@ security policy, or milestone status.
   Next.js 16.2.10 standalone service. Its packaged runtime now owns a bounded
   whole-origin plain-HTTP gateway in front of a private ephemeral Next
   listener; the updated 52-test unit tree, production build, exact-Bun runtime
-  smoke, and 26/26 Playwright journeys pass. Native package execution remains
-  part of Linux staging.
-- Last verified commit: `ba06060efc1c43c552a522f235070c700b8d5d82`
-  (`feat: expose dashboard through bounded HTTP gateway`).
+  smoke, and 26/26 Playwright journeys pass. Native packaged-launcher
+  execution also passes on x86_64 Linux.
+- Last verified commit: `dd89ba7bf20ee43656274b57442226dc8b189306`
+  (`build: align releases with external TLS gateway`).
 - Last verified implementation: commit
-  `ba06060efc1c43c552a522f235070c700b8d5d82`; it includes schema-2 invitation
+  `dd89ba7bf20ee43656274b57442226dc8b189306`; it includes schema-2 invitation
   persistence/derivation/throttling, atomic inventory and one-time issuance,
   public redemption and generated pinned installer, strict bootstrap import,
   Node-only/bootstrap-assets packaging, management/dashboard flows,
   consumed-marker idempotency, restore/consume invalidation, the bounded
   whole-origin dashboard gateway, Linux-portable directory handling, and
-  unchanged Node wire enrollment.
+  unchanged Node wire enrollment, master-branch CI/release alignment, and
+  external-proxy-only packaging with no same-host NGINX artifact.
 - Migration 0001 SHA-256:
   `d7aab9680379dec566989e2998828e063e67c9d441ae860a3871d7393f3d4678`
 - Migration 0002 SHA-256:
@@ -53,9 +55,11 @@ security policy, or milestone status.
   and 26/26 Playwright journeys pass. Packaging/configuration, source secret
   scan, installer, bootstrap-assets install, external-proxy separation,
   gateway/package contract, workflow YAML, shell syntax, and ShellCheck gates
-  pass. Clean release reproducibility, architecture-matched package execution,
-  and live deployment remain Linux staging evidence, not claims of this local
-  macOS pass.
+  pass. Native x86_64 execution, both-architecture package validation,
+  byte-for-byte core/API/Node/bootstrap/dashboard reproducibility, systemd
+  hardening, and the fresh live schema-2 deployment pass on vps02. AArch64
+  runtime execution, the 24-hour soak, independent review, interoperability,
+  and benchmark evidence remain separate release gates.
 
 ## Current State
 
@@ -247,6 +251,11 @@ downloads with generate, replace, and reset-plus-generate actions.
   bootstrap-assets package carries immutable Node archives, their manifest,
   and documentation only; an external TLS edge must forward the complete
   public origin to the gateway without path rewriting.
+- Keep the stable showcase `/install.sh` fail-closed until the full v0.2.0
+  release gate passes. A clearly labeled demonstration may instead use
+  `/demo/install.sh`, pinned to a full source commit plus exact archive sizes
+  and SHA-256 digests; it makes no stable-release or production-readiness
+  claim.
 - Master-only SQLite migration; Node-local persistence stays as-is.
 - Filesystem protection plus online backup and verified offline restore; no
   SQLCipher.
@@ -285,15 +294,13 @@ downloads with generate, replace, and reset-plus-generate actions.
 
 ### In progress
 
-- Verify the dashboard gateway and Linux directory-handle fix, then build and
-  validate matched native x86_64 service/dashboard artifacts and both
-  static-musl Node archives on Linux. Stage every binary, configuration,
-  manifest, asset, external-proxy endpoint, and NGINX removal before touching
-  live state.
-- Atomically deploy schema 2 on vps02, perform only the explicitly authorized
-  database-file reset, bootstrap the initial administrator, verify empty
-  inventory and the public pinned installer path, and leave vps01/ubuntu110
-  unchanged for the operator-driven invitation test.
+- Publish the verified repository and commit-pinned demonstration artifacts,
+  then verify that the public showcase and demo enrollment paths bypass the
+  outer Pangolin login. The operator-driven invitation test on vps01 and
+  ubuntu110 follows; their current installations remain untouched.
+- Accumulate the independent evidence required by the stable v0.2.0 release
+  policy. Do not turn the development preview into a nominal stable tag or
+  weaken `REQUIRE_PUBLIC_RELEASE=1` while any required gate is absent.
 
 ### Implemented
 
@@ -831,8 +838,60 @@ downloads with generate, replace, and reset-plus-generate actions.
   unchanged at generation 4 with `primary`, `test01` (`10.10.1.4`),
   `ubuntu110` (`10.10.1.3`), and `vps01` (`10.10.1.2`).
 
+### One-command bootstrap live verification
+
+- Commit `dd89ba7bf20ee43656274b57442226dc8b189306` was exported and built on
+  native x86_64 vps02 with Zig 0.16.0 and Bun 1.3.14. All 452 Zig checks,
+  443 direct Zig tests, 20 contract tests, 52 dashboard tests, and 26 native
+  Playwright journeys passed. Core/API/Node/bootstrap-assets and dashboard
+  archives were reproduced byte-for-byte across two packaging passes; native
+  x86_64 execution, cross-architecture structure, SBOM consistency, isolated
+  installers, source-secret scanning, ShellCheck, and systemd hardening passed.
+- The installed x86_64 archive SHA-256 values are
+  `590e0124e5d5268fdfb6cf0c0ee6e18b7bb078056aacf6ef5d4dd0e8e5e394ac`
+  for core,
+  `d8a3ac4558a37d393d5f48d01d7b185d9b9599ed90d3c0bf5a67be86acf1ce31`
+  for API,
+  `8af49124fa36824b80e0c9d8f1318ad61e6519c075164f71347b2b18d16c6889`
+  for bootstrap assets, and
+  `1d04776d3a33eb6e3c22599b940b95c744e877c67298999c877e9354274526a9`
+  for the pinned-Bun dashboard.
+- Per the explicit test authorization, no new backup was made. With all NTIP
+  services stopped and the exact state path, file types, modes, owners, and
+  retained identity/lock files verified, only
+  `/var/lib/ntip/server/ntip.sqlite3`, `ntip.sqlite3-wal`, and
+  `ntip.sqlite3-shm` were targeted for deletion. Clean shutdown had already
+  removed WAL/SHM; the remaining database was deleted explicitly. The existing
+  `identity.key` and `state.lock` were retained. Offline password-stdin
+  bootstrap created `admin`, and readiness now reports database schema 2.
+- The fresh live inventory is generation 0 with no VNRs, Nodes, or routes.
+  OpenAPI reports management 1.1.0, authentication rejects unauthenticated
+  overview access, administrator login succeeds with the required Origin and
+  idempotency preconditions, and a gateway-served x86_64 Node archive hashes
+  exactly to its installed manifest entry. vps01 and ubuntu110 binaries,
+  services, configurations, and state were not changed.
+- `ntsrv`, `ntip-api`, and `ntip-dashboard` are active and enabled. Listeners
+  are UDP 49152 on IPv4/IPv6, API `127.0.0.1:8787`, and the Bun gateway
+  `0.0.0.0:443` over plain HTTP. NGINX is disabled and its packages are
+  removed without purge; the retired local certificate, private key, and
+  configuration remain recoverable and byte-identical. Newt reaches
+  `http://172.30.2.1:443/login` from its own container namespace, and the raw
+  provider address returns the login page over plain HTTP.
+- Pangolin still returns its own authentication `302` for both
+  `demo.ntip.alkhatib.online` and `ntip.alkhatib.online`. Until the operator
+  removes that outer policy, management requests never reach NTIP and the
+  cookie-independent `/enrollment/*` and showcase installer paths cannot work.
+  UFW also still permits 443/tcp globally as instructed, so binding cleartext
+  HTTP on all interfaces exposes the provider-NAT path; production deployment
+  should restrict that listener to the external proxy's source path.
+
 ### Deferred or out of scope
 
+- A stable `v0.2.0` tag/release remains blocked until the versioned gate record
+  has real native AArch64, 24-hour soak, independent security review, Noise
+  interoperability, and benchmark evidence, plus a registered signing key and
+  protected `production-beta` reviewer environment. The commit-pinned
+  `0.2.0-dev` demonstration channel is not a substitute for those controls.
 - SSO, MFA, API tokens, SSE/WebSockets, mobile administration, Node software
   version telemetry, direct Node-to-Node probes, SQLCipher, automatic backup
   scheduling, legacy Master import, and Zig source-tree relocation.
@@ -869,8 +928,10 @@ downloads with generate, replace, and reset-plus-generate actions.
 - [x] `ntcl bootstrap-import`, Node-only archives, assets manifest, and installer
 - [x] Dashboard issuance/disclosure/replacement/reset journeys
 - [x] Dashboard-owned plain-HTTP gateway and portable directory-handle tests
-- [ ] Full release gate, atomic vps02 deployment, authorized fresh-state reset,
-  and live handoff
+- [x] Native artifact reproducibility, atomic vps02 deployment, authorized
+  fresh-state reset, NGINX removal, and local/Newt live handoff
+- [ ] Anonymous public proxy routing and operator-driven Node bootstrap proof
+- [ ] Stable v0.2.0 evidence gate, signed publication, and release handoff
 
 ## Verification Commands
 
@@ -944,8 +1005,9 @@ Latest evidence:
   workflow-YAML parsing, and `git diff --check` pass. A repository-wide audit
   finds no remaining packaged-dashboard readiness probe on port 3000, stale
   same-host proxy artifact/check, `origin/main` release ancestry, or `main`
-  CI branch filter. Native installed-service execution on 443 remains part of
-  the pending Linux CI/live evidence rather than a macOS claim.
+  CI branch filter. Native installed-service execution on the schema-2 port
+  443 gateway passes on vps02; it remains Linux evidence rather than a macOS
+  claim.
 - Management 1.1.0 and Bootstrap 1.0.0 validation, typecheck, generated drift,
   and 20/20 contract tests pass. The dashboard production build, exact-Bun
   runtime smoke, and 26/26 Playwright journeys pass on the same tree, including
@@ -976,6 +1038,14 @@ Latest evidence:
   preservation, UDP listener, and UFW rules passed live verification. The
   later operator-created `test01` transition to generation 4 is recorded in
   the live-verification section above.
+- Commit `dd89ba7bf20ee43656274b57442226dc8b189306` passed the complete native
+  Linux and reproducible packaging proof recorded above, then was deployed as
+  a matched fresh schema-2 service set. Local gateway/API readiness, OpenAPI
+  1.1.0, empty generation-0 inventory, administrator authentication,
+  manifest-authenticated Node asset delivery, UDP 49152, Newt bridge access,
+  NGINX package removal, and retained identity/lock material passed. Public TLS
+  requests remain intercepted by the operator's outer Pangolin login and are
+  not claimed as end-to-end enrollment proof.
 
 The remaining evidence in this section records the previously verified
 implementation unless a bullet explicitly identifies the current working-tree
